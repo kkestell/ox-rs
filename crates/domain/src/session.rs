@@ -2,11 +2,13 @@ use std::fmt;
 use std::path::PathBuf;
 use std::str::FromStr;
 
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::Message;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
 pub struct SessionId(pub Uuid);
 
 impl SessionId {
@@ -36,7 +38,7 @@ pub struct SessionSummary {
     pub message_count: usize,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Session {
     pub id: SessionId,
     pub workspace_root: PathBuf,
