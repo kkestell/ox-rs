@@ -10,12 +10,24 @@ pub enum StreamEvent {
     TextDelta(String),
     ReasoningDelta(String),
     /// Encrypted reasoning arrives as a single opaque blob, not a delta stream.
-    EncryptedReasoning { data: String, format: String },
-    ToolCallStart { index: usize, id: String, name: String },
-    ToolCallArgumentDelta { index: usize, delta: String },
+    EncryptedReasoning {
+        data: String,
+        format: String,
+    },
+    ToolCallStart {
+        index: usize,
+        id: String,
+        name: String,
+    },
+    ToolCallArgumentDelta {
+        index: usize,
+        delta: String,
+    },
     /// Anthropic-style signature for reasoning verification, separate from content.
     ReasoningSignature(String),
-    Finished { usage: Usage },
+    Finished {
+        usage: Usage,
+    },
 }
 
 #[derive(Debug, Clone, Default)]
@@ -147,7 +159,11 @@ mod tests {
         acc.push(StreamEvent::TextDelta("Hello, ".into()));
         acc.push(StreamEvent::TextDelta("world!".into()));
         acc.push(StreamEvent::Finished {
-            usage: Usage { prompt_tokens: 10, completion_tokens: 5, reasoning_tokens: 0 },
+            usage: Usage {
+                prompt_tokens: 10,
+                completion_tokens: 5,
+                reasoning_tokens: 0,
+            },
         });
 
         let msg = acc.into_message();
@@ -174,14 +190,22 @@ mod tests {
             delta: r#""foo.rs"}"#.into(),
         });
         acc.push(StreamEvent::Finished {
-            usage: Usage { prompt_tokens: 10, completion_tokens: 8, reasoning_tokens: 0 },
+            usage: Usage {
+                prompt_tokens: 10,
+                completion_tokens: 8,
+                reasoning_tokens: 0,
+            },
         });
 
         let msg = acc.into_message();
         let calls = msg.tool_calls();
         assert_eq!(calls.len(), 1);
         match &calls[0] {
-            ContentBlock::ToolCall { id, name, arguments } => {
+            ContentBlock::ToolCall {
+                id,
+                name,
+                arguments,
+            } => {
                 assert_eq!(id, "call_1");
                 assert_eq!(name, "read_file");
                 assert_eq!(arguments, r#"{"path":"foo.rs"}"#);
@@ -194,15 +218,29 @@ mod tests {
     fn parallel_tool_calls() {
         let mut acc = StreamAccumulator::new();
         acc.push(StreamEvent::ToolCallStart {
-            index: 0, id: "call_a".into(), name: "tool_a".into(),
+            index: 0,
+            id: "call_a".into(),
+            name: "tool_a".into(),
         });
         acc.push(StreamEvent::ToolCallStart {
-            index: 1, id: "call_b".into(), name: "tool_b".into(),
+            index: 1,
+            id: "call_b".into(),
+            name: "tool_b".into(),
         });
-        acc.push(StreamEvent::ToolCallArgumentDelta { index: 0, delta: r#"{"x":1}"#.into() });
-        acc.push(StreamEvent::ToolCallArgumentDelta { index: 1, delta: r#"{"y":2}"#.into() });
+        acc.push(StreamEvent::ToolCallArgumentDelta {
+            index: 0,
+            delta: r#"{"x":1}"#.into(),
+        });
+        acc.push(StreamEvent::ToolCallArgumentDelta {
+            index: 1,
+            delta: r#"{"y":2}"#.into(),
+        });
         acc.push(StreamEvent::Finished {
-            usage: Usage { prompt_tokens: 0, completion_tokens: 10, reasoning_tokens: 0 },
+            usage: Usage {
+                prompt_tokens: 0,
+                completion_tokens: 10,
+                reasoning_tokens: 0,
+            },
         });
 
         let msg = acc.into_message();
@@ -226,14 +264,23 @@ mod tests {
         acc.push(StreamEvent::ReasoningDelta(" done.".into()));
         acc.push(StreamEvent::TextDelta("The answer is 42.".into()));
         acc.push(StreamEvent::Finished {
-            usage: Usage { prompt_tokens: 5, completion_tokens: 12, reasoning_tokens: 8 },
+            usage: Usage {
+                prompt_tokens: 5,
+                completion_tokens: 12,
+                reasoning_tokens: 8,
+            },
         });
 
         let msg = acc.into_message();
         assert_eq!(msg.text(), "The answer is 42.");
         assert_eq!(msg.content.len(), 2);
         match &msg.content[0] {
-            ContentBlock::Reasoning { content, signature, encrypted, format } => {
+            ContentBlock::Reasoning {
+                content,
+                signature,
+                encrypted,
+                format,
+            } => {
                 assert_eq!(content, "Let me think... done.");
                 assert!(signature.is_none());
                 assert!(encrypted.is_none());
@@ -252,13 +299,22 @@ mod tests {
         });
         acc.push(StreamEvent::TextDelta("visible answer".into()));
         acc.push(StreamEvent::Finished {
-            usage: Usage { prompt_tokens: 0, completion_tokens: 3, reasoning_tokens: 10 },
+            usage: Usage {
+                prompt_tokens: 0,
+                completion_tokens: 3,
+                reasoning_tokens: 10,
+            },
         });
 
         let msg = acc.into_message();
         assert_eq!(msg.content.len(), 2);
         match &msg.content[0] {
-            ContentBlock::Reasoning { content, encrypted, format, .. } => {
+            ContentBlock::Reasoning {
+                content,
+                encrypted,
+                format,
+                ..
+            } => {
                 assert!(content.is_empty());
                 assert_eq!(encrypted.as_deref(), Some("base64blob=="));
                 assert_eq!(format.as_deref(), Some("anthropic-claude-v1"));
@@ -274,7 +330,11 @@ mod tests {
         acc.push(StreamEvent::ReasoningSignature("sig123".into()));
         acc.push(StreamEvent::TextDelta("answer".into()));
         acc.push(StreamEvent::Finished {
-            usage: Usage { prompt_tokens: 0, completion_tokens: 2, reasoning_tokens: 5 },
+            usage: Usage {
+                prompt_tokens: 0,
+                completion_tokens: 2,
+                reasoning_tokens: 5,
+            },
         });
 
         let msg = acc.into_message();
@@ -291,11 +351,20 @@ mod tests {
         let mut acc = StreamAccumulator::new();
         acc.push(StreamEvent::TextDelta("I'll read that file.".into()));
         acc.push(StreamEvent::ToolCallStart {
-            index: 0, id: "call_1".into(), name: "read".into(),
+            index: 0,
+            id: "call_1".into(),
+            name: "read".into(),
         });
-        acc.push(StreamEvent::ToolCallArgumentDelta { index: 0, delta: "{}".into() });
+        acc.push(StreamEvent::ToolCallArgumentDelta {
+            index: 0,
+            delta: "{}".into(),
+        });
         acc.push(StreamEvent::Finished {
-            usage: Usage { prompt_tokens: 0, completion_tokens: 6, reasoning_tokens: 0 },
+            usage: Usage {
+                prompt_tokens: 0,
+                completion_tokens: 6,
+                reasoning_tokens: 0,
+            },
         });
 
         let msg = acc.into_message();
@@ -309,7 +378,11 @@ mod tests {
     fn empty_response() {
         let mut acc = StreamAccumulator::new();
         acc.push(StreamEvent::Finished {
-            usage: Usage { prompt_tokens: 5, completion_tokens: 0, reasoning_tokens: 0 },
+            usage: Usage {
+                prompt_tokens: 5,
+                completion_tokens: 0,
+                reasoning_tokens: 0,
+            },
         });
 
         let msg = acc.into_message();
@@ -322,9 +395,16 @@ mod tests {
     fn orphan_argument_delta_is_silently_dropped() {
         let mut acc = StreamAccumulator::new();
         // Argument delta arrives for an index that was never started.
-        acc.push(StreamEvent::ToolCallArgumentDelta { index: 99, delta: "garbage".into() });
+        acc.push(StreamEvent::ToolCallArgumentDelta {
+            index: 99,
+            delta: "garbage".into(),
+        });
         acc.push(StreamEvent::Finished {
-            usage: Usage { prompt_tokens: 0, completion_tokens: 0, reasoning_tokens: 0 },
+            usage: Usage {
+                prompt_tokens: 0,
+                completion_tokens: 0,
+                reasoning_tokens: 0,
+            },
         });
 
         let msg = acc.into_message();
@@ -342,13 +422,22 @@ mod tests {
         acc.push(StreamEvent::ReasoningSignature("sig_abc".into()));
         acc.push(StreamEvent::TextDelta("visible".into()));
         acc.push(StreamEvent::Finished {
-            usage: Usage { prompt_tokens: 0, completion_tokens: 1, reasoning_tokens: 10 },
+            usage: Usage {
+                prompt_tokens: 0,
+                completion_tokens: 1,
+                reasoning_tokens: 10,
+            },
         });
 
         let msg = acc.into_message();
         assert_eq!(msg.content.len(), 2);
         match &msg.content[0] {
-            ContentBlock::Reasoning { content, encrypted, signature, format } => {
+            ContentBlock::Reasoning {
+                content,
+                encrypted,
+                signature,
+                format,
+            } => {
                 assert!(content.is_empty());
                 assert_eq!(encrypted.as_deref(), Some("encrypted_blob"));
                 assert_eq!(format.as_deref(), Some("anthropic-claude-v1"));
@@ -369,15 +458,25 @@ mod tests {
             format: "unknown".into(),
         });
         acc.push(StreamEvent::Finished {
-            usage: Usage { prompt_tokens: 0, completion_tokens: 0, reasoning_tokens: 5 },
+            usage: Usage {
+                prompt_tokens: 0,
+                completion_tokens: 0,
+                reasoning_tokens: 5,
+            },
         });
 
         let msg = acc.into_message();
         // Only one reasoning block — the readable one.
-        let reasoning_blocks: Vec<_> = msg.content.iter().filter(|b| matches!(b, ContentBlock::Reasoning { .. })).collect();
+        let reasoning_blocks: Vec<_> = msg
+            .content
+            .iter()
+            .filter(|b| matches!(b, ContentBlock::Reasoning { .. }))
+            .collect();
         assert_eq!(reasoning_blocks.len(), 1);
         match &reasoning_blocks[0] {
-            ContentBlock::Reasoning { content, encrypted, .. } => {
+            ContentBlock::Reasoning {
+                content, encrypted, ..
+            } => {
                 assert_eq!(content, "readable thinking");
                 assert!(encrypted.is_none());
             }

@@ -35,10 +35,7 @@ pub trait FileSystem {
 }
 
 pub trait Shell {
-    fn run(
-        &self,
-        command: &str,
-    ) -> impl Future<Output = Result<CommandOutput>> + Send;
+    fn run(&self, command: &str) -> impl Future<Output = Result<CommandOutput>> + Send;
 }
 
 #[derive(Debug, Clone)]

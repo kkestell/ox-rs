@@ -6,8 +6,8 @@ use anyhow::Result;
 use domain::Message;
 use futures::stream::{self, Stream};
 
-use crate::stream::{StreamEvent, ToolDef, Usage};
 use crate::LlmProvider;
+use crate::stream::{StreamEvent, ToolDef, Usage};
 
 /// Test double for `LlmProvider`. Queue responses ahead of time; each
 /// `stream()` call pops the next one. Panics if the queue is empty — a
@@ -119,7 +119,11 @@ mod tests {
         let calls = msg.tool_calls();
         assert_eq!(calls.len(), 1);
         match &calls[0] {
-            ContentBlock::ToolCall { id, name, arguments } => {
+            ContentBlock::ToolCall {
+                id,
+                name,
+                arguments,
+            } => {
                 assert_eq!(id, "call_1");
                 assert_eq!(name, "read_file");
                 assert_eq!(arguments, r#"{"path":"a.rs"}"#);

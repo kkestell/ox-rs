@@ -123,11 +123,7 @@ pub struct SseUsage {
 // ---------------------------------------------------------------------------
 
 impl RequestBody {
-    pub fn from_messages(
-        model: &str,
-        messages: &[Message],
-        tools: &[ToolDef],
-    ) -> Self {
+    pub fn from_messages(model: &str, messages: &[Message], tools: &[ToolDef]) -> Self {
         let wire_messages: Vec<WireMessage> = messages.iter().map(wire_message).collect();
 
         let wire_tools: Vec<WireTool> = tools
@@ -169,7 +165,11 @@ fn wire_message(msg: &Message) -> WireMessage {
                 .content
                 .iter()
                 .filter_map(|b| match b {
-                    ContentBlock::ToolCall { id, name, arguments } => Some(WireToolCall {
+                    ContentBlock::ToolCall {
+                        id,
+                        name,
+                        arguments,
+                    } => Some(WireToolCall {
                         id: id.clone(),
                         call_type: "function".to_owned(),
                         function: WireFunction {
@@ -187,7 +187,11 @@ fn wire_message(msg: &Message) -> WireMessage {
                     let t = msg.text();
                     if t.is_empty() { None } else { Some(t) }
                 },
-                tool_calls: if tool_calls.is_empty() { None } else { Some(tool_calls) },
+                tool_calls: if tool_calls.is_empty() {
+                    None
+                } else {
+                    Some(tool_calls)
+                },
                 tool_call_id: None,
             }
         }
@@ -197,9 +201,11 @@ fn wire_message(msg: &Message) -> WireMessage {
                 .content
                 .iter()
                 .find_map(|b| match b {
-                    ContentBlock::ToolResult { tool_call_id, content, .. } => {
-                        Some((tool_call_id.clone(), content.clone()))
-                    }
+                    ContentBlock::ToolResult {
+                        tool_call_id,
+                        content,
+                        ..
+                    } => Some((tool_call_id.clone(), content.clone())),
                     _ => None,
                 })
                 .unwrap_or_default();
@@ -230,7 +236,9 @@ mod tests {
 
     #[test]
     fn assistant_text_only() {
-        let msg = Message::assistant(vec![ContentBlock::Text { text: "reply".into() }]);
+        let msg = Message::assistant(vec![ContentBlock::Text {
+            text: "reply".into(),
+        }]);
         let wire = wire_message(&msg);
         assert_eq!(wire.role, "assistant");
         assert_eq!(wire.content.as_deref(), Some("reply"));
@@ -273,7 +281,9 @@ mod tests {
                 encrypted: None,
                 format: None,
             },
-            ContentBlock::Text { text: "answer".into() },
+            ContentBlock::Text {
+                text: "answer".into(),
+            },
         ]);
         let wire = wire_message(&msg);
         assert_eq!(wire.content.as_deref(), Some("answer"));

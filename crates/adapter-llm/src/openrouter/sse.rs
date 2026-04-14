@@ -180,8 +180,10 @@ mod tests {
         let chunk: SseChunk = serde_json::from_str(json).unwrap();
         let events = chunk_to_events(&chunk);
         assert_eq!(events.len(), 1);
-        assert!(matches!(&events[0], StreamEvent::EncryptedReasoning { data, format }
-            if data == "blob==" && format == "anthropic-claude-v1"));
+        assert!(
+            matches!(&events[0], StreamEvent::EncryptedReasoning { data, format }
+            if data == "blob==" && format == "anthropic-claude-v1")
+        );
     }
 
     #[test]
@@ -199,10 +201,14 @@ mod tests {
         let chunk: SseChunk = serde_json::from_str(json).unwrap();
         let events = chunk_to_events(&chunk);
         assert_eq!(events.len(), 2); // ToolCallStart + ToolCallArgumentDelta
-        assert!(matches!(&events[0], StreamEvent::ToolCallStart { index: 0, id, name }
-            if id == "call_1" && name == "read_file"));
-        assert!(matches!(&events[1], StreamEvent::ToolCallArgumentDelta { index: 0, delta }
-            if delta == r#"{"path":"#));
+        assert!(
+            matches!(&events[0], StreamEvent::ToolCallStart { index: 0, id, name }
+            if id == "call_1" && name == "read_file")
+        );
+        assert!(
+            matches!(&events[1], StreamEvent::ToolCallArgumentDelta { index: 0, delta }
+            if delta == r#"{"path":"#)
+        );
     }
 
     #[test]
