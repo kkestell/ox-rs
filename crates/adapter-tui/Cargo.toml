@@ -1,0 +1,9 @@
+[package]
+name = "adapter-tui"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.102"
+app = { version = "0.1.0", path = "../app" }
+domain = { version = "0.1.0", path = "../domain" }

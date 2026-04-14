@@ -1,0 +1,27 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/domain",
+    "crates/app",
+    "crates/adapter-llm",
+    "crates/adapter-storage",
+    "crates/adapter-fs",
+    "crates/adapter-tui",
+    "crates/adapter-secrets",
+]
+
+[package]
+name = "ox"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+adapter-fs = { version = "0.1.0", path = "crates/adapter-fs" }
+adapter-llm = { version = "0.1.0", path = "crates/adapter-llm" }
+adapter-secrets = { version = "0.1.0", path = "crates/adapter-secrets" }
+adapter-storage = { version = "0.1.0", path = "crates/adapter-storage" }
+adapter-tui = { version = "0.1.0", path = "crates/adapter-tui" }
+anyhow = "1.0.102"
+app = { version = "0.1.0", path = "crates/app" }
+domain = { version = "0.1.0", path = "crates/domain" }
+tokio = { version = "1.51.1", features = ["full"] }
