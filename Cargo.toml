@@ -6,7 +6,7 @@ members = [
     "crates/adapter-llm",
     "crates/adapter-storage",
     "crates/adapter-fs",
-    "crates/adapter-tui",
+    "crates/adapter-egui",
     "crates/adapter-secrets",
 ]
 
@@ -20,7 +20,7 @@ adapter-fs = { version = "0.1.0", path = "crates/adapter-fs" }
 adapter-llm = { version = "0.1.0", path = "crates/adapter-llm" }
 adapter-secrets = { version = "0.1.0", path = "crates/adapter-secrets" }
 adapter-storage = { version = "0.1.0", path = "crates/adapter-storage" }
-adapter-tui = { version = "0.1.0", path = "crates/adapter-tui" }
+adapter-egui = { version = "0.1.0", path = "crates/adapter-egui" }
 anyhow = "1.0.102"
 app = { version = "0.1.0", path = "crates/app" }
 domain = { version = "0.1.0", path = "crates/domain" }

@@ -9,8 +9,8 @@ fn main() -> Result<()> {
     // let shell = adapter_fs::BashShell;
     // let runner = app::SessionRunner::new(llm, store);
     // let id = domain::SessionId::new_v4();
-    // let tui = adapter_tui::TuiApp::new();
-    // tui.run()
+    // let gui = adapter_egui::OxApp::new();
+    // gui.run()
 
     println!("ox");
     Ok(())

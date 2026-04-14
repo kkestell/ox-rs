@@ -1,5 +1,5 @@
 [package]
-name = "adapter-tui"
+name = "adapter-egui"
 version = "0.1.0"
 edition = "2024"
 
@@ -7,3 +7,4 @@ edition = "2024"
 anyhow = "1.0.102"
 app = { version = "0.1.0", path = "../app" }
 domain = { version = "0.1.0", path = "../domain" }
+eframe = "0.31"

@@ -1,11 +1,12 @@
 # AGENTS.md
 
-Ox is a terminal-based AI coding assistant built in Rust. It uses a hexagonal (ports-and-adapters) architecture to stream LLM responses through a TUI, with pluggable backends for model providers, session persistence, filesystem access, and secret management.
+Ox is a desktop AI coding assistant built in Rust. It uses a hexagonal (ports-and-adapters) architecture to stream LLM responses through an egui GUI, with pluggable backends for model providers, session persistence, filesystem access, and secret management.
 
 ## Tech Stack
 
 - **Language:** Rust (edition 2024)
 - **Build system:** Cargo (workspace with 7 internal crates + root binary)
+- **GUI framework:** egui (via eframe)
 
 ## Codebase Map
 
@@ -14,7 +15,7 @@ Ox is a terminal-based AI coding assistant built in Rust. It uses a hexagonal (p
 - `crates/app/` — Application layer: port traits (LlmProvider, SessionStore, SecretStore, FileSystem, Shell), use cases (SessionRunner), streaming (StreamEvent, StreamAccumulator, ToolDef)
 - `crates/adapter-llm/` — LLM provider implementations: OpenRouter (streaming via SSE), Ollama (stub)
 - `crates/adapter-storage/` — Session persistence: DiskSessionStore (stub)
-- `crates/adapter-tui/` — Terminal UI (stub)
+- `crates/adapter-egui/` — GUI client: egui/eframe native window (stub)
 - `crates/adapter-fs/` — Filesystem and shell: LocalFileSystem (implemented), BashShell (stub)
 - `crates/adapter-secrets/` — Secret retrieval: EnvSecretStore (implemented)
 - `experiments/` — Throwaway scripts for testing provider APIs
@@ -49,7 +50,7 @@ The stable architectural shape.
 ```mermaid
 flowchart TB
     main["Binary<br/>src/main.rs"]
-    adapters["Adapters<br/>adapter-tui · adapter-llm · adapter-storage · adapter-fs · adapter-secrets"]
+    adapters["Adapters<br/>adapter-egui · adapter-llm · adapter-storage · adapter-fs · adapter-secrets"]
     app["Application<br/>ports · use_cases · stream"]
     domain["Domain<br/>Session · Message · ContentBlock · Role · SessionId · SessionSummary"]
 
@@ -93,7 +94,7 @@ sequenceDiagram
 
 Current status:
 - `src/main.rs`: stub binary, no composition root yet.
-- `adapter-tui`: stub, not wired to `SessionRunner`.
+- `adapter-egui`: stub egui window, not wired to `SessionRunner`.
 - `adapter-llm/OpenRouterProvider`: implemented streaming path.
 - `adapter-llm/OllamaProvider`: stub.
 - `adapter-storage/DiskSessionStore`: constructor only, load/save/list are stubs.
@@ -108,22 +109,22 @@ What a full end-to-end turn should look like once wiring is complete.
 ```mermaid
 sequenceDiagram
     participant M as main.rs
-    participant T as TuiApp
+    participant G as OxApp (egui)
     participant SR as SessionRunner
     participant SS as SessionStore
     participant LP as LlmProvider
     participant ACC as StreamAccumulator
 
-    M->>T: wire adapters and start app
-    T->>SR: start(id, workspace_root, input) or resume(id, input)
+    M->>G: wire adapters and start app
+    G->>SR: start(id, workspace_root, input) or resume(id, input)
     SR->>SS: load session [resume] / create new [start]
     SR->>LP: stream model response
 
     loop each streamed event
         SR->>ACC: push(event)
-        ACC-->>T: incremental UI state
+        ACC-->>G: incremental UI state
     end
 
     SR->>SS: save updated session
-    SR-->>T: completed assistant message
+    SR-->>G: completed assistant message
 ```
