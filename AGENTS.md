@@ -10,12 +10,12 @@ Ox is a desktop AI coding assistant built in Rust. It uses a hexagonal (ports-an
 
 ## Codebase Map
 
-- `src/main.rs` — Binary entry point; composition root (stub — not yet wiring adapters)
+- `src/main.rs` — Binary entry point; composition root wiring adapters, tokio runtime, channels, and GUI
 - `crates/domain/` — Core types: Session, Message, ContentBlock, Role, SessionId, SessionSummary
 - `crates/app/` — Application layer: port traits (LlmProvider, SessionStore, SecretStore, FileSystem, Shell), use cases (SessionRunner), streaming (StreamEvent, StreamAccumulator, ToolDef)
 - `crates/adapter-llm/` — LLM provider implementations: OpenRouter (streaming via SSE), Ollama (stub)
 - `crates/adapter-storage/` — Session persistence: DiskSessionStore (stub)
-- `crates/adapter-egui/` — GUI client: egui/eframe native window (stub)
+- `crates/adapter-egui/` — GUI client: egui/eframe native window with channel-driven backend controller (`backend.rs`)
 - `crates/adapter-fs/` — Filesystem and shell: LocalFileSystem (implemented), BashShell (stub)
 - `crates/adapter-secrets/` — Secret retrieval: EnvSecretStore (implemented)
 - `experiments/` — Throwaway scripts for testing provider APIs
@@ -70,19 +70,19 @@ What is actually implemented today.
 
 ```mermaid
 sequenceDiagram
+    participant M as main.rs
+    participant G as OxApp (egui)
+    participant BC as run_backend
     participant SR as SessionRunner
     participant SS as SessionStore
     participant LP as LlmProvider
-    participant OR as OpenRouterProvider
-    participant SSE as SSE parser
     participant ACC as StreamAccumulator
 
-    SR->>SS: load(session_id) [resume] / create new [start]
-    SS-->>SR: Session
+    M->>G: create channels, spawn backend, launch GUI
+    G->>BC: BackendCommand::SendMessage (via channel)
+    BC->>SR: start(id, workspace_root, input) or resume(id, input)
+    SR->>SS: load session [resume] / create new [start]
     SR->>LP: stream(messages, tools=[])
-    LP->>OR: provider call
-    OR->>SSE: parse response body
-    SSE-->>SR: StreamEvent
 
     loop each streamed event
         SR->>ACC: push(event)
@@ -90,41 +90,21 @@ sequenceDiagram
 
     ACC-->>SR: completed Message
     SR->>SS: save(updated session)
+    BC-->>G: BackendEvent::AssistantMessage (via channel)
 ```
 
 Current status:
-- `src/main.rs`: stub binary, no composition root yet.
-- `adapter-egui`: stub egui window, not wired to `SessionRunner`.
+- `src/main.rs`: composition root wiring all adapters and launching the GUI.
+- `adapter-egui`: channel-driven GUI with message display, text input, send button, and event polling. `backend.rs` contains the `run_backend` controller and channel protocol types.
 - `adapter-llm/OpenRouterProvider`: implemented streaming path.
 - `adapter-llm/OllamaProvider`: stub.
-- `adapter-storage/DiskSessionStore`: constructor only, load/save/list are stubs.
+- `adapter-storage/DiskSessionStore`: implemented (load, save, list).
 - `adapter-fs/LocalFileSystem`: implemented.
 - `adapter-fs/BashShell`: stub.
 - `adapter-secrets/EnvSecretStore`: implemented.
 
-### Target Runtime Path
-
-What a full end-to-end turn should look like once wiring is complete.
-
-```mermaid
-sequenceDiagram
-    participant M as main.rs
-    participant G as OxApp (egui)
-    participant SR as SessionRunner
-    participant SS as SessionStore
-    participant LP as LlmProvider
-    participant ACC as StreamAccumulator
-
-    M->>G: wire adapters and start app
-    G->>SR: start(id, workspace_root, input) or resume(id, input)
-    SR->>SS: load session [resume] / create new [start]
-    SR->>LP: stream model response
-
-    loop each streamed event
-        SR->>ACC: push(event)
-        ACC-->>G: incremental UI state
-    end
-
-    SR->>SS: save updated session
-    SR-->>G: completed assistant message
-```
+Not yet implemented:
+- Streaming display (response appears only after full completion).
+- Model/config selection (model is hardcoded).
+- Session management (new session on every launch).
+- Error recovery UI (errors displayed but no retry/dismiss).

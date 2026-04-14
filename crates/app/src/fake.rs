@@ -10,11 +10,18 @@ use crate::LlmProvider;
 use crate::ports::SessionStore;
 use crate::stream::{StreamEvent, ToolDef, Usage};
 
+/// A queued response: either a sequence of stream events (success) or an
+/// error message that `stream()` will return as `Err(...)`.
+enum QueuedResponse {
+    Events(Vec<StreamEvent>),
+    Error(String),
+}
+
 /// Test double for `LlmProvider`. Queue responses ahead of time; each
 /// `stream()` call pops the next one. Panics if the queue is empty — a
 /// missing response is a test bug, not a graceful failure.
 pub struct FakeLlmProvider {
-    responses: Mutex<VecDeque<Vec<StreamEvent>>>,
+    responses: Mutex<VecDeque<QueuedResponse>>,
 }
 
 impl FakeLlmProvider {
@@ -26,7 +33,18 @@ impl FakeLlmProvider {
 
     /// Queue a raw sequence of events.
     pub fn push_response(&self, events: Vec<StreamEvent>) {
-        self.responses.lock().unwrap().push_back(events);
+        self.responses
+            .lock()
+            .unwrap()
+            .push_back(QueuedResponse::Events(events));
+    }
+
+    /// Queue an error response. The next `stream()` call will return `Err`.
+    pub fn push_error(&self, msg: impl Into<String>) {
+        self.responses
+            .lock()
+            .unwrap()
+            .push_back(QueuedResponse::Error(msg.into()));
     }
 
     /// Convenience: queue a simple text response.
@@ -72,14 +90,19 @@ impl LlmProvider for FakeLlmProvider {
         _messages: &[Message],
         _tools: &[ToolDef],
     ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamEvent>> + Send>>> {
-        let events = self
+        let queued = self
             .responses
             .lock()
             .unwrap()
             .pop_front()
             .expect("FakeLlmProvider: no responses queued — did you forget to call push_*?");
 
-        Ok(Box::pin(stream::iter(events.into_iter().map(Ok))))
+        match queued {
+            QueuedResponse::Events(events) => {
+                Ok(Box::pin(stream::iter(events.into_iter().map(Ok))))
+            }
+            QueuedResponse::Error(msg) => Err(anyhow::anyhow!("{msg}")),
+        }
     }
 }
 
