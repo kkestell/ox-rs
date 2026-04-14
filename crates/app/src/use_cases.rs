@@ -5,7 +5,7 @@ use domain::{Message, Session, SessionId};
 use futures::StreamExt;
 
 use crate::ports::{LlmProvider, SessionStore};
-use crate::stream::StreamAccumulator;
+use crate::stream::{StreamAccumulator, StreamEvent};
 
 /// Runs conversation turns against an LLM, handling session creation, message
 /// accumulation, and persistence. Exposes two entry points:
@@ -28,22 +28,34 @@ impl<L: LlmProvider, S: SessionStore> SessionRunner<L, S> {
     /// Create a new session and run the first turn. The caller is responsible
     /// for generating the `SessionId` — this keeps the app layer pure and
     /// deterministic.
+    ///
+    /// The `on_event` callback fires for each stream event as it arrives,
+    /// before accumulation — see `run_turn` for details.
     pub async fn start(
         &self,
         id: SessionId,
         workspace_root: PathBuf,
         input: &str,
+        on_event: impl FnMut(&StreamEvent) + Send,
     ) -> Result<(SessionId, Message)> {
         let mut session = Session::new(id, workspace_root);
-        let response = self.run_turn(&mut session, input).await?;
+        let response = self.run_turn(&mut session, input, on_event).await?;
         self.store.save(&session).await?;
         Ok((id, response))
     }
 
     /// Load an existing session and run the next turn.
-    pub async fn resume(&self, id: SessionId, input: &str) -> Result<Message> {
+    ///
+    /// The `on_event` callback fires for each stream event as it arrives,
+    /// before accumulation — see `run_turn` for details.
+    pub async fn resume(
+        &self,
+        id: SessionId,
+        input: &str,
+        on_event: impl FnMut(&StreamEvent) + Send,
+    ) -> Result<Message> {
         let mut session = self.store.load(id).await?;
-        let response = self.run_turn(&mut session, input).await?;
+        let response = self.run_turn(&mut session, input, on_event).await?;
         self.store.save(&session).await?;
         Ok(response)
     }
@@ -51,13 +63,25 @@ impl<L: LlmProvider, S: SessionStore> SessionRunner<L, S> {
     /// Core turn loop: append the user message, stream the LLM response,
     /// accumulate it into a `Message`, and append the assistant reply to
     /// the session. The caller is responsible for saving.
-    async fn run_turn(&self, session: &mut Session, input: &str) -> Result<Message> {
+    ///
+    /// The `on_event` callback fires for each stream event before it is
+    /// accumulated, giving callers a chance to forward incremental updates
+    /// (e.g. to a GUI) without breaking SessionRunner's ownership of the
+    /// turn lifecycle.
+    async fn run_turn(
+        &self,
+        session: &mut Session,
+        input: &str,
+        mut on_event: impl FnMut(&StreamEvent) + Send,
+    ) -> Result<Message> {
         session.push_message(Message::user(input));
 
         let mut event_stream = self.llm.stream(&session.messages, &[]).await?;
         let mut acc = StreamAccumulator::new();
         while let Some(event) = event_stream.next().await {
-            acc.push(event?);
+            let event = event?;
+            on_event(&event);
+            acc.push(event);
         }
         let response = acc.into_message();
 
@@ -90,7 +114,10 @@ mod tests {
 
         let runner = make_runner(llm, store);
         let id = SessionId::new_v4();
-        let (returned_id, msg) = runner.start(id, "/project".into(), "Hello").await.unwrap();
+        let (returned_id, msg) = runner
+            .start(id, "/project".into(), "Hello", |_| {})
+            .await
+            .unwrap();
 
         assert_eq!(returned_id, id);
         assert_eq!(msg.role, Role::Assistant);
@@ -105,7 +132,10 @@ mod tests {
 
         let runner = make_runner(llm, store);
         let id = SessionId::new_v4();
-        runner.start(id, "/my/project".into(), "hi").await.unwrap();
+        runner
+            .start(id, "/my/project".into(), "hi", |_| {})
+            .await
+            .unwrap();
 
         // Inspect the saved session through the store.
         let saved = runner.store.get(id).expect("session should be saved");
@@ -136,7 +166,7 @@ mod tests {
         store.insert(existing);
 
         let runner = make_runner(llm, store);
-        let msg = runner.resume(id, "turn 2").await.unwrap();
+        let msg = runner.resume(id, "turn 2", |_| {}).await.unwrap();
 
         assert_eq!(msg.role, Role::Assistant);
         assert_eq!(msg.text(), "continued");
@@ -154,8 +184,116 @@ mod tests {
         let store = FakeSessionStore::new();
         let runner = make_runner(llm, store);
 
-        let result = runner.resume(SessionId::new_v4(), "hi").await;
+        let result = runner.resume(SessionId::new_v4(), "hi", |_| {}).await;
         assert!(result.is_err());
+    }
+
+    // -- streaming callback --
+
+    #[tokio::test]
+    async fn start_invokes_callback_for_each_event() {
+        let llm = FakeLlmProvider::new();
+        llm.push_response(vec![
+            StreamEvent::TextDelta("Hello, ".into()),
+            StreamEvent::TextDelta("world!".into()),
+            StreamEvent::Finished {
+                usage: crate::stream::Usage {
+                    prompt_tokens: 0,
+                    completion_tokens: 2,
+                    reasoning_tokens: 0,
+                },
+            },
+        ]);
+        let store = FakeSessionStore::new();
+
+        let runner = make_runner(llm, store);
+        let id = SessionId::new_v4();
+        let mut collected = Vec::new();
+        let (_, msg) = runner
+            .start(id, "/project".into(), "hi", |evt| {
+                collected.push(evt.clone());
+            })
+            .await
+            .unwrap();
+
+        // Callback received all three events in order.
+        assert_eq!(collected.len(), 3);
+        assert!(matches!(&collected[0], StreamEvent::TextDelta(s) if s == "Hello, "));
+        assert!(matches!(&collected[1], StreamEvent::TextDelta(s) if s == "world!"));
+        assert!(matches!(&collected[2], StreamEvent::Finished { .. }));
+
+        // Final message is still correctly assembled.
+        assert_eq!(msg.text(), "Hello, world!");
+    }
+
+    #[tokio::test]
+    async fn resume_invokes_callback_for_each_event() {
+        let llm = FakeLlmProvider::new();
+        llm.push_response(vec![
+            StreamEvent::TextDelta("continued".into()),
+            StreamEvent::Finished {
+                usage: crate::stream::Usage {
+                    prompt_tokens: 0,
+                    completion_tokens: 1,
+                    reasoning_tokens: 0,
+                },
+            },
+        ]);
+        let store = FakeSessionStore::new();
+
+        let id = SessionId::new_v4();
+        let mut existing = Session::new(id, "/project".into());
+        existing.push_message(Message::user("turn 1"));
+        existing.push_message(Message::assistant(vec![domain::ContentBlock::Text {
+            text: "response 1".into(),
+        }]));
+        store.insert(existing);
+
+        let runner = make_runner(llm, store);
+        let mut collected = Vec::new();
+        let msg = runner
+            .resume(id, "turn 2", |evt| {
+                collected.push(evt.clone());
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(collected.len(), 2);
+        assert!(matches!(&collected[0], StreamEvent::TextDelta(s) if s == "continued"));
+        assert!(matches!(&collected[1], StreamEvent::Finished { .. }));
+        assert_eq!(msg.text(), "continued");
+    }
+
+    // -- mid-stream error --
+
+    #[tokio::test]
+    async fn mid_stream_error_invokes_callback_for_events_before_failure() {
+        let llm = FakeLlmProvider::new();
+        llm.push_error_after(
+            vec![StreamEvent::TextDelta("partial ".into())],
+            "connection lost",
+        );
+        let store = FakeSessionStore::new();
+
+        let runner = make_runner(llm, store);
+        let id = SessionId::new_v4();
+        let mut collected = Vec::new();
+        let result = runner
+            .start(id, "/project".into(), "hi", |evt| {
+                collected.push(evt.clone());
+            })
+            .await;
+
+        // Callback was invoked for the event before the error.
+        assert_eq!(collected.len(), 1);
+        assert!(matches!(&collected[0], StreamEvent::TextDelta(s) if s == "partial "));
+
+        // The overall turn failed.
+        assert!(result.is_err());
+        assert!(
+            result.unwrap_err().to_string().contains("connection lost"),
+            "error should propagate"
+        );
     }
 
     // -- multi-turn integration --
@@ -171,11 +309,14 @@ mod tests {
         let id = SessionId::new_v4();
 
         // Turn 1: start
-        let (_, msg1) = runner.start(id, "/project".into(), "hello").await.unwrap();
+        let (_, msg1) = runner
+            .start(id, "/project".into(), "hello", |_| {})
+            .await
+            .unwrap();
         assert_eq!(msg1.text(), "first reply");
 
         // Turn 2: resume
-        let msg2 = runner.resume(id, "followup").await.unwrap();
+        let msg2 = runner.resume(id, "followup", |_| {}).await.unwrap();
         assert_eq!(msg2.text(), "second reply");
 
         // Final session should have 4 messages total.

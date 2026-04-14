@@ -10,11 +10,16 @@ use crate::LlmProvider;
 use crate::ports::SessionStore;
 use crate::stream::{StreamEvent, ToolDef, Usage};
 
-/// A queued response: either a sequence of stream events (success) or an
-/// error message that `stream()` will return as `Err(...)`.
+/// A queued response: a sequence of stream events (success), a connection-time
+/// error, or a mid-stream error that fires after some successful events.
 enum QueuedResponse {
     Events(Vec<StreamEvent>),
     Error(String),
+    /// Some events succeed, then the stream yields an error.
+    MidStreamError {
+        events: Vec<StreamEvent>,
+        error: String,
+    },
 }
 
 /// Test double for `LlmProvider`. Queue responses ahead of time; each
@@ -61,6 +66,19 @@ impl FakeLlmProvider {
         ]);
     }
 
+    /// Queue a mid-stream error: the given events succeed, then the stream
+    /// yields an error. Simulates failures like a dropped connection after
+    /// partial output.
+    pub fn push_error_after(&self, events: Vec<StreamEvent>, msg: impl Into<String>) {
+        self.responses
+            .lock()
+            .unwrap()
+            .push_back(QueuedResponse::MidStreamError {
+                events,
+                error: msg.into(),
+            });
+    }
+
     /// Convenience: queue a single tool call response.
     pub fn push_tool_call(&self, id: &str, name: &str, arguments: &str) {
         self.push_response(vec![
@@ -102,6 +120,15 @@ impl LlmProvider for FakeLlmProvider {
                 Ok(Box::pin(stream::iter(events.into_iter().map(Ok))))
             }
             QueuedResponse::Error(msg) => Err(anyhow::anyhow!("{msg}")),
+            QueuedResponse::MidStreamError { events, error } => {
+                // Yield the successful events, then an error item.
+                let items: Vec<Result<StreamEvent>> = events
+                    .into_iter()
+                    .map(Ok)
+                    .chain(std::iter::once(Err(anyhow::anyhow!("{error}"))))
+                    .collect();
+                Ok(Box::pin(stream::iter(items)))
+            }
         }
     }
 }

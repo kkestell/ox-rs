@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use app::{LlmProvider, SessionRunner, SessionStore};
+use app::{LlmProvider, SessionRunner, SessionStore, StreamEvent};
 use domain::{Message, SessionId};
 use tokio::sync::mpsc;
 
@@ -16,7 +16,10 @@ pub enum BackendCommand {
 
 /// Events the backend sends back to the GUI.
 pub enum BackendEvent {
-    /// A completed assistant message (non-streaming for now).
+    /// An incremental stream event from the LLM (e.g. a text token). Sent
+    /// for each event as it arrives, before the final message is assembled.
+    StreamDelta(StreamEvent),
+    /// The completed assistant message, sent after the stream finishes.
     AssistantMessage(Message),
     /// An error from the LLM or session layer.
     Error(String),
@@ -47,11 +50,21 @@ pub async fn run_backend<L, S>(
     while let Some(cmd) = cmd_rx.recv().await {
         match cmd {
             BackendCommand::SendMessage { input } => {
+                // Closure that forwards each stream event to the GUI as a
+                // StreamDelta. Ignores send failures — if the GUI is gone,
+                // the final send below will detect it and exit the loop.
+                let stream_callback = |event: &StreamEvent| {
+                    let _ = evt_tx.send(BackendEvent::StreamDelta(event.clone()));
+                };
+
                 let result = match session_id {
                     None => {
                         // First message — create a fresh session.
                         let id = SessionId::new_v4();
-                        match runner.start(id, workspace_root.clone(), &input).await {
+                        match runner
+                            .start(id, workspace_root.clone(), &input, stream_callback)
+                            .await
+                        {
                             Ok((id, msg)) => {
                                 session_id = Some(id);
                                 Ok(msg)
@@ -65,7 +78,7 @@ pub async fn run_backend<L, S>(
                     }
                     Some(id) => {
                         // Subsequent message — resume the existing session.
-                        runner.resume(id, &input).await
+                        runner.resume(id, &input, stream_callback).await
                     }
                 };
 
@@ -110,6 +123,21 @@ mod tests {
         (cmd_tx, evt_rx, handle)
     }
 
+    /// Receive events until we hit a non-StreamDelta event, returning both the
+    /// collected deltas and the terminal event (AssistantMessage or Error).
+    async fn recv_past_deltas(
+        evt_rx: &mut mpsc::UnboundedReceiver<BackendEvent>,
+    ) -> (Vec<StreamEvent>, BackendEvent) {
+        let mut deltas = Vec::new();
+        loop {
+            let event = evt_rx.recv().await.expect("channel closed unexpectedly");
+            match event {
+                BackendEvent::StreamDelta(se) => deltas.push(se),
+                other => return (deltas, other),
+            }
+        }
+    }
+
     #[tokio::test]
     async fn first_message_creates_session() {
         let llm = FakeLlmProvider::new();
@@ -123,13 +151,14 @@ mod tests {
             })
             .unwrap();
 
-        let event = evt_rx.recv().await.unwrap();
+        let (_deltas, event) = recv_past_deltas(&mut evt_rx).await;
         match event {
             BackendEvent::AssistantMessage(msg) => {
                 assert_eq!(msg.role, Role::Assistant);
                 assert_eq!(msg.text(), "Hello back!");
             }
             BackendEvent::Error(e) => panic!("expected AssistantMessage, got Error: {e}"),
+            _ => panic!("unexpected event"),
         }
 
         drop(cmd_tx);
@@ -150,10 +179,11 @@ mod tests {
                 input: "hello".into(),
             })
             .unwrap();
-        let event1 = evt_rx.recv().await.unwrap();
+        let (_deltas, event1) = recv_past_deltas(&mut evt_rx).await;
         match &event1 {
             BackendEvent::AssistantMessage(msg) => assert_eq!(msg.text(), "first reply"),
             BackendEvent::Error(e) => panic!("expected AssistantMessage, got Error: {e}"),
+            _ => panic!("unexpected event"),
         }
 
         // Second message — triggers resume()
@@ -162,10 +192,11 @@ mod tests {
                 input: "followup".into(),
             })
             .unwrap();
-        let event2 = evt_rx.recv().await.unwrap();
+        let (_deltas, event2) = recv_past_deltas(&mut evt_rx).await;
         match &event2 {
             BackendEvent::AssistantMessage(msg) => assert_eq!(msg.text(), "second reply"),
             BackendEvent::Error(e) => panic!("expected AssistantMessage, got Error: {e}"),
+            _ => panic!("unexpected event"),
         }
 
         drop(cmd_tx);
@@ -183,14 +214,15 @@ mod tests {
             .send(BackendCommand::SendMessage { input: "hi".into() })
             .unwrap();
 
-        let event = evt_rx.recv().await.unwrap();
+        // Error occurs at stream creation time — no StreamDelta events
+        // should precede the Error event.
+        let (deltas, event) = recv_past_deltas(&mut evt_rx).await;
+        assert!(deltas.is_empty(), "expected no StreamDelta before error");
         match event {
             BackendEvent::Error(msg) => {
                 assert!(msg.contains("model overloaded"), "error was: {msg}");
             }
-            BackendEvent::AssistantMessage(_) => {
-                panic!("expected Error, got AssistantMessage")
-            }
+            _ => panic!("expected Error event"),
         }
 
         drop(cmd_tx);
@@ -214,7 +246,7 @@ mod tests {
                 input: "hello".into(),
             })
             .unwrap();
-        let event1 = evt_rx.recv().await.unwrap();
+        let (_deltas, event1) = recv_past_deltas(&mut evt_rx).await;
         assert!(
             matches!(&event1, BackendEvent::Error(_)),
             "expected Error on first attempt"
@@ -226,10 +258,88 @@ mod tests {
                 input: "hello again".into(),
             })
             .unwrap();
-        let event2 = evt_rx.recv().await.unwrap();
+        let (_deltas, event2) = recv_past_deltas(&mut evt_rx).await;
         match &event2 {
             BackendEvent::AssistantMessage(msg) => assert_eq!(msg.text(), "recovered!"),
             BackendEvent::Error(e) => panic!("expected recovery, got Error: {e}"),
+            _ => panic!("unexpected event"),
+        }
+
+        drop(cmd_tx);
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn streaming_events_arrive_before_final_message() {
+        let llm = FakeLlmProvider::new();
+        llm.push_response(vec![
+            StreamEvent::TextDelta("Hello, ".into()),
+            StreamEvent::TextDelta("world!".into()),
+            StreamEvent::Finished {
+                usage: app::Usage {
+                    prompt_tokens: 0,
+                    completion_tokens: 2,
+                    reasoning_tokens: 0,
+                },
+            },
+        ]);
+        let store = FakeSessionStore::new();
+        let (cmd_tx, mut evt_rx, handle) = start_backend(llm, store);
+
+        cmd_tx
+            .send(BackendCommand::SendMessage {
+                input: "hello".into(),
+            })
+            .unwrap();
+
+        let (deltas, final_event) = recv_past_deltas(&mut evt_rx).await;
+
+        // Three StreamDelta events: TextDelta, TextDelta, Finished.
+        assert_eq!(deltas.len(), 3);
+        assert!(matches!(&deltas[0], StreamEvent::TextDelta(s) if s == "Hello, "));
+        assert!(matches!(&deltas[1], StreamEvent::TextDelta(s) if s == "world!"));
+        assert!(matches!(&deltas[2], StreamEvent::Finished { .. }));
+
+        // Followed by the final assembled AssistantMessage.
+        match final_event {
+            BackendEvent::AssistantMessage(msg) => {
+                assert_eq!(msg.text(), "Hello, world!");
+            }
+            _ => panic!("expected AssistantMessage after deltas"),
+        }
+
+        drop(cmd_tx);
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn mid_stream_error_sends_deltas_then_error() {
+        let llm = FakeLlmProvider::new();
+        llm.push_error_after(
+            vec![StreamEvent::TextDelta("partial".into())],
+            "stream interrupted",
+        );
+        let store = FakeSessionStore::new();
+        let (cmd_tx, mut evt_rx, handle) = start_backend(llm, store);
+
+        cmd_tx
+            .send(BackendCommand::SendMessage {
+                input: "hello".into(),
+            })
+            .unwrap();
+
+        let (deltas, final_event) = recv_past_deltas(&mut evt_rx).await;
+
+        // The TextDelta arrived before the error.
+        assert_eq!(deltas.len(), 1);
+        assert!(matches!(&deltas[0], StreamEvent::TextDelta(s) if s == "partial"));
+
+        // Terminal event is an Error, not an AssistantMessage.
+        match final_event {
+            BackendEvent::Error(msg) => {
+                assert!(msg.contains("stream interrupted"), "error was: {msg}");
+            }
+            _ => panic!("expected Error after mid-stream failure"),
         }
 
         drop(cmd_tx);

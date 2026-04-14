@@ -80,11 +80,13 @@ sequenceDiagram
 
     M->>G: create channels, spawn backend, launch GUI
     G->>BC: BackendCommand::SendMessage (via channel)
-    BC->>SR: start(id, workspace_root, input) or resume(id, input)
+    BC->>SR: start(id, workspace_root, input, on_event) or resume(id, input, on_event)
     SR->>SS: load session [resume] / create new [start]
     SR->>LP: stream(messages, tools=[])
 
     loop each streamed event
+        SR->>BC: on_event(&event) callback
+        BC-->>G: BackendEvent::StreamDelta(event) (via channel)
         SR->>ACC: push(event)
     end
 
@@ -95,7 +97,7 @@ sequenceDiagram
 
 Current status:
 - `src/main.rs`: composition root wiring all adapters and launching the GUI.
-- `adapter-egui`: channel-driven GUI with message display, text input, send button, and event polling. `backend.rs` contains the `run_backend` controller and channel protocol types.
+- `adapter-egui`: channel-driven GUI with message display, text input, send button, event polling, and incremental streaming display. `backend.rs` contains the `run_backend` controller and channel protocol types (`BackendCommand`, `BackendEvent` including `StreamDelta`).
 - `adapter-llm/OpenRouterProvider`: implemented streaming path.
 - `adapter-llm/OllamaProvider`: stub.
 - `adapter-storage/DiskSessionStore`: implemented (load, save, list).
@@ -104,7 +106,8 @@ Current status:
 - `adapter-secrets/EnvSecretStore`: implemented.
 
 Not yet implemented:
-- Streaming display (response appears only after full completion).
+- Streaming reasoning/tool-call display (reasoning tokens and tool calls are accumulated but not rendered incrementally).
 - Model/config selection (model is hardcoded).
 - Session management (new session on every launch).
 - Error recovery UI (errors displayed but no retry/dismiss).
+- Cancel/stop generation (no way to abort an in-progress stream).

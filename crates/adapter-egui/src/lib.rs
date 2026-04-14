@@ -5,6 +5,7 @@ use domain::{Message, Role};
 use eframe::egui;
 use tokio::sync::mpsc;
 
+use app::StreamEvent;
 use backend::{BackendCommand, BackendEvent};
 
 pub struct OxApp {
@@ -12,6 +13,10 @@ pub struct OxApp {
     evt_rx: mpsc::UnboundedReceiver<BackendEvent>,
     messages: Vec<Message>,
     input: String,
+    /// Text accumulated from streaming text deltas. Rendered in place of the
+    /// "..." indicator once the first token arrives, then cleared when the
+    /// final AssistantMessage lands.
+    streaming_text: String,
     /// True while waiting for the backend to respond — prevents double-sends
     /// and shows a visual indicator.
     waiting: bool,
@@ -28,6 +33,7 @@ impl OxApp {
             evt_rx,
             messages: Vec::new(),
             input: String::new(),
+            streaming_text: String::new(),
             waiting: false,
             error: None,
         }
@@ -44,12 +50,21 @@ impl OxApp {
     fn poll_events(&mut self) {
         loop {
             match self.evt_rx.try_recv() {
+                Ok(BackendEvent::StreamDelta(StreamEvent::TextDelta(s))) => {
+                    self.streaming_text.push_str(&s);
+                }
+                Ok(BackendEvent::StreamDelta(_)) => {
+                    // Non-text stream events (reasoning, tool calls, finished)
+                    // are accumulated by SessionRunner but not rendered yet.
+                }
                 Ok(BackendEvent::AssistantMessage(msg)) => {
                     self.messages.push(msg);
+                    self.streaming_text.clear();
                     self.waiting = false;
                     self.error = None;
                 }
                 Ok(BackendEvent::Error(e)) => {
+                    self.streaming_text.clear();
                     self.error = Some(e);
                     self.waiting = false;
                 }
@@ -98,7 +113,11 @@ impl eframe::App for OxApp {
                         ui.add_space(8.0);
                     }
 
-                    if self.waiting {
+                    if !self.streaming_text.is_empty() {
+                        ui.label(egui::RichText::new("Ox").strong());
+                        ui.label(&self.streaming_text);
+                        ui.add_space(8.0);
+                    } else if self.waiting {
                         ui.label("...");
                     }
 
@@ -133,7 +152,8 @@ impl eframe::App for OxApp {
             ui.add_space(4.0);
         });
 
-        // Keep polling while waiting so we pick up the response promptly.
+        // Keep polling while waiting so we pick up streaming tokens and
+        // the final response promptly.
         if self.waiting {
             ctx.request_repaint();
         }
