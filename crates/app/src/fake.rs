@@ -1,12 +1,13 @@
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::pin::Pin;
 use std::sync::Mutex;
 
 use anyhow::Result;
-use domain::Message;
+use domain::{Message, Session, SessionId, SessionSummary};
 use futures::stream::{self, Stream};
 
 use crate::LlmProvider;
+use crate::ports::SessionStore;
 use crate::stream::{StreamEvent, ToolDef, Usage};
 
 /// Test double for `LlmProvider`. Queue responses ahead of time; each
@@ -79,6 +80,66 @@ impl LlmProvider for FakeLlmProvider {
             .expect("FakeLlmProvider: no responses queued — did you forget to call push_*?");
 
         Ok(Box::pin(stream::iter(events.into_iter().map(Ok))))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// FakeSessionStore
+// ---------------------------------------------------------------------------
+
+/// Test double for `SessionStore`. Stores sessions in a `HashMap` behind a
+/// `Mutex`. Useful for verifying that use cases save and load correctly without
+/// touching the filesystem.
+pub struct FakeSessionStore {
+    sessions: Mutex<HashMap<SessionId, Session>>,
+}
+
+impl FakeSessionStore {
+    pub fn new() -> Self {
+        Self {
+            sessions: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Seed the store with a pre-existing session (for resume tests).
+    pub fn insert(&self, session: Session) {
+        self.sessions.lock().unwrap().insert(session.id, session);
+    }
+
+    /// Snapshot of the currently stored session, if any.
+    pub fn get(&self, id: SessionId) -> Option<Session> {
+        self.sessions.lock().unwrap().get(&id).cloned()
+    }
+}
+
+impl SessionStore for FakeSessionStore {
+    async fn load(&self, id: SessionId) -> Result<Session> {
+        self.sessions
+            .lock()
+            .unwrap()
+            .get(&id)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("FakeSessionStore: no session with id {id}"))
+    }
+
+    async fn save(&self, session: &Session) -> Result<()> {
+        self.sessions
+            .lock()
+            .unwrap()
+            .insert(session.id, session.clone());
+        Ok(())
+    }
+
+    async fn list(&self) -> Result<Vec<SessionSummary>> {
+        let guard = self.sessions.lock().unwrap();
+        let summaries = guard
+            .values()
+            .map(|s| SessionSummary {
+                id: s.id,
+                message_count: s.messages.len(),
+            })
+            .collect();
+        Ok(summaries)
     }
 }
 
@@ -160,5 +221,54 @@ mod tests {
     async fn panics_when_no_responses_queued() {
         let fake = FakeLlmProvider::new();
         let _ = fake.stream(&[], &[]).await;
+    }
+
+    // -- FakeSessionStore tests --
+
+    #[tokio::test]
+    async fn store_save_load_roundtrip() {
+        let store = FakeSessionStore::new();
+        let id = SessionId::new_v4();
+        let mut session = Session::new(id, "/tmp/project".into());
+        session.push_message(Message::user("hello"));
+
+        store.save(&session).await.unwrap();
+        let loaded = store.load(id).await.unwrap();
+
+        assert_eq!(loaded.id, id);
+        assert_eq!(loaded.workspace_root.to_str().unwrap(), "/tmp/project");
+        assert_eq!(loaded.messages.len(), 1);
+        assert_eq!(loaded.messages[0].text(), "hello");
+    }
+
+    #[tokio::test]
+    async fn store_load_nonexistent_returns_error() {
+        let store = FakeSessionStore::new();
+        let result = store.load(SessionId::new_v4()).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn store_list_returns_summaries() {
+        let store = FakeSessionStore::new();
+
+        let id1 = SessionId::new_v4();
+        let mut s1 = Session::new(id1, "/a".into());
+        s1.push_message(Message::user("hi"));
+        s1.push_message(Message::user("there"));
+        store.save(&s1).await.unwrap();
+
+        let id2 = SessionId::new_v4();
+        let s2 = Session::new(id2, "/b".into());
+        store.save(&s2).await.unwrap();
+
+        let summaries = store.list().await.unwrap();
+        assert_eq!(summaries.len(), 2);
+
+        // Find each summary by ID and check message counts.
+        let sum1 = summaries.iter().find(|s| s.id == id1).unwrap();
+        assert_eq!(sum1.message_count, 2);
+        let sum2 = summaries.iter().find(|s| s.id == id2).unwrap();
+        assert_eq!(sum2.message_count, 0);
     }
 }

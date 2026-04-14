@@ -11,7 +11,7 @@ Ox is a terminal-based AI coding assistant built in Rust. It uses a hexagonal (p
 
 - `src/main.rs` — Binary entry point; composition root (stub — not yet wiring adapters)
 - `crates/domain/` — Core types: Session, Message, ContentBlock, Role, SessionId, SessionSummary
-- `crates/app/` — Application layer: port traits (LlmProvider, SessionStore, SecretStore, FileSystem, Shell), use cases (ContinueSession), streaming (StreamEvent, StreamAccumulator, ToolDef)
+- `crates/app/` — Application layer: port traits (LlmProvider, SessionStore, SecretStore, FileSystem, Shell), use cases (SessionRunner), streaming (StreamEvent, StreamAccumulator, ToolDef)
 - `crates/adapter-llm/` — LLM provider implementations: OpenRouter (streaming via SSE), Ollama (stub)
 - `crates/adapter-storage/` — Session persistence: DiskSessionStore (stub)
 - `crates/adapter-tui/` — Terminal UI (stub)
@@ -69,31 +69,31 @@ What is actually implemented today.
 
 ```mermaid
 sequenceDiagram
-    participant UC as ContinueSession
+    participant SR as SessionRunner
     participant SS as SessionStore
     participant LP as LlmProvider
     participant OR as OpenRouterProvider
     participant SSE as SSE parser
     participant ACC as StreamAccumulator
 
-    UC->>SS: load(session_id)
-    SS-->>UC: Session
-    UC->>LP: stream(messages, tools=[])
+    SR->>SS: load(session_id) [resume] / create new [start]
+    SS-->>SR: Session
+    SR->>LP: stream(messages, tools=[])
     LP->>OR: provider call
     OR->>SSE: parse response body
-    SSE-->>UC: StreamEvent
+    SSE-->>SR: StreamEvent
 
     loop each streamed event
-        UC->>ACC: push(event)
+        SR->>ACC: push(event)
     end
 
-    ACC-->>UC: completed Message
-    UC->>SS: save(updated session)
+    ACC-->>SR: completed Message
+    SR->>SS: save(updated session)
 ```
 
 Current status:
 - `src/main.rs`: stub binary, no composition root yet.
-- `adapter-tui`: stub, not wired to `ContinueSession`.
+- `adapter-tui`: stub, not wired to `SessionRunner`.
 - `adapter-llm/OpenRouterProvider`: implemented streaming path.
 - `adapter-llm/OllamaProvider`: stub.
 - `adapter-storage/DiskSessionStore`: constructor only, load/save/list are stubs.
@@ -109,21 +109,21 @@ What a full end-to-end turn should look like once wiring is complete.
 sequenceDiagram
     participant M as main.rs
     participant T as TuiApp
-    participant UC as ContinueSession
+    participant SR as SessionRunner
     participant SS as SessionStore
     participant LP as LlmProvider
     participant ACC as StreamAccumulator
 
     M->>T: wire adapters and start app
-    T->>UC: submit user input
-    UC->>SS: load session
-    UC->>LP: stream model response
+    T->>SR: start(id, workspace_root, input) or resume(id, input)
+    SR->>SS: load session [resume] / create new [start]
+    SR->>LP: stream model response
 
     loop each streamed event
-        UC->>ACC: push(event)
+        SR->>ACC: push(event)
         ACC-->>T: incremental UI state
     end
 
-    UC->>SS: save updated session
-    UC-->>T: completed assistant message
+    SR->>SS: save updated session
+    SR-->>T: completed assistant message
 ```

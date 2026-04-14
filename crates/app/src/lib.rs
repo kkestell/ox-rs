@@ -7,4 +7,4 @@ pub mod fake;
 
 pub use ports::*;
 pub use stream::{StreamAccumulator, StreamEvent, ToolDef, Usage};
-pub use use_cases::*;
+pub use use_cases::SessionRunner;
