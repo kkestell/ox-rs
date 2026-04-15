@@ -17,7 +17,8 @@ pub struct OxApp {
     /// event into the accumulator and render a fresh snapshot each frame,
     /// so ordering and block shape match the final `Message` exactly —
     /// preventing a visual flicker when the accumulator is dropped and the
-    /// final `AssistantMessage` takes its place in history.
+    /// final assistant message (delivered via `MessageAppended`) takes its
+    /// place in history.
     ///
     /// `None` when no turn is in flight (initial state and between turns).
     streaming: Option<StreamAccumulator>,
@@ -56,20 +57,26 @@ impl OxApp {
         loop {
             match self.evt_rx.try_recv() {
                 Ok(BackendEvent::StreamDelta(event)) => {
-                    // Lazily create the accumulator on the first delta.
-                    // This keeps the "just submitted, no tokens yet" state
-                    // distinguishable from the "tokens streaming" state for
-                    // the UI's waiting placeholder.
+                    // Lazily create the accumulator on the first delta so
+                    // "waiting for any output" stays distinguishable from
+                    // "tokens arriving" in the placeholder UI branch.
                     self.streaming
                         .get_or_insert_with(StreamAccumulator::new)
                         .push(event);
                 }
-                Ok(BackendEvent::AssistantMessage(msg)) => {
+                Ok(BackendEvent::MessageAppended(msg)) => {
+                    // Every committed message flows through here — the
+                    // user's input, tool-result messages produced inside
+                    // the tool loop, and every assistant reply. Drop the
+                    // accumulator on each append so the live-view branch
+                    // stops rendering the message we just committed.
                     self.messages.push(msg);
-                    // The final message supersedes the accumulator — drop it
-                    // so the live-view branch stops rendering.
                     self.streaming = None;
+                    self.error = None;
+                }
+                Ok(BackendEvent::TurnComplete) => {
                     self.waiting = false;
+                    self.streaming = None;
                     self.error = None;
                 }
                 Ok(BackendEvent::Error(e)) => {
@@ -85,14 +92,18 @@ impl OxApp {
     }
 
     /// Send the current input as a user message.
+    ///
+    /// We DON'T optimistically push the user message into `messages` here:
+    /// the backend round-trips it back as a `MessageAppended` event, and
+    /// having one render path for every message (including the user's own
+    /// input) means tool-result, intermediate-assistant, and user rendering
+    /// all share a single code path. The channel is in-process mpsc so the
+    /// round-trip latency is trivial.
     fn send_message(&mut self) {
         let text = self.input.trim().to_owned();
         if text.is_empty() || self.waiting {
             return;
         }
-
-        // Show the user message immediately in the chat history.
-        self.messages.push(Message::user(&text));
 
         let _ = self
             .cmd_tx

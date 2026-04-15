@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use app::{LlmProvider, SessionRunner, SessionStore, StreamEvent};
+use app::{LlmProvider, SessionRunner, SessionStore, StreamEvent, TurnEvent};
 use domain::{Message, SessionId};
 use tokio::sync::mpsc;
 
@@ -15,13 +15,25 @@ pub enum BackendCommand {
 }
 
 /// Events the backend sends back to the GUI.
+///
+/// The protocol separates *streaming* from *committing*:
+/// - `StreamDelta` carries in-flight events (tokens, reasoning, tool-call
+///   argument chunks) and drives the live-updating UI.
+/// - `MessageAppended` fires once per message committed to the session —
+///   the user's input, any intermediate assistant/tool messages produced
+///   inside the tool-call loop, and the final assistant reply.
+/// - `TurnComplete` signals the turn's end, so the GUI can re-enable input.
+/// - `Error` ends the turn abnormally; no `TurnComplete` follows.
 pub enum BackendEvent {
-    /// An incremental stream event from the LLM (e.g. a text token). Sent
-    /// for each event as it arrives, before the final message is assembled.
+    /// An incremental stream event from the LLM (e.g. a text token).
     StreamDelta(StreamEvent),
-    /// The completed assistant message, sent after the stream finishes.
-    AssistantMessage(Message),
-    /// An error from the LLM or session layer.
+    /// A message was just appended to the session (user, assistant, or tool).
+    /// The GUI treats this as "commit this to history" — drop any live-
+    /// streaming accumulator mirror for the same message.
+    MessageAppended(Message),
+    /// The turn has ended successfully — input can be re-enabled.
+    TurnComplete,
+    /// An error from the LLM or session layer. No `TurnComplete` follows.
     Error(String),
 }
 
@@ -52,11 +64,16 @@ where
     while let Some(cmd) = cmd_rx.recv().await {
         match cmd {
             BackendCommand::SendMessage { input } => {
-                // Closure that forwards each stream event to the GUI as a
-                // StreamDelta. Ignores send failures — if the GUI is gone,
-                // the final send below will detect it and exit the loop.
-                let stream_callback = |event: &StreamEvent| {
-                    let _ = evt_tx.send(BackendEvent::StreamDelta(event.clone()));
+                // Closure that forwards each TurnEvent to the GUI. A send
+                // failure means the GUI channel is gone — that's handled
+                // below by the terminal `evt_tx.send`, so ignore it here.
+                let callback = |evt: TurnEvent<'_>| match evt {
+                    TurnEvent::StreamDelta(e) => {
+                        let _ = evt_tx.send(BackendEvent::StreamDelta(e.clone()));
+                    }
+                    TurnEvent::MessageAppended(m) => {
+                        let _ = evt_tx.send(BackendEvent::MessageAppended(m.clone()));
+                    }
                 };
 
                 let result = match session_id {
@@ -64,12 +81,12 @@ where
                         // First message — create a fresh session.
                         let id = SessionId::new_v4();
                         match runner
-                            .start(id, workspace_root.clone(), &input, stream_callback)
+                            .start(id, workspace_root.clone(), &input, callback)
                             .await
                         {
-                            Ok((id, msg)) => {
+                            Ok(id) => {
                                 session_id = Some(id);
-                                Ok(msg)
+                                Ok(())
                             }
                             // start() failed — leave session_id as None so the
                             // next attempt retries with a new session. No orphan
@@ -80,17 +97,17 @@ where
                     }
                     Some(id) => {
                         // Subsequent message — resume the existing session.
-                        runner.resume(id, &input, stream_callback).await
+                        runner.resume(id, &input, callback).await
                     }
                 };
 
-                let event = match result {
-                    Ok(msg) => BackendEvent::AssistantMessage(msg),
+                let terminal_event = match result {
+                    Ok(()) => BackendEvent::TurnComplete,
                     Err(e) => BackendEvent::Error(format!("{e:#}")),
                 };
 
                 // If the event channel is closed the GUI is gone — exit.
-                if evt_tx.send(event).is_err() {
+                if evt_tx.send(terminal_event).is_err() {
                     break;
                 }
             }
@@ -102,8 +119,10 @@ where
 
 #[cfg(test)]
 mod tests {
-    use app::fake::{FakeLlmProvider, FakeSessionStore};
-    use domain::{Role, Session};
+    use app::fake::{FakeLlmProvider, FakeSessionStore, FakeTool, tool_registry_with};
+    use app::{Tool, ToolRegistry};
+    use domain::{ContentBlock, Role, Session};
+    use std::sync::Arc;
 
     use super::*;
 
@@ -113,13 +132,14 @@ mod tests {
     fn start_backend(
         llm: FakeLlmProvider,
         store: FakeSessionStore,
+        tools: ToolRegistry,
         initial_session_id: Option<SessionId>,
     ) -> (
         mpsc::UnboundedSender<BackendCommand>,
         mpsc::UnboundedReceiver<BackendEvent>,
         tokio::task::JoinHandle<Option<SessionId>>,
     ) {
-        let runner = SessionRunner::new(llm, store);
+        let runner = SessionRunner::new(llm, store, tools);
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
         let (evt_tx, evt_rx) = mpsc::unbounded_channel();
 
@@ -134,27 +154,31 @@ mod tests {
         (cmd_tx, evt_rx, handle)
     }
 
-    /// Receive events until we hit a non-StreamDelta event, returning both the
-    /// collected deltas and the terminal event (AssistantMessage or Error).
-    async fn recv_past_deltas(
+    /// Pump events until we see `TurnComplete` or `Error`. Returns the
+    /// stream deltas, the appended messages, and the terminal event.
+    async fn drain_turn(
         evt_rx: &mut mpsc::UnboundedReceiver<BackendEvent>,
-    ) -> (Vec<StreamEvent>, BackendEvent) {
+    ) -> (Vec<StreamEvent>, Vec<Message>, BackendEvent) {
         let mut deltas = Vec::new();
+        let mut appended = Vec::new();
         loop {
             let event = evt_rx.recv().await.expect("channel closed unexpectedly");
             match event {
                 BackendEvent::StreamDelta(se) => deltas.push(se),
-                other => return (deltas, other),
+                BackendEvent::MessageAppended(m) => appended.push(m),
+                terminal @ (BackendEvent::TurnComplete | BackendEvent::Error(_)) => {
+                    return (deltas, appended, terminal);
+                }
             }
         }
     }
 
     #[tokio::test]
-    async fn first_message_creates_session() {
+    async fn first_message_creates_session_and_appends_user_then_assistant() {
         let llm = FakeLlmProvider::new();
         llm.push_text("Hello back!");
         let store = FakeSessionStore::new();
-        let (cmd_tx, mut evt_rx, handle) = start_backend(llm, store, None);
+        let (cmd_tx, mut evt_rx, handle) = start_backend(llm, store, ToolRegistry::new(), None);
 
         cmd_tx
             .send(BackendCommand::SendMessage {
@@ -162,15 +186,13 @@ mod tests {
             })
             .unwrap();
 
-        let (_deltas, event) = recv_past_deltas(&mut evt_rx).await;
-        match event {
-            BackendEvent::AssistantMessage(msg) => {
-                assert_eq!(msg.role, Role::Assistant);
-                assert_eq!(msg.text(), "Hello back!");
-            }
-            BackendEvent::Error(e) => panic!("expected AssistantMessage, got Error: {e}"),
-            _ => panic!("unexpected event"),
-        }
+        let (_deltas, appended, terminal) = drain_turn(&mut evt_rx).await;
+        assert!(matches!(terminal, BackendEvent::TurnComplete));
+        assert_eq!(appended.len(), 2);
+        assert_eq!(appended[0].role, Role::User);
+        assert_eq!(appended[0].text(), "Hello");
+        assert_eq!(appended[1].role, Role::Assistant);
+        assert_eq!(appended[1].text(), "Hello back!");
 
         drop(cmd_tx);
         handle.await.unwrap();
@@ -182,33 +204,27 @@ mod tests {
         llm.push_text("first reply");
         llm.push_text("second reply");
         let store = FakeSessionStore::new();
-        let (cmd_tx, mut evt_rx, handle) = start_backend(llm, store, None);
+        let (cmd_tx, mut evt_rx, handle) = start_backend(llm, store, ToolRegistry::new(), None);
 
-        // First message — triggers start()
+        // First turn.
         cmd_tx
             .send(BackendCommand::SendMessage {
                 input: "hello".into(),
             })
             .unwrap();
-        let (_deltas, event1) = recv_past_deltas(&mut evt_rx).await;
-        match &event1 {
-            BackendEvent::AssistantMessage(msg) => assert_eq!(msg.text(), "first reply"),
-            BackendEvent::Error(e) => panic!("expected AssistantMessage, got Error: {e}"),
-            _ => panic!("unexpected event"),
-        }
+        let (_, appended1, term1) = drain_turn(&mut evt_rx).await;
+        assert!(matches!(term1, BackendEvent::TurnComplete));
+        assert_eq!(appended1[1].text(), "first reply");
 
-        // Second message — triggers resume()
+        // Second turn resumes.
         cmd_tx
             .send(BackendCommand::SendMessage {
                 input: "followup".into(),
             })
             .unwrap();
-        let (_deltas, event2) = recv_past_deltas(&mut evt_rx).await;
-        match &event2 {
-            BackendEvent::AssistantMessage(msg) => assert_eq!(msg.text(), "second reply"),
-            BackendEvent::Error(e) => panic!("expected AssistantMessage, got Error: {e}"),
-            _ => panic!("unexpected event"),
-        }
+        let (_, appended2, term2) = drain_turn(&mut evt_rx).await;
+        assert!(matches!(term2, BackendEvent::TurnComplete));
+        assert_eq!(appended2[1].text(), "second reply");
 
         drop(cmd_tx);
         handle.await.unwrap();
@@ -216,7 +232,6 @@ mod tests {
 
     #[tokio::test]
     async fn initial_session_id_resumes_on_first_message() {
-        // Seed the store with a session so resume() can find it.
         let id = SessionId::new_v4();
         let store = FakeSessionStore::new();
         store.insert(Session::new(id, "/test/project".into()));
@@ -224,23 +239,17 @@ mod tests {
         let llm = FakeLlmProvider::new();
         llm.push_text("resumed!");
 
-        let (cmd_tx, mut evt_rx, handle) = start_backend(llm, store, Some(id));
+        let (cmd_tx, mut evt_rx, handle) = start_backend(llm, store, ToolRegistry::new(), Some(id));
 
-        // First message should call resume(), not start().
         cmd_tx
             .send(BackendCommand::SendMessage {
                 input: "continue".into(),
             })
             .unwrap();
 
-        let (_deltas, event) = recv_past_deltas(&mut evt_rx).await;
-        match event {
-            BackendEvent::AssistantMessage(msg) => {
-                assert_eq!(msg.text(), "resumed!");
-            }
-            BackendEvent::Error(e) => panic!("expected AssistantMessage, got Error: {e}"),
-            _ => panic!("unexpected event"),
-        }
+        let (_, appended, term) = drain_turn(&mut evt_rx).await;
+        assert!(matches!(term, BackendEvent::TurnComplete));
+        assert_eq!(appended[1].text(), "resumed!");
 
         drop(cmd_tx);
         let final_id = handle.await.unwrap();
@@ -251,9 +260,8 @@ mod tests {
     async fn returns_none_when_no_message_sent() {
         let llm = FakeLlmProvider::new();
         let store = FakeSessionStore::new();
-        let (cmd_tx, _evt_rx, handle) = start_backend(llm, store, None);
+        let (cmd_tx, _evt_rx, handle) = start_backend(llm, store, ToolRegistry::new(), None);
 
-        // Close immediately without sending any message.
         drop(cmd_tx);
         let final_id = handle.await.unwrap();
         assert_eq!(final_id, None);
@@ -264,12 +272,12 @@ mod tests {
         let llm = FakeLlmProvider::new();
         llm.push_text("hello!");
         let store = FakeSessionStore::new();
-        let (cmd_tx, mut evt_rx, handle) = start_backend(llm, store, None);
+        let (cmd_tx, mut evt_rx, handle) = start_backend(llm, store, ToolRegistry::new(), None);
 
         cmd_tx
             .send(BackendCommand::SendMessage { input: "hi".into() })
             .unwrap();
-        let _ = recv_past_deltas(&mut evt_rx).await;
+        let _ = drain_turn(&mut evt_rx).await;
 
         drop(cmd_tx);
         let final_id = handle.await.unwrap();
@@ -278,15 +286,12 @@ mod tests {
 
     #[tokio::test]
     async fn resumed_session_returns_id_even_without_message() {
-        // When resuming an existing session and the user closes without
-        // sending a message, the session ID should still be returned since
-        // the session exists on disk.
         let id = SessionId::new_v4();
         let store = FakeSessionStore::new();
         store.insert(Session::new(id, "/test/project".into()));
 
         let llm = FakeLlmProvider::new();
-        let (cmd_tx, _evt_rx, handle) = start_backend(llm, store, Some(id));
+        let (cmd_tx, _evt_rx, handle) = start_backend(llm, store, ToolRegistry::new(), Some(id));
 
         drop(cmd_tx);
         let final_id = handle.await.unwrap();
@@ -295,14 +300,11 @@ mod tests {
 
     #[tokio::test]
     async fn resume_nonexistent_session_returns_error_and_keeps_id() {
-        // When the backend is started with a session ID that doesn't exist
-        // in the store, resume() fails. The session ID should stay — we
-        // don't fall back to creating a new session for an explicit resume.
         let id = SessionId::new_v4();
         let llm = FakeLlmProvider::new();
-        let store = FakeSessionStore::new(); // deliberately empty
+        let store = FakeSessionStore::new();
 
-        let (cmd_tx, mut evt_rx, handle) = start_backend(llm, store, Some(id));
+        let (cmd_tx, mut evt_rx, handle) = start_backend(llm, store, ToolRegistry::new(), Some(id));
 
         cmd_tx
             .send(BackendCommand::SendMessage {
@@ -310,41 +312,34 @@ mod tests {
             })
             .unwrap();
 
-        let (_deltas, event) = recv_past_deltas(&mut evt_rx).await;
-        assert!(
-            matches!(&event, BackendEvent::Error(_)),
-            "expected Error for non-existent session"
-        );
+        let (_, _, term) = drain_turn(&mut evt_rx).await;
+        assert!(matches!(term, BackendEvent::Error(_)));
 
         drop(cmd_tx);
         let final_id = handle.await.unwrap();
-        assert_eq!(
-            final_id,
-            Some(id),
-            "session ID should be preserved after resume failure"
-        );
+        assert_eq!(final_id, Some(id));
     }
 
     #[tokio::test]
-    async fn llm_error_becomes_error_event() {
+    async fn llm_error_becomes_error_event_with_no_stream_deltas() {
         let llm = FakeLlmProvider::new();
         llm.push_error("model overloaded");
         let store = FakeSessionStore::new();
-        let (cmd_tx, mut evt_rx, handle) = start_backend(llm, store, None);
+        let (cmd_tx, mut evt_rx, handle) = start_backend(llm, store, ToolRegistry::new(), None);
 
         cmd_tx
             .send(BackendCommand::SendMessage { input: "hi".into() })
             .unwrap();
 
-        // Error occurs at stream creation time — no StreamDelta events
-        // should precede the Error event.
-        let (deltas, event) = recv_past_deltas(&mut evt_rx).await;
-        assert!(deltas.is_empty(), "expected no StreamDelta before error");
-        match event {
-            BackendEvent::Error(msg) => {
-                assert!(msg.contains("model overloaded"), "error was: {msg}");
-            }
-            _ => panic!("expected Error event"),
+        let (deltas, appended, term) = drain_turn(&mut evt_rx).await;
+        assert!(deltas.is_empty());
+        // The user message IS appended before the LLM call — that matches
+        // `run_turn`'s "commit user input first, then stream" ordering.
+        assert_eq!(appended.len(), 1);
+        assert_eq!(appended[0].role, Role::User);
+        match term {
+            BackendEvent::Error(msg) => assert!(msg.contains("model overloaded"), "{msg}"),
+            _ => panic!("expected Error"),
         }
 
         drop(cmd_tx);
@@ -353,46 +348,35 @@ mod tests {
 
     #[tokio::test]
     async fn error_on_first_message_allows_retry() {
-        // Verifies that a failed start() leaves session_id as None so the
-        // next SendMessage retries with a fresh session instead of calling
-        // resume() with an ID that was never persisted.
         let llm = FakeLlmProvider::new();
         llm.push_error("connection refused");
         llm.push_text("recovered!");
         let store = FakeSessionStore::new();
-        let (cmd_tx, mut evt_rx, handle) = start_backend(llm, store, None);
+        let (cmd_tx, mut evt_rx, handle) = start_backend(llm, store, ToolRegistry::new(), None);
 
-        // First message fails.
         cmd_tx
             .send(BackendCommand::SendMessage {
                 input: "hello".into(),
             })
             .unwrap();
-        let (_deltas, event1) = recv_past_deltas(&mut evt_rx).await;
-        assert!(
-            matches!(&event1, BackendEvent::Error(_)),
-            "expected Error on first attempt"
-        );
+        let (_, _, term1) = drain_turn(&mut evt_rx).await;
+        assert!(matches!(term1, BackendEvent::Error(_)));
 
-        // Second message should retry via start(), not resume().
         cmd_tx
             .send(BackendCommand::SendMessage {
                 input: "hello again".into(),
             })
             .unwrap();
-        let (_deltas, event2) = recv_past_deltas(&mut evt_rx).await;
-        match &event2 {
-            BackendEvent::AssistantMessage(msg) => assert_eq!(msg.text(), "recovered!"),
-            BackendEvent::Error(e) => panic!("expected recovery, got Error: {e}"),
-            _ => panic!("unexpected event"),
-        }
+        let (_, appended, term2) = drain_turn(&mut evt_rx).await;
+        assert!(matches!(term2, BackendEvent::TurnComplete));
+        assert_eq!(appended[1].text(), "recovered!");
 
         drop(cmd_tx);
         handle.await.unwrap();
     }
 
     #[tokio::test]
-    async fn streaming_events_arrive_before_final_message() {
+    async fn streaming_events_arrive_before_assistant_message_appended() {
         let llm = FakeLlmProvider::new();
         llm.push_response(vec![
             StreamEvent::TextDelta("Hello, ".into()),
@@ -406,7 +390,7 @@ mod tests {
             },
         ]);
         let store = FakeSessionStore::new();
-        let (cmd_tx, mut evt_rx, handle) = start_backend(llm, store, None);
+        let (cmd_tx, mut evt_rx, handle) = start_backend(llm, store, ToolRegistry::new(), None);
 
         cmd_tx
             .send(BackendCommand::SendMessage {
@@ -414,20 +398,82 @@ mod tests {
             })
             .unwrap();
 
-        let (deltas, final_event) = recv_past_deltas(&mut evt_rx).await;
-
-        // Three StreamDelta events: TextDelta, TextDelta, Finished.
-        assert_eq!(deltas.len(), 3);
-        assert!(matches!(&deltas[0], StreamEvent::TextDelta(s) if s == "Hello, "));
-        assert!(matches!(&deltas[1], StreamEvent::TextDelta(s) if s == "world!"));
-        assert!(matches!(&deltas[2], StreamEvent::Finished { .. }));
-
-        // Followed by the final assembled AssistantMessage.
-        match final_event {
-            BackendEvent::AssistantMessage(msg) => {
-                assert_eq!(msg.text(), "Hello, world!");
+        // Order of events on the wire: user MessageAppended, N StreamDeltas,
+        // assistant MessageAppended, TurnComplete.
+        let mut seen_assistant_msg_after_deltas = false;
+        let mut delta_count = 0;
+        let mut saw_user_msg = false;
+        loop {
+            let evt = evt_rx.recv().await.unwrap();
+            match evt {
+                BackendEvent::StreamDelta(_) => {
+                    assert!(
+                        saw_user_msg,
+                        "StreamDelta arrived before user MessageAppended"
+                    );
+                    delta_count += 1;
+                }
+                BackendEvent::MessageAppended(m) => match m.role {
+                    Role::User => {
+                        saw_user_msg = true;
+                        assert_eq!(delta_count, 0, "user msg arrived after deltas");
+                    }
+                    Role::Assistant => {
+                        assert_eq!(delta_count, 3, "assistant msg arrived before all deltas");
+                        seen_assistant_msg_after_deltas = true;
+                    }
+                    Role::Tool => panic!("no tool messages expected"),
+                },
+                BackendEvent::TurnComplete => break,
+                BackendEvent::Error(e) => panic!("unexpected error: {e}"),
             }
-            _ => panic!("expected AssistantMessage after deltas"),
+        }
+        assert!(seen_assistant_msg_after_deltas);
+
+        drop(cmd_tx);
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn tool_call_round_trip_surfaces_messages_in_order() {
+        // End-to-end-ish: model calls a tool, we execute it, model emits a
+        // final reply. The backend should forward every message to the GUI
+        // as a `MessageAppended` in chronological order.
+        let llm = FakeLlmProvider::new();
+        llm.push_tool_call("call_1", "echo", r#"{"x":1}"#);
+        llm.push_text("done");
+
+        let echo = Arc::new(FakeTool::new("echo"));
+        echo.push_ok("tool-output");
+        let tools = tool_registry_with(vec![echo as Arc<dyn Tool>]);
+
+        let store = FakeSessionStore::new();
+        let (cmd_tx, mut evt_rx, handle) = start_backend(llm, store, tools, None);
+
+        cmd_tx
+            .send(BackendCommand::SendMessage { input: "hi".into() })
+            .unwrap();
+
+        let (_deltas, appended, term) = drain_turn(&mut evt_rx).await;
+        assert!(matches!(term, BackendEvent::TurnComplete));
+
+        // user → asst(tool-call) → tool result → asst("done")
+        assert_eq!(appended.len(), 4);
+        assert_eq!(appended[0].role, Role::User);
+        assert_eq!(appended[1].role, Role::Assistant);
+        assert_eq!(appended[2].role, Role::Tool);
+        assert_eq!(appended[3].role, Role::Assistant);
+        assert_eq!(appended[3].text(), "done");
+
+        // Tool-result message carries the tool's output.
+        match &appended[2].content[0] {
+            ContentBlock::ToolResult {
+                content, is_error, ..
+            } => {
+                assert_eq!(content, "tool-output");
+                assert!(!is_error);
+            }
+            _ => panic!("expected ToolResult"),
         }
 
         drop(cmd_tx);
@@ -442,7 +488,7 @@ mod tests {
             "stream interrupted",
         );
         let store = FakeSessionStore::new();
-        let (cmd_tx, mut evt_rx, handle) = start_backend(llm, store, None);
+        let (cmd_tx, mut evt_rx, handle) = start_backend(llm, store, ToolRegistry::new(), None);
 
         cmd_tx
             .send(BackendCommand::SendMessage {
@@ -450,18 +496,12 @@ mod tests {
             })
             .unwrap();
 
-        let (deltas, final_event) = recv_past_deltas(&mut evt_rx).await;
-
-        // The TextDelta arrived before the error.
+        let (deltas, _appended, term) = drain_turn(&mut evt_rx).await;
         assert_eq!(deltas.len(), 1);
         assert!(matches!(&deltas[0], StreamEvent::TextDelta(s) if s == "partial"));
-
-        // Terminal event is an Error, not an AssistantMessage.
-        match final_event {
-            BackendEvent::Error(msg) => {
-                assert!(msg.contains("stream interrupted"), "error was: {msg}");
-            }
-            _ => panic!("expected Error after mid-stream failure"),
+        match term {
+            BackendEvent::Error(msg) => assert!(msg.contains("stream interrupted"), "{msg}"),
+            _ => panic!("expected Error"),
         }
 
         drop(cmd_tx);
@@ -472,10 +512,8 @@ mod tests {
     async fn channel_close_exits_cleanly() {
         let llm = FakeLlmProvider::new();
         let store = FakeSessionStore::new();
-        let (cmd_tx, _evt_rx, handle) = start_backend(llm, store, None);
+        let (cmd_tx, _evt_rx, handle) = start_backend(llm, store, ToolRegistry::new(), None);
 
-        // Drop the command sender immediately — backend should exit
-        // without panicking or hanging.
         drop(cmd_tx);
         handle.await.unwrap();
     }

@@ -1,5 +1,8 @@
+use std::sync::Arc;
+
 use anyhow::{Context, Result};
-use app::{SecretStore, SessionRunner, SessionStore};
+use app::tools::{EditFileTool, ReadFileTool, ToolRegistry, WriteFileTool};
+use app::{SecretStore, SessionRunner, SessionStore, Tool};
 use clap::Parser;
 use domain::SessionId;
 use tokio::sync::mpsc;
@@ -48,7 +51,21 @@ fn main() -> Result<()> {
     };
 
     let llm = adapter_llm::OpenRouterProvider::new(api_key, model);
-    let runner = SessionRunner::new(llm, store);
+
+    // Wire the file-editing tools. An `Arc<LocalFileSystem>` is shared so
+    // each tool observes the same filesystem; the workspace root is cloned
+    // into each tool for path resolution (absolute paths bypass it).
+    let fs = Arc::new(adapter_fs::LocalFileSystem);
+    let mut tools = ToolRegistry::new();
+    tools
+        .register(Arc::new(ReadFileTool::new(fs.clone(), workspace_root.clone())) as Arc<dyn Tool>);
+    tools.register(
+        Arc::new(WriteFileTool::new(fs.clone(), workspace_root.clone())) as Arc<dyn Tool>,
+    );
+    tools
+        .register(Arc::new(EditFileTool::new(fs.clone(), workspace_root.clone())) as Arc<dyn Tool>);
+
+    let runner = SessionRunner::new(llm, store, tools);
 
     // Channels between the GUI and the async backend controller.
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();

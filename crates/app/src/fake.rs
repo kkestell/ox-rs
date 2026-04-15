@@ -1,14 +1,17 @@
 use std::collections::{HashMap, VecDeque};
+use std::future::Future;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
 use domain::{Message, Session, SessionId, SessionSummary};
 use futures::stream::{self, Stream};
 
 use crate::LlmProvider;
-use crate::ports::SessionStore;
+use crate::ports::{FileSystem, SessionStore};
 use crate::stream::{StreamEvent, ToolDef, Usage};
+use crate::tools::Tool;
 
 /// A queued response: a sequence of stream events (success), a connection-time
 /// error, or a mid-stream error that fires after some successful events.
@@ -191,6 +194,169 @@ impl SessionStore for FakeSessionStore {
             .collect();
         Ok(summaries)
     }
+}
+
+// ---------------------------------------------------------------------------
+// FakeFileSystem
+// ---------------------------------------------------------------------------
+
+/// Test double for `FileSystem`. Backed by an in-memory `HashMap` keyed by
+/// absolute path. Writes record parent directories in a set so tests can
+/// assert that a write either targeted an existing directory or created one.
+///
+/// Paths are stored verbatim — no canonicalization. Callers must be consistent
+/// about absolute-vs-relative paths, which matches how the real tools resolve
+/// paths against the workspace root before handing them to the `FileSystem`.
+pub struct FakeFileSystem {
+    files: Mutex<HashMap<PathBuf, String>>,
+    /// Every parent directory that `write` has ensured exists. A real
+    /// filesystem doesn't track this separately, but tests benefit from a
+    /// way to assert "yes, this write implicitly created that dir tree."
+    created_dirs: Mutex<Vec<PathBuf>>,
+}
+
+impl FakeFileSystem {
+    pub fn new() -> Self {
+        Self {
+            files: Mutex::new(HashMap::new()),
+            created_dirs: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Seed the fake with a file at `path`.
+    pub fn insert(&self, path: impl Into<PathBuf>, content: impl Into<String>) {
+        self.files
+            .lock()
+            .unwrap()
+            .insert(path.into(), content.into());
+    }
+
+    /// Snapshot of a file's current contents, if present.
+    pub fn get(&self, path: &Path) -> Option<String> {
+        self.files.lock().unwrap().get(path).cloned()
+    }
+
+    /// Set of parent directories that `write` has "created" via this fake.
+    pub fn created_dirs(&self) -> Vec<PathBuf> {
+        self.created_dirs.lock().unwrap().clone()
+    }
+}
+
+impl Default for FakeFileSystem {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl FileSystem for FakeFileSystem {
+    fn read(&self, path: &Path) -> Result<String> {
+        self.files
+            .lock()
+            .unwrap()
+            .get(path)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("FakeFileSystem: no file at {}", path.display()))
+    }
+
+    fn write(&self, path: &Path, content: &str) -> Result<()> {
+        // Mirror `LocalFileSystem::write`'s parent-dir-creation behavior so
+        // tests that exercise "writes into a new subdirectory" produce the
+        // same observable outcome in-memory as on disk.
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            self.created_dirs.lock().unwrap().push(parent.to_path_buf());
+        }
+        self.files
+            .lock()
+            .unwrap()
+            .insert(path.to_path_buf(), content.to_owned());
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// FakeTool
+// ---------------------------------------------------------------------------
+
+/// Test double for `Tool`. Executions consume canned results in FIFO order.
+/// Panics on extra calls — missing a canned result in a test is a bug.
+///
+/// Keeps a minimal call log for tests that need to assert dispatch order or
+/// that arguments survived JSON round-tripping through the LLM.
+pub struct FakeTool {
+    def: ToolDef,
+    results: Mutex<VecDeque<Result<String, String>>>,
+    calls: Mutex<Vec<String>>,
+}
+
+impl FakeTool {
+    /// Construct a fake tool with a minimal schema (no parameters). The
+    /// schema shape doesn't matter for loop tests — only `name` does.
+    pub fn new(name: &str) -> Self {
+        Self {
+            def: ToolDef {
+                name: name.to_owned(),
+                description: format!("fake tool '{name}'"),
+                parameters: serde_json::json!({"type": "object"}),
+            },
+            results: Mutex::new(VecDeque::new()),
+            calls: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Queue a successful result.
+    pub fn push_ok(&self, output: impl Into<String>) {
+        self.results.lock().unwrap().push_back(Ok(output.into()));
+    }
+
+    /// Queue an error result. Surfaces as `Err` from `execute`, which the
+    /// tool loop translates into a `ToolResult { is_error: true }`.
+    pub fn push_err(&self, msg: impl Into<String>) {
+        self.results.lock().unwrap().push_back(Err(msg.into()));
+    }
+
+    /// All arguments passed to `execute` so far, in call order.
+    pub fn calls(&self) -> Vec<String> {
+        self.calls.lock().unwrap().clone()
+    }
+}
+
+impl Tool for FakeTool {
+    fn def(&self) -> ToolDef {
+        self.def.clone()
+    }
+
+    fn execute<'a>(
+        &'a self,
+        args: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<String>> + Send + 'a>> {
+        Box::pin(async move {
+            self.calls.lock().unwrap().push(args.to_owned());
+            match self
+                .results
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("FakeTool: no results queued — did you forget to call push_ok/push_err?")
+            {
+                Ok(s) => Ok(s),
+                Err(e) => Err(anyhow::anyhow!("{e}")),
+            }
+        })
+    }
+}
+
+/// Build a `ToolRegistry` pre-populated with the given fakes. Convenience for
+/// tests that want to stand up a registry without repeating the registration
+/// boilerplate — takes the fakes by `Arc` so callers can still observe call
+/// logs on the originals after the registry consumes them.
+pub fn tool_registry_with(tools: Vec<Arc<dyn Tool>>) -> crate::tools::ToolRegistry {
+    let mut reg = crate::tools::ToolRegistry::new();
+    for t in tools {
+        reg.register(t);
+    }
+    reg
 }
 
 #[cfg(test)]
