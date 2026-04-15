@@ -1,11 +1,11 @@
 use std::path::PathBuf;
 
 use anyhow::{Result, bail};
-use domain::{Message, Session, SessionId};
+use domain::{Message, Session, SessionId, StreamEvent};
 use futures::StreamExt;
 
 use crate::ports::{LlmProvider, SessionStore};
-use crate::stream::{StreamAccumulator, StreamEvent};
+use crate::stream::StreamAccumulator;
 use crate::tools::{ToolRegistry, extract_tool_calls};
 
 /// Events surfaced to the caller during a turn.
@@ -170,7 +170,7 @@ mod tests {
     use super::*;
     use crate::Tool;
     use crate::fake::{FakeLlmProvider, FakeSessionStore, FakeTool, tool_registry_with};
-    use crate::stream::Usage;
+    use domain::Usage;
 
     fn make_runner(
         llm: FakeLlmProvider,
@@ -271,8 +271,12 @@ mod tests {
     async fn start_surfaces_stream_deltas_in_arrival_order() {
         let llm = FakeLlmProvider::new();
         llm.push_response(vec![
-            StreamEvent::TextDelta("Hello, ".into()),
-            StreamEvent::TextDelta("world!".into()),
+            StreamEvent::TextDelta {
+                delta: "Hello, ".into(),
+            },
+            StreamEvent::TextDelta {
+                delta: "world!".into(),
+            },
             StreamEvent::Finished {
                 usage: Usage {
                     prompt_tokens: 0,
@@ -296,8 +300,8 @@ mod tests {
             .unwrap();
 
         assert_eq!(deltas.len(), 3);
-        assert!(matches!(&deltas[0], StreamEvent::TextDelta(s) if s == "Hello, "));
-        assert!(matches!(&deltas[1], StreamEvent::TextDelta(s) if s == "world!"));
+        assert!(matches!(&deltas[0], StreamEvent::TextDelta { delta: s } if s == "Hello, "));
+        assert!(matches!(&deltas[1], StreamEvent::TextDelta { delta: s } if s == "world!"));
         assert!(matches!(&deltas[2], StreamEvent::Finished { .. }));
     }
 
@@ -335,7 +339,9 @@ mod tests {
     async fn mid_stream_error_aborts_turn_but_preserves_earlier_events() {
         let llm = FakeLlmProvider::new();
         llm.push_error_after(
-            vec![StreamEvent::TextDelta("partial ".into())],
+            vec![StreamEvent::TextDelta {
+                delta: "partial ".into(),
+            }],
             "connection lost",
         );
         let store = FakeSessionStore::new();
@@ -352,7 +358,7 @@ mod tests {
             .await;
 
         assert_eq!(deltas.len(), 1);
-        assert!(matches!(&deltas[0], StreamEvent::TextDelta(s) if s == "partial "));
+        assert!(matches!(&deltas[0], StreamEvent::TextDelta { delta: s } if s == "partial "));
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("connection lost"));
     }

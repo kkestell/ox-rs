@@ -5,12 +5,12 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
-use domain::{Message, Session, SessionId, SessionSummary};
+use domain::{Message, Session, SessionId, SessionSummary, StreamEvent, Usage};
 use futures::stream::{self, Stream};
 
 use crate::LlmProvider;
 use crate::ports::{FileSystem, SessionStore};
-use crate::stream::{StreamEvent, ToolDef, Usage};
+use crate::stream::ToolDef;
 use crate::tools::Tool;
 
 /// A queued response: a sequence of stream events (success), a connection-time
@@ -30,6 +30,12 @@ enum QueuedResponse {
 /// missing response is a test bug, not a graceful failure.
 pub struct FakeLlmProvider {
     responses: Mutex<VecDeque<QueuedResponse>>,
+}
+
+impl Default for FakeLlmProvider {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl FakeLlmProvider {
@@ -58,7 +64,9 @@ impl FakeLlmProvider {
     /// Convenience: queue a simple text response.
     pub fn push_text(&self, text: &str) {
         self.push_response(vec![
-            StreamEvent::TextDelta(text.to_owned()),
+            StreamEvent::TextDelta {
+                delta: text.to_owned(),
+            },
             StreamEvent::Finished {
                 usage: Usage {
                     prompt_tokens: 0,
@@ -145,6 +153,12 @@ impl LlmProvider for FakeLlmProvider {
 /// touching the filesystem.
 pub struct FakeSessionStore {
     sessions: Mutex<HashMap<SessionId, Session>>,
+}
+
+impl Default for FakeSessionStore {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl FakeSessionStore {

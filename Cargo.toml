@@ -3,27 +3,12 @@ resolver = "2"
 members = [
     "crates/domain",
     "crates/app",
+    "crates/protocol",
     "crates/adapter-llm",
     "crates/adapter-storage",
     "crates/adapter-fs",
     "crates/adapter-egui",
     "crates/adapter-secrets",
+    "crates/bin-gui",
+    "crates/bin-agent",
 ]
-
-[package]
-name = "ox"
-version = "0.1.0"
-edition = "2024"
-
-[dependencies]
-adapter-fs = { version = "0.1.0", path = "crates/adapter-fs" }
-adapter-llm = { version = "0.1.0", path = "crates/adapter-llm" }
-adapter-secrets = { version = "0.1.0", path = "crates/adapter-secrets" }
-adapter-storage = { version = "0.1.0", path = "crates/adapter-storage" }
-adapter-egui = { version = "0.1.0", path = "crates/adapter-egui" }
-anyhow = "1.0.102"
-app = { version = "0.1.0", path = "crates/app" }
-domain = { version = "0.1.0", path = "crates/domain" }
-tokio = { version = "1.51.1", features = ["full"] }
-dirs = "6.0.0"
-clap = { version = "4.6.0", features = ["derive"] }

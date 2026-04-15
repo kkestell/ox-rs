@@ -26,6 +26,15 @@ impl app::FileSystem for LocalFileSystem {
     }
 }
 
+pub struct BashShell;
+
+impl app::Shell for BashShell {
+    async fn run(&self, _command: &str) -> Result<app::CommandOutput> {
+        // TODO: implement shell execution
+        todo!()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
@@ -61,14 +70,5 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let missing = tmp.path().join("nope.txt");
         assert!(fs().read(&missing).is_err());
-    }
-}
-
-pub struct BashShell;
-
-impl app::Shell for BashShell {
-    async fn run(&self, _command: &str) -> Result<app::CommandOutput> {
-        // TODO: implement shell execution
-        todo!()
     }
 }

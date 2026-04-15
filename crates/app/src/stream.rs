@@ -1,43 +1,13 @@
 use std::collections::BTreeMap;
 
-use domain::{ContentBlock, Message, Role};
-
-/// In-flight streaming events from an LLM provider. These represent incremental
-/// chunks as they arrive over the wire — never serialized, only consumed by
-/// the accumulator to produce at-rest `Message` values.
-#[derive(Debug, Clone)]
-pub enum StreamEvent {
-    TextDelta(String),
-    ReasoningDelta(String),
-    /// Encrypted reasoning arrives as a single opaque blob, not a delta stream.
-    EncryptedReasoning {
-        data: String,
-        format: String,
-    },
-    ToolCallStart {
-        index: usize,
-        id: String,
-        name: String,
-    },
-    ToolCallArgumentDelta {
-        index: usize,
-        delta: String,
-    },
-    /// Anthropic-style signature for reasoning verification, separate from content.
-    ReasoningSignature(String),
-    Finished {
-        usage: Usage,
-    },
-}
-
-#[derive(Debug, Clone, Default)]
-pub struct Usage {
-    pub prompt_tokens: u32,
-    pub completion_tokens: u32,
-    pub reasoning_tokens: u32,
-}
+use domain::{ContentBlock, Message, Role, StreamEvent, Usage};
 
 /// Definition of a tool the model can call.
+///
+/// Stays in the app layer rather than in `domain` because the LLM tool schema
+/// is an *application* concern — `ToolRegistry` produces these from `Tool`
+/// implementations, and provider adapters translate them to provider-specific
+/// request shapes. Nothing persisted or serialized cares about `ToolDef`.
 #[derive(Debug, Clone)]
 pub struct ToolDef {
     pub name: String,
@@ -78,8 +48,8 @@ impl StreamAccumulator {
 
     pub fn push(&mut self, event: StreamEvent) {
         match event {
-            StreamEvent::TextDelta(delta) => self.text.push_str(&delta),
-            StreamEvent::ReasoningDelta(delta) => self.reasoning.push_str(&delta),
+            StreamEvent::TextDelta { delta } => self.text.push_str(&delta),
+            StreamEvent::ReasoningDelta { delta } => self.reasoning.push_str(&delta),
             StreamEvent::EncryptedReasoning { data, format } => {
                 self.encrypted = Some((data, format));
             }
@@ -98,8 +68,8 @@ impl StreamAccumulator {
                     tc.arguments.push_str(&delta);
                 }
             }
-            StreamEvent::ReasoningSignature(sig) => {
-                self.signature = Some(sig);
+            StreamEvent::ReasoningSignature { signature } => {
+                self.signature = Some(signature);
             }
             StreamEvent::Finished { usage } => {
                 self.usage = usage;
@@ -179,8 +149,12 @@ mod tests {
     #[test]
     fn text_only_response() {
         let mut acc = StreamAccumulator::new();
-        acc.push(StreamEvent::TextDelta("Hello, ".into()));
-        acc.push(StreamEvent::TextDelta("world!".into()));
+        acc.push(StreamEvent::TextDelta {
+            delta: "Hello, ".into(),
+        });
+        acc.push(StreamEvent::TextDelta {
+            delta: "world!".into(),
+        });
         acc.push(StreamEvent::Finished {
             usage: Usage {
                 prompt_tokens: 10,
@@ -283,9 +257,15 @@ mod tests {
     #[test]
     fn reasoning_plus_text() {
         let mut acc = StreamAccumulator::new();
-        acc.push(StreamEvent::ReasoningDelta("Let me think...".into()));
-        acc.push(StreamEvent::ReasoningDelta(" done.".into()));
-        acc.push(StreamEvent::TextDelta("The answer is 42.".into()));
+        acc.push(StreamEvent::ReasoningDelta {
+            delta: "Let me think...".into(),
+        });
+        acc.push(StreamEvent::ReasoningDelta {
+            delta: " done.".into(),
+        });
+        acc.push(StreamEvent::TextDelta {
+            delta: "The answer is 42.".into(),
+        });
         acc.push(StreamEvent::Finished {
             usage: Usage {
                 prompt_tokens: 5,
@@ -320,7 +300,9 @@ mod tests {
             data: "base64blob==".into(),
             format: "anthropic-claude-v1".into(),
         });
-        acc.push(StreamEvent::TextDelta("visible answer".into()));
+        acc.push(StreamEvent::TextDelta {
+            delta: "visible answer".into(),
+        });
         acc.push(StreamEvent::Finished {
             usage: Usage {
                 prompt_tokens: 0,
@@ -349,9 +331,15 @@ mod tests {
     #[test]
     fn anthropic_signature_attachment() {
         let mut acc = StreamAccumulator::new();
-        acc.push(StreamEvent::ReasoningDelta("thinking".into()));
-        acc.push(StreamEvent::ReasoningSignature("sig123".into()));
-        acc.push(StreamEvent::TextDelta("answer".into()));
+        acc.push(StreamEvent::ReasoningDelta {
+            delta: "thinking".into(),
+        });
+        acc.push(StreamEvent::ReasoningSignature {
+            signature: "sig123".into(),
+        });
+        acc.push(StreamEvent::TextDelta {
+            delta: "answer".into(),
+        });
         acc.push(StreamEvent::Finished {
             usage: Usage {
                 prompt_tokens: 0,
@@ -372,7 +360,9 @@ mod tests {
     #[test]
     fn interleaved_text_and_tool_calls() {
         let mut acc = StreamAccumulator::new();
-        acc.push(StreamEvent::TextDelta("I'll read that file.".into()));
+        acc.push(StreamEvent::TextDelta {
+            delta: "I'll read that file.".into(),
+        });
         acc.push(StreamEvent::ToolCallStart {
             index: 0,
             id: "call_1".into(),
@@ -442,8 +432,12 @@ mod tests {
             data: "encrypted_blob".into(),
             format: "anthropic-claude-v1".into(),
         });
-        acc.push(StreamEvent::ReasoningSignature("sig_abc".into()));
-        acc.push(StreamEvent::TextDelta("visible".into()));
+        acc.push(StreamEvent::ReasoningSignature {
+            signature: "sig_abc".into(),
+        });
+        acc.push(StreamEvent::TextDelta {
+            delta: "visible".into(),
+        });
         acc.push(StreamEvent::Finished {
             usage: Usage {
                 prompt_tokens: 0,
@@ -475,7 +469,9 @@ mod tests {
         let mut acc = StreamAccumulator::new();
         // Both readable and encrypted arrive (shouldn't happen in practice,
         // but the accumulator should prefer readable).
-        acc.push(StreamEvent::ReasoningDelta("readable thinking".into()));
+        acc.push(StreamEvent::ReasoningDelta {
+            delta: "readable thinking".into(),
+        });
         acc.push(StreamEvent::EncryptedReasoning {
             data: "blob".into(),
             format: "unknown".into(),
@@ -527,8 +523,12 @@ mod tests {
     #[test]
     fn snapshot_matches_into_message_for_text_only() {
         let mut acc = StreamAccumulator::new();
-        acc.push(StreamEvent::TextDelta("Hello, ".into()));
-        acc.push(StreamEvent::TextDelta("world!".into()));
+        acc.push(StreamEvent::TextDelta {
+            delta: "Hello, ".into(),
+        });
+        acc.push(StreamEvent::TextDelta {
+            delta: "world!".into(),
+        });
         acc.push(StreamEvent::Finished {
             usage: Usage {
                 prompt_tokens: 10,
@@ -545,10 +545,18 @@ mod tests {
     #[test]
     fn snapshot_matches_into_message_for_reasoning_plus_text() {
         let mut acc = StreamAccumulator::new();
-        acc.push(StreamEvent::ReasoningDelta("think ".into()));
-        acc.push(StreamEvent::ReasoningDelta("harder".into()));
-        acc.push(StreamEvent::ReasoningSignature("sig".into()));
-        acc.push(StreamEvent::TextDelta("answer".into()));
+        acc.push(StreamEvent::ReasoningDelta {
+            delta: "think ".into(),
+        });
+        acc.push(StreamEvent::ReasoningDelta {
+            delta: "harder".into(),
+        });
+        acc.push(StreamEvent::ReasoningSignature {
+            signature: "sig".into(),
+        });
+        acc.push(StreamEvent::TextDelta {
+            delta: "answer".into(),
+        });
         acc.push(StreamEvent::Finished {
             usage: Usage {
                 prompt_tokens: 0,
@@ -565,7 +573,9 @@ mod tests {
     #[test]
     fn snapshot_matches_into_message_for_tool_calls_including_parallel() {
         let mut acc = StreamAccumulator::new();
-        acc.push(StreamEvent::TextDelta("dispatching...".into()));
+        acc.push(StreamEvent::TextDelta {
+            delta: "dispatching...".into(),
+        });
         acc.push(StreamEvent::ToolCallStart {
             index: 0,
             id: "call_a".into(),
@@ -638,8 +648,12 @@ mod tests {
         // that has arrived, including a tool call whose arguments haven't
         // finished streaming. This is the live-rendering path.
         let mut acc = StreamAccumulator::new();
-        acc.push(StreamEvent::ReasoningDelta("partial reasoning".into()));
-        acc.push(StreamEvent::TextDelta("partial ".into()));
+        acc.push(StreamEvent::ReasoningDelta {
+            delta: "partial reasoning".into(),
+        });
+        acc.push(StreamEvent::TextDelta {
+            delta: "partial ".into(),
+        });
         acc.push(StreamEvent::ToolCallStart {
             index: 0,
             id: "call_x".into(),
@@ -711,8 +725,12 @@ mod tests {
             data: "opaque-blob".into(),
             format: "provider-x".into(),
         });
-        acc.push(StreamEvent::ReasoningSignature("sig-1".into()));
-        acc.push(StreamEvent::TextDelta("final answer".into()));
+        acc.push(StreamEvent::ReasoningSignature {
+            signature: "sig-1".into(),
+        });
+        acc.push(StreamEvent::TextDelta {
+            delta: "final answer".into(),
+        });
 
         let snap = acc.snapshot();
         assert_eq!(snap.content.len(), 2);
@@ -739,8 +757,12 @@ mod tests {
             data: "opaque".into(),
             format: "provider-x".into(),
         });
-        acc.push(StreamEvent::ReasoningDelta("readable".into()));
-        acc.push(StreamEvent::TextDelta("done".into()));
+        acc.push(StreamEvent::ReasoningDelta {
+            delta: "readable".into(),
+        });
+        acc.push(StreamEvent::TextDelta {
+            delta: "done".into(),
+        });
 
         let snap = acc.snapshot();
         let reasoning: Vec<_> = snap

@@ -4,8 +4,8 @@ pub mod wire;
 use std::pin::Pin;
 
 use anyhow::{Context, Result};
-use app::stream::{StreamEvent, ToolDef};
-use domain::Message;
+use app::stream::ToolDef;
+use domain::{Message, StreamEvent};
 use futures::stream::Stream;
 use tokio_stream::wrappers::ReceiverStream;
 

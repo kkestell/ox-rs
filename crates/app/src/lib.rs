@@ -7,6 +7,11 @@ mod use_cases;
 pub mod fake;
 
 pub use ports::*;
-pub use stream::{StreamAccumulator, StreamEvent, ToolDef, Usage};
+pub use stream::{StreamAccumulator, ToolDef};
 pub use tools::{EditFileTool, ReadFileTool, Tool, ToolRegistry, WriteFileTool};
 pub use use_cases::{SessionRunner, TurnEvent};
+
+// `StreamEvent` and `Usage` live in `domain` now — they're serializable data
+// shapes, not application behavior. Re-exported here so existing `app::*`
+// callers don't have to chase the move.
+pub use domain::{StreamEvent, Usage};

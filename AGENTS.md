@@ -1,33 +1,37 @@
 # AGENTS.md
 
-Ox is a desktop AI coding assistant built in Rust. It uses a hexagonal (ports-and-adapters) architecture to stream LLM responses through an egui GUI, with pluggable backends for model providers, session persistence, filesystem access, and secret management.
+Ox is a desktop AI coding assistant built in Rust. It uses a hexagonal (ports-and-adapters) architecture and a two-process design: an egui GUI (`ox-gui`) spawns one or more headless agent subprocesses (`ox-agent`) and talks to each over NDJSON on stdin/stdout. Pluggable backends cover model providers, session persistence, filesystem access, and secret management.
 
 ## Tech Stack
 
 - **Language:** Rust (edition 2024)
-- **Build system:** Cargo (workspace with 7 internal crates + root binary)
+- **Build system:** Cargo (virtual workspace — 8 library crates + 2 binary crates)
 - **GUI framework:** egui (via eframe)
+- **IPC:** NDJSON over stdin/stdout (tokio pipes, `kill_on_drop` for child lifetime)
 
 ## Codebase Map
 
-- `src/main.rs` — Binary entry point; composition root wiring adapters, tokio runtime, channels, GUI, and tool registry
-- `crates/domain/` — Core types: Session, Message, ContentBlock, Role, SessionId, SessionSummary
-- `crates/app/` — Application layer: port traits (LlmProvider, SessionStore, SecretStore, FileSystem, Shell), use cases (SessionRunner, TurnEvent), streaming (StreamEvent, StreamAccumulator, ToolDef), tools (Tool trait, ToolRegistry, ReadFileTool, WriteFileTool, EditFileTool, hashline helpers)
-- `crates/adapter-llm/` — LLM provider implementations: OpenRouter (streaming via SSE), Ollama (stub)
-- `crates/adapter-storage/` — Session persistence: DiskSessionStore (stub)
-- `crates/adapter-egui/` — GUI client: egui/eframe native window with channel-driven backend controller (`backend.rs`)
-- `crates/adapter-fs/` — Filesystem and shell: LocalFileSystem (implemented), BashShell (stub)
-- `crates/adapter-secrets/` — Secret retrieval: EnvSecretStore (implemented)
-- `experiments/` — Throwaway scripts for testing provider APIs
-- `docs/` — Research and design notes
+- `crates/domain/` — Core types: `Session`, `Message`, `ContentBlock`, `Role`, `SessionId`, `SessionSummary`, `StreamEvent`, `Usage`. All serde-derived so the same shapes serialize to disk *and* cross the GUI↔agent wire.
+- `crates/app/` — Application layer: port traits (`LlmProvider`, `SessionStore`, `SecretStore`, `FileSystem`, `Shell`), use cases (`SessionRunner`, `TurnEvent`), streaming (`StreamAccumulator`, `ToolDef`), tools (`Tool` trait, `ToolRegistry`, `ReadFileTool`, `WriteFileTool`, `EditFileTool`, hashline helpers). Re-exports `StreamEvent`/`Usage` from domain for caller convenience.
+- `crates/protocol/` — Wire protocol between `ox-gui` and `ox-agent`: `AgentCommand`, `AgentEvent`, and `read_frame`/`write_frame` helpers. Depends only on `domain` — no dep on `app` so the wire types cannot accidentally leak application-layer concerns.
+- `crates/adapter-llm/` — LLM provider implementations: OpenRouter (streaming via SSE), Ollama (stub).
+- `crates/adapter-storage/` — Session persistence: `DiskSessionStore` (one JSON file per session).
+- `crates/adapter-egui/` — GUI library: `OxApp` (egui root), `AgentTab` (per-agent state), `AgentClient` (IPC client over stdio with reader/writer tasks), `AgentSpawnConfig`.
+- `crates/adapter-fs/` — Filesystem and shell: `LocalFileSystem` (implemented), `BashShell` (stub).
+- `crates/adapter-secrets/` — Secret retrieval: `EnvSecretStore` (implemented).
+- `crates/bin-gui/` — `ox-gui` binary: composition root for the GUI process. Parses CLI, locates the `ox-agent` binary, spawns exactly one `AgentClient`, wraps it in an `AgentTab`, runs `OxApp`. Prints `ox-gui --resume <id>` per active agent on shutdown.
+- `crates/bin-agent/` — `ox-agent` binary: composition root for the agent process. Parses CLI, wires adapters, builds a `SessionRunner`, and hands control to `driver::agent_driver` which drives NDJSON I/O over stdin/stdout.
+- `experiments/` — Throwaway scripts for testing provider APIs.
+- `docs/` — Research and design notes.
 
 ## Commands
 
 - Build: `cargo build`
-- Run: `cargo run`
+- Run: `cargo run -p bin-gui`
+- Run the agent headless: `cargo run -p bin-agent -- --workspace-root … --model … --sessions-dir …`
 - Test: `cargo test`
 - Test (single crate): `cargo test -p <crate-name>`
-- Lint: `cargo clippy`
+- Lint: `cargo clippy --workspace --all-targets`
 - Format: `cargo fmt`
 
 ## Project Rules
@@ -49,60 +53,85 @@ The stable architectural shape.
 
 ```mermaid
 flowchart TB
-    main["Binary<br/>src/main.rs"]
+    binaries["Binaries<br/>bin-gui (ox-gui) · bin-agent (ox-agent)"]
     adapters["Adapters<br/>adapter-egui · adapter-llm · adapter-storage · adapter-fs · adapter-secrets"]
-    app["Application<br/>ports · use_cases · stream"]
-    domain["Domain<br/>Session · Message · ContentBlock · Role · SessionId · SessionSummary"]
+    app_layer["Application<br/>app: ports · use_cases · stream · tools"]
+    protocol["Wire protocol<br/>protocol: AgentCommand · AgentEvent · framing"]
+    domain["Domain<br/>Session · Message · ContentBlock · Role · SessionId · SessionSummary · StreamEvent · Usage"]
 
-    main --> adapters
-    adapters --> app
-    app --> domain
+    binaries --> adapters
+    binaries --> protocol
+    adapters --> protocol
+    adapters --> app_layer
+    app_layer --> domain
+    protocol --> domain
 ```
 
 Notes:
-- `app` depends on `domain`.
-- Adapters depend on `app` ports.
-- Some adapters also depend directly on `domain` types for translation and persistence.
+- `app` and `protocol` both depend on `domain` and sit at the same layer; neither depends on the other. `protocol` deliberately avoids `app` so wire types can never accidentally drag in application behavior.
+- Adapters depend on `app` ports. `adapter-egui` also depends on `protocol` (it speaks the wire format).
+- Binary crates compose adapters. `bin-gui` doesn't depend on `bin-agent` — the only coupling between the two processes is the `protocol` crate.
 
 ### Current Runtime Path
 
-What is actually implemented today.
+What is actually implemented today. Two processes, one NDJSON channel between them.
 
 ```mermaid
 sequenceDiagram
-    participant M as main.rs
-    participant G as OxApp (egui)
-    participant BC as run_backend
-    participant SR as SessionRunner
-    participant SS as SessionStore
-    participant LP as LlmProvider
-    participant TR as ToolRegistry
-    participant ACC as StreamAccumulator
+    box rgb(240,240,255) ox-gui process
+        participant M as bin-gui main
+        participant G as OxApp (egui)
+        participant T as AgentTab
+        participant C as AgentClient
+    end
+    box rgb(240,255,240) ox-agent process
+        participant D as agent_driver
+        participant SR as SessionRunner
+        participant SS as SessionStore
+        participant LP as LlmProvider
+        participant TR as ToolRegistry
+        participant ACC as StreamAccumulator
+    end
 
-    M->>SS: load(id) [--resume only]
-    M->>G: create channels, spawn backend, launch GUI (with initial messages if resuming)
-    G->>BC: BackendCommand::SendMessage (via channel)
-    BC->>SR: start(id, workspace_root, input, on_event) or resume(id, input, on_event)
-    SR->>SS: load session [resume] / create new [start]
+    M->>C: AgentClient::spawn(config) — tokio::process::Command + kill_on_drop
+    C->>D: (child process starts)
+    D->>SS: load(id) [--resume only]
+    D-->>C: AgentEvent::Ready { session_id, workspace_root }
+    Note over D,C: NDJSON frames on stdout
+    alt resume
+        loop each historical message
+            D-->>C: AgentEvent::MessageAppended(message)
+        end
+    end
+    C-->>T: deliver events via mpsc channel
+    T->>T: record session_id; append historical messages
+
+    M->>G: OxApp::new(vec![tab]); app.run()
+
+    G->>T: user clicks Send
+    T->>C: send(AgentCommand::SendMessage { input })
+    C->>D: NDJSON on stdin
+    D->>SR: start(...) or resume(...) with callback
+
     SR->>SR: append user message
-    BC-->>G: BackendEvent::MessageAppended(user)
+    D-->>C: AgentEvent::MessageAppended(user)
 
     loop until no tool calls or iteration cap
         SR->>LP: stream(messages, tool_defs)
         loop each streamed event
-            SR->>BC: on_event(TurnEvent::StreamDelta)
-            BC-->>G: BackendEvent::StreamDelta
+            SR->>D: TurnEvent::StreamDelta
+            D-->>C: AgentEvent::StreamDelta
             SR->>ACC: push(event)
         end
         ACC-->>SR: completed Message
         SR->>SR: append assistant message
-        BC-->>G: BackendEvent::MessageAppended(assistant)
+        D-->>C: AgentEvent::MessageAppended(assistant)
         alt assistant emitted tool calls
             loop each tool call
                 SR->>TR: execute(name, args)
                 TR-->>SR: Result<String>
                 SR->>SR: append tool-result message
-                BC-->>G: BackendEvent::MessageAppended(tool)
+                D-->>C: AgentEvent::MessageAppended(tool)
             end
         else no tool calls
             Note over SR: exit loop
@@ -110,25 +139,30 @@ sequenceDiagram
     end
 
     SR->>SS: save(updated session)
-    BC-->>G: BackendEvent::TurnComplete
-    Note over M: after GUI exits, print "ox --resume <id>" to stderr
+    D-->>C: AgentEvent::TurnComplete
+    C-->>T: turn_complete
+    Note over M: GUI exits — AgentClient drops — kill_on_drop SIGKILLs ox-agent
+    Note over M: bin-gui prints "ox-gui --resume <id>" per active tab
 ```
 
 Current status:
-- `src/main.rs`: composition root with CLI parsing (`--resume <id>`), session pre-loading, adapter wiring, tool registration (read_file, write_file, edit_file), and resume-command output on exit.
-- `adapter-egui`: channel-driven GUI with message display, text input, send button, event polling, and incremental streaming display for text, reasoning, and tool-call arguments. Accepts initial messages for session resume. `backend.rs` contains the `run_backend` controller and channel protocol types (`BackendCommand`; `BackendEvent::{StreamDelta, MessageAppended, TurnComplete, Error}`). Backend accepts an optional initial session ID and returns the final session ID.
-- `app::tools`: file-editing tool suite — `read_file` (hashlined output with offset/limit), `write_file` (creates parent dirs), `edit_file` (replace/insert_after operations anchored by hashlines with mismatch detection). The `Tool` trait + `ToolRegistry` form the in-process execution contract.
+- `bin-gui`: composition root for the GUI process. CLI (`--resume <id>`, `--model`), API key from env, locates `ox-agent` next to `current_exe()`, spawns one agent, runs `OxApp`, prints resume command on shutdown.
+- `bin-agent`: composition root for the agent process. CLI (`--workspace-root`, `--model`, `--sessions-dir`, `--resume`), wires adapters, runs `driver::agent_driver` over stdin/stdout. On fatal error, emits an `AgentEvent::Error` frame and exits non-zero.
+- `protocol`: `AgentCommand` (`SendMessage`), `AgentEvent` (`Ready`, `StreamDelta`, `MessageAppended`, `TurnComplete`, `Error`), `read_frame`/`write_frame` helpers. All enums `#[non_exhaustive]` for forward compatibility.
+- `adapter-egui`: `OxApp` renders `tabs[current]`; per-tab state (messages, streaming accumulator, waiting flag, error, session_id) lives on `AgentTab`. `AgentClient` owns the tokio::process `Child` with `kill_on_drop(true)`, runs reader/writer tasks, exposes a channel API. Single tab for this iteration; multi-tab plumbing is ready for a future tiling UI.
+- `app::tools`: file-editing tool suite — `read_file` (hashlined output with offset/limit), `write_file` (creates parent dirs), `edit_file` (replace/insert_after operations anchored by hashlines with mismatch detection).
 - `adapter-llm/OpenRouterProvider`: implemented streaming path.
 - `adapter-llm/OllamaProvider`: stub.
 - `adapter-storage/DiskSessionStore`: implemented (load, save, list).
-- `adapter-fs/LocalFileSystem`: implemented (now creates parent dirs on write).
+- `adapter-fs/LocalFileSystem`: implemented.
 - `adapter-fs/BashShell`: stub.
 - `adapter-secrets/EnvSecretStore`: implemented.
 
 Not yet implemented:
-- Model/config selection (model is hardcoded).
+- Model/config selection in-app (passed from GUI to agent at spawn; no UI to change mid-session).
 - Session management UI (sessions can be resumed via CLI, but no in-app session browser/switcher).
 - Error recovery UI (errors displayed but no retry/dismiss).
-- Cancel/stop generation (no way to abort an in-progress stream or a long tool-call loop).
-- Tool-approval flow (tools auto-execute; destructive tools have no permission gate).
+- Graceful cancel of an in-progress turn. Today the model is "kill the agent subprocess" — dropping the `AgentClient` / `AgentTab` SIGKILLs the agent. A future `AgentCommand::Cancel` that preserves partial state is not yet wired.
+- Multi-tab UI. `OxApp` holds `Vec<AgentTab>` and renders `tabs[current]`, but no UI exists yet to add, remove, or switch tabs.
+- Tool-approval flow (tools auto-execute; destructive tools have no permission gate). Would require an `AgentEvent::ToolCallPending` + `AgentCommand::ApproveToolCall` protocol extension.
 - Bash tool (trait and registry are ready; `BashShell` is still a stub).

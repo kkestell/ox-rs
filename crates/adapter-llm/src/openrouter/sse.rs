@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use app::stream::{StreamEvent, Usage};
+use domain::{StreamEvent, Usage};
 use futures::StreamExt;
 use reqwest::Response;
 
@@ -73,7 +73,9 @@ fn chunk_to_events(chunk: &SseChunk) -> Vec<StreamEvent> {
         if let Some(ref reasoning) = delta.reasoning
             && !reasoning.is_empty()
         {
-            events.push(StreamEvent::ReasoningDelta(reasoning.clone()));
+            events.push(StreamEvent::ReasoningDelta {
+                delta: reasoning.clone(),
+            });
         }
 
         // Inspect reasoning_details only for encrypted blobs and signatures.
@@ -90,7 +92,9 @@ fn chunk_to_events(chunk: &SseChunk) -> Vec<StreamEvent> {
                 if let Some(ref sig) = detail.signature
                     && !sig.is_empty()
                 {
-                    events.push(StreamEvent::ReasoningSignature(sig.clone()));
+                    events.push(StreamEvent::ReasoningSignature {
+                        signature: sig.clone(),
+                    });
                 }
             }
         }
@@ -99,7 +103,9 @@ fn chunk_to_events(chunk: &SseChunk) -> Vec<StreamEvent> {
         if let Some(ref content) = delta.content
             && !content.is_empty()
         {
-            events.push(StreamEvent::TextDelta(content.clone()));
+            events.push(StreamEvent::TextDelta {
+                delta: content.clone(),
+            });
         }
 
         // Tool call deltas.
@@ -162,7 +168,7 @@ mod tests {
         let chunk: SseChunk = serde_json::from_str(json).unwrap();
         let events = chunk_to_events(&chunk);
         assert_eq!(events.len(), 1);
-        assert!(matches!(&events[0], StreamEvent::TextDelta(t) if t == "hello"));
+        assert!(matches!(&events[0], StreamEvent::TextDelta { delta: t } if t == "hello"));
     }
 
     #[test]
@@ -171,7 +177,9 @@ mod tests {
         let chunk: SseChunk = serde_json::from_str(json).unwrap();
         let events = chunk_to_events(&chunk);
         assert_eq!(events.len(), 1);
-        assert!(matches!(&events[0], StreamEvent::ReasoningDelta(r) if r == "thinking..."));
+        assert!(
+            matches!(&events[0], StreamEvent::ReasoningDelta { delta: r } if r == "thinking...")
+        );
     }
 
     #[test]
@@ -192,7 +200,9 @@ mod tests {
         let chunk: SseChunk = serde_json::from_str(json).unwrap();
         let events = chunk_to_events(&chunk);
         assert_eq!(events.len(), 1);
-        assert!(matches!(&events[0], StreamEvent::ReasoningSignature(s) if s == "sig123"));
+        assert!(
+            matches!(&events[0], StreamEvent::ReasoningSignature { signature: s } if s == "sig123")
+        );
     }
 
     #[test]

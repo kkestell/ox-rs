@@ -2,10 +2,10 @@ use std::path::Path;
 use std::pin::Pin;
 
 use anyhow::Result;
-use domain::{Message, Session, SessionId, SessionSummary};
+use domain::{Message, Session, SessionId, SessionSummary, StreamEvent};
 use futures::stream::Stream;
 
-use crate::stream::{StreamEvent, ToolDef};
+use crate::stream::ToolDef;
 
 // Driven (outbound) ports
 
