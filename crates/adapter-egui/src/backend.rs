@@ -267,9 +267,7 @@ mod tests {
         let (cmd_tx, mut evt_rx, handle) = start_backend(llm, store, None);
 
         cmd_tx
-            .send(BackendCommand::SendMessage {
-                input: "hi".into(),
-            })
+            .send(BackendCommand::SendMessage { input: "hi".into() })
             .unwrap();
         let _ = recv_past_deltas(&mut evt_rx).await;
 
@@ -320,7 +318,11 @@ mod tests {
 
         drop(cmd_tx);
         let final_id = handle.await.unwrap();
-        assert_eq!(final_id, Some(id), "session ID should be preserved after resume failure");
+        assert_eq!(
+            final_id,
+            Some(id),
+            "session ID should be preserved after resume failure"
+        );
     }
 
     #[tokio::test]

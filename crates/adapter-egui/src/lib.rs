@@ -1,11 +1,11 @@
 pub mod backend;
 
 use anyhow::Result;
-use domain::{Message, Role};
+use domain::{ContentBlock, Message, Role};
 use eframe::egui;
 use tokio::sync::mpsc;
 
-use app::StreamEvent;
+use app::StreamAccumulator;
 use backend::{BackendCommand, BackendEvent};
 
 pub struct OxApp {
@@ -13,10 +13,14 @@ pub struct OxApp {
     evt_rx: mpsc::UnboundedReceiver<BackendEvent>,
     messages: Vec<Message>,
     input: String,
-    /// Text accumulated from streaming text deltas. Rendered in place of the
-    /// "..." indicator once the first token arrives, then cleared when the
-    /// final AssistantMessage lands.
-    streaming_text: String,
+    /// A live mirror of the in-flight assistant turn. We push every stream
+    /// event into the accumulator and render a fresh snapshot each frame,
+    /// so ordering and block shape match the final `Message` exactly —
+    /// preventing a visual flicker when the accumulator is dropped and the
+    /// final `AssistantMessage` takes its place in history.
+    ///
+    /// `None` when no turn is in flight (initial state and between turns).
+    streaming: Option<StreamAccumulator>,
     /// True while waiting for the backend to respond — prevents double-sends
     /// and shows a visual indicator.
     waiting: bool,
@@ -34,7 +38,7 @@ impl OxApp {
             evt_rx,
             messages,
             input: String::new(),
-            streaming_text: String::new(),
+            streaming: None,
             waiting: false,
             error: None,
         }
@@ -51,21 +55,27 @@ impl OxApp {
     fn poll_events(&mut self) {
         loop {
             match self.evt_rx.try_recv() {
-                Ok(BackendEvent::StreamDelta(StreamEvent::TextDelta(s))) => {
-                    self.streaming_text.push_str(&s);
-                }
-                Ok(BackendEvent::StreamDelta(_)) => {
-                    // Non-text stream events (reasoning, tool calls, finished)
-                    // are accumulated by SessionRunner but not rendered yet.
+                Ok(BackendEvent::StreamDelta(event)) => {
+                    // Lazily create the accumulator on the first delta.
+                    // This keeps the "just submitted, no tokens yet" state
+                    // distinguishable from the "tokens streaming" state for
+                    // the UI's waiting placeholder.
+                    self.streaming
+                        .get_or_insert_with(StreamAccumulator::new)
+                        .push(event);
                 }
                 Ok(BackendEvent::AssistantMessage(msg)) => {
                     self.messages.push(msg);
-                    self.streaming_text.clear();
+                    // The final message supersedes the accumulator — drop it
+                    // so the live-view branch stops rendering.
+                    self.streaming = None;
                     self.waiting = false;
                     self.error = None;
                 }
                 Ok(BackendEvent::Error(e)) => {
-                    self.streaming_text.clear();
+                    // Abandon the partial accumulator; whatever streamed is
+                    // not a valid assistant turn.
+                    self.streaming = None;
                     self.error = Some(e);
                     self.waiting = false;
                 }
@@ -110,13 +120,18 @@ impl eframe::App for OxApp {
                             Role::Tool => "Tool",
                         };
                         ui.label(egui::RichText::new(label).strong());
-                        ui.label(msg.text());
+                        render_blocks(ui, &msg.content);
                         ui.add_space(8.0);
                     }
 
-                    if !self.streaming_text.is_empty() {
+                    // Live view of the in-flight turn. `streaming` is `None`
+                    // until the first delta arrives, so we fall back to the
+                    // "..." placeholder while the request is in flight but
+                    // hasn't produced anything yet.
+                    if let Some(acc) = &self.streaming {
+                        let snapshot = acc.snapshot();
                         ui.label(egui::RichText::new("Ox").strong());
-                        ui.label(&self.streaming_text);
+                        render_blocks(ui, &snapshot.content);
                         ui.add_space(8.0);
                     } else if self.waiting {
                         ui.label("...");
@@ -157,6 +172,52 @@ impl eframe::App for OxApp {
         // the final response promptly.
         if self.waiting {
             ctx.request_repaint();
+        }
+    }
+}
+
+/// Render a sequence of `ContentBlock`s as a flat column of labels.
+///
+/// One renderer for both history and live streaming: each call takes a borrowed
+/// slice so it doesn't care whether the blocks came from a persisted `Message`
+/// or a fresh `StreamAccumulator::snapshot`. That symmetry is the whole point —
+/// the live view and the final view can't drift apart because they run through
+/// the same function.
+///
+/// Visual treatment is deliberately plain: a `kind:` prefix per non-text block,
+/// no collapsibles, no JSON prettifying. If reasoning or tool-call volume
+/// becomes noisy we can revisit, but flat text is the right default for now.
+fn render_blocks(ui: &mut egui::Ui, blocks: &[ContentBlock]) {
+    for block in blocks {
+        match block {
+            ContentBlock::Text { text } => {
+                ui.label(text);
+            }
+            ContentBlock::Reasoning { content, .. } => {
+                // An encrypted-only reasoning block carries an empty `content`
+                // — the opaque blob is persisted so we can re-send it, but
+                // there's nothing to show the user. Skip rather than emit a
+                // dangling "thinking:" header.
+                if !content.is_empty() {
+                    ui.label(format!("thinking: {content}"));
+                }
+            }
+            ContentBlock::ToolCall {
+                name, arguments, ..
+            } => {
+                ui.label(format!("tool call: {name}({arguments})"));
+            }
+            ContentBlock::ToolResult {
+                content, is_error, ..
+            } => {
+                // Plain-text "(error)" suffix — no color, no styling, matches
+                // the no-fancy-formatting decision for the rest of the UI.
+                if *is_error {
+                    ui.label(format!("tool result: {content} (error)"));
+                } else {
+                    ui.label(format!("tool result: {content}"));
+                }
+            }
         }
     }
 }

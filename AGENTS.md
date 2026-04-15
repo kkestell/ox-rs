@@ -99,7 +99,7 @@ sequenceDiagram
 
 Current status:
 - `src/main.rs`: composition root with CLI parsing (`--resume <id>`), session pre-loading, adapter wiring, and resume-command output on exit.
-- `adapter-egui`: channel-driven GUI with message display, text input, send button, event polling, and incremental streaming display. Accepts initial messages for session resume. `backend.rs` contains the `run_backend` controller and channel protocol types (`BackendCommand`, `BackendEvent` including `StreamDelta`). Backend accepts an optional initial session ID and returns the final session ID.
+- `adapter-egui`: channel-driven GUI with message display, text input, send button, event polling, and incremental streaming display for text, reasoning, and tool-call arguments. Accepts initial messages for session resume. `backend.rs` contains the `run_backend` controller and channel protocol types (`BackendCommand`, `BackendEvent` including `StreamDelta`). Backend accepts an optional initial session ID and returns the final session ID.
 - `adapter-llm/OpenRouterProvider`: implemented streaming path.
 - `adapter-llm/OllamaProvider`: stub.
 - `adapter-storage/DiskSessionStore`: implemented (load, save, list).
@@ -108,7 +108,6 @@ Current status:
 - `adapter-secrets/EnvSecretStore`: implemented.
 
 Not yet implemented:
-- Streaming reasoning/tool-call display (reasoning tokens and tool calls are accumulated but not rendered incrementally).
 - Model/config selection (model is hardcoded).
 - Session management UI (sessions can be resumed via CLI, but no in-app session browser/switcher).
 - Error recovery UI (errors displayed but no retry/dismiss).
