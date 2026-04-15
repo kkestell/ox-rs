@@ -21,8 +21,9 @@ fn main() -> Result<()> {
         .get("OPENROUTER_API_KEY")?
         .context("OPENROUTER_API_KEY is not set — export it and try again")?;
 
-    // Cheap model suitable for development and testing.
-    let model = "mistralai/mistral-nemo".to_owned();
+    // DeepSeek R1 — reasoning-capable flagship, good for exercising the
+    // thinking/tool-call rendering path.
+    let model = "deepseek/deepseek-r1".to_owned();
 
     let sessions_dir = dirs::home_dir()
         .context("could not determine home directory")?

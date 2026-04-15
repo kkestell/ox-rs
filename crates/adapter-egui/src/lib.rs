@@ -107,7 +107,37 @@ impl eframe::App for OxApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_events();
 
-        // Message history fills the central area.
+        // Input bar at the bottom. Must be registered BEFORE the central
+        // panel — egui allocates panels in declaration order, and the
+        // central panel consumes whatever space remains. If the bottom
+        // panel is added after the central panel, the central panel has
+        // already claimed the full viewport and message content ends up
+        // hidden behind the input bar.
+        egui::TopBottomPanel::bottom("input_panel").show(ctx, |ui| {
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                let input_response = ui.add_sized(
+                    [ui.available_width() - 60.0, 24.0],
+                    egui::TextEdit::singleline(&mut self.input).hint_text("Type a message..."),
+                );
+
+                let enter_pressed =
+                    input_response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+
+                let send_clicked = ui
+                    .add_enabled(!self.waiting, egui::Button::new("Send"))
+                    .clicked();
+
+                if enter_pressed || send_clicked {
+                    self.send_message();
+                    // Return focus to the text input after sending.
+                    input_response.request_focus();
+                }
+            });
+            ui.add_space(4.0);
+        });
+
+        // Message history fills whatever space the bottom panel leaves.
         egui::CentralPanel::default().show(ctx, |ui| {
             egui::ScrollArea::vertical()
                 .auto_shrink(false)
@@ -143,31 +173,6 @@ impl eframe::App for OxApp {
                 });
         });
 
-        // Input bar at the bottom.
-        egui::TopBottomPanel::bottom("input_panel").show(ctx, |ui| {
-            ui.add_space(4.0);
-            ui.horizontal(|ui| {
-                let input_response = ui.add_sized(
-                    [ui.available_width() - 60.0, 24.0],
-                    egui::TextEdit::singleline(&mut self.input).hint_text("Type a message..."),
-                );
-
-                let enter_pressed =
-                    input_response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-
-                let send_clicked = ui
-                    .add_enabled(!self.waiting, egui::Button::new("Send"))
-                    .clicked();
-
-                if enter_pressed || send_clicked {
-                    self.send_message();
-                    // Return focus to the text input after sending.
-                    input_response.request_focus();
-                }
-            });
-            ui.add_space(4.0);
-        });
-
         // Keep polling while waiting so we pick up streaming tokens and
         // the final response promptly.
         if self.waiting {
@@ -198,8 +203,15 @@ fn render_blocks(ui: &mut egui::Ui, blocks: &[ContentBlock]) {
                 // — the opaque blob is persisted so we can re-send it, but
                 // there's nothing to show the user. Skip rather than emit a
                 // dangling "thinking:" header.
+                //
+                // Red visually separates the model's internal monologue from
+                // its final answer. Works against both light and dark egui
+                // themes.
                 if !content.is_empty() {
-                    ui.label(format!("thinking: {content}"));
+                    ui.label(
+                        egui::RichText::new(format!("thinking: {content}"))
+                            .color(egui::Color32::RED),
+                    );
                 }
             }
             ContentBlock::ToolCall {
