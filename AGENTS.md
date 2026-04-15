@@ -78,7 +78,8 @@ sequenceDiagram
     participant LP as LlmProvider
     participant ACC as StreamAccumulator
 
-    M->>G: create channels, spawn backend, launch GUI
+    M->>SS: load(id) [--resume only]
+    M->>G: create channels, spawn backend, launch GUI (with initial messages if resuming)
     G->>BC: BackendCommand::SendMessage (via channel)
     BC->>SR: start(id, workspace_root, input, on_event) or resume(id, input, on_event)
     SR->>SS: load session [resume] / create new [start]
@@ -93,11 +94,12 @@ sequenceDiagram
     ACC-->>SR: completed Message
     SR->>SS: save(updated session)
     BC-->>G: BackendEvent::AssistantMessage (via channel)
+    Note over M: after GUI exits, print "ox --resume <id>" to stderr
 ```
 
 Current status:
-- `src/main.rs`: composition root wiring all adapters and launching the GUI.
-- `adapter-egui`: channel-driven GUI with message display, text input, send button, event polling, and incremental streaming display. `backend.rs` contains the `run_backend` controller and channel protocol types (`BackendCommand`, `BackendEvent` including `StreamDelta`).
+- `src/main.rs`: composition root with CLI parsing (`--resume <id>`), session pre-loading, adapter wiring, and resume-command output on exit.
+- `adapter-egui`: channel-driven GUI with message display, text input, send button, event polling, and incremental streaming display. Accepts initial messages for session resume. `backend.rs` contains the `run_backend` controller and channel protocol types (`BackendCommand`, `BackendEvent` including `StreamDelta`). Backend accepts an optional initial session ID and returns the final session ID.
 - `adapter-llm/OpenRouterProvider`: implemented streaming path.
 - `adapter-llm/OllamaProvider`: stub.
 - `adapter-storage/DiskSessionStore`: implemented (load, save, list).
@@ -108,6 +110,6 @@ Current status:
 Not yet implemented:
 - Streaming reasoning/tool-call display (reasoning tokens and tool calls are accumulated but not rendered incrementally).
 - Model/config selection (model is hardcoded).
-- Session management (new session on every launch).
+- Session management UI (sessions can be resumed via CLI, but no in-app session browser/switcher).
 - Error recovery UI (errors displayed but no retry/dismiss).
 - Cancel/stop generation (no way to abort an in-progress stream).

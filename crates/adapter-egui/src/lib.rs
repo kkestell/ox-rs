@@ -27,11 +27,12 @@ impl OxApp {
     pub fn new(
         cmd_tx: mpsc::UnboundedSender<BackendCommand>,
         evt_rx: mpsc::UnboundedReceiver<BackendEvent>,
+        messages: Vec<Message>,
     ) -> Self {
         Self {
             cmd_tx,
             evt_rx,
-            messages: Vec::new(),
+            messages,
             input: String::new(),
             streaming_text: String::new(),
             waiting: false,

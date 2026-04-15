@@ -41,11 +41,13 @@ pub async fn run_backend<L, S>(
     mut cmd_rx: mpsc::UnboundedReceiver<BackendCommand>,
     evt_tx: mpsc::UnboundedSender<BackendEvent>,
     workspace_root: PathBuf,
-) where
+    initial_session_id: Option<SessionId>,
+) -> Option<SessionId>
+where
     L: LlmProvider + Send + Sync + 'static,
     S: SessionStore + Send + Sync + 'static,
 {
-    let mut session_id: Option<SessionId> = None;
+    let mut session_id: Option<SessionId> = initial_session_id;
 
     while let Some(cmd) = cmd_rx.recv().await {
         match cmd {
@@ -94,12 +96,14 @@ pub async fn run_backend<L, S>(
             }
         }
     }
+
+    session_id
 }
 
 #[cfg(test)]
 mod tests {
     use app::fake::{FakeLlmProvider, FakeSessionStore};
-    use domain::Role;
+    use domain::{Role, Session};
 
     use super::*;
 
@@ -109,16 +113,23 @@ mod tests {
     fn start_backend(
         llm: FakeLlmProvider,
         store: FakeSessionStore,
+        initial_session_id: Option<SessionId>,
     ) -> (
         mpsc::UnboundedSender<BackendCommand>,
         mpsc::UnboundedReceiver<BackendEvent>,
-        tokio::task::JoinHandle<()>,
+        tokio::task::JoinHandle<Option<SessionId>>,
     ) {
         let runner = SessionRunner::new(llm, store);
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
         let (evt_tx, evt_rx) = mpsc::unbounded_channel();
 
-        let handle = tokio::spawn(run_backend(runner, cmd_rx, evt_tx, "/test/project".into()));
+        let handle = tokio::spawn(run_backend(
+            runner,
+            cmd_rx,
+            evt_tx,
+            "/test/project".into(),
+            initial_session_id,
+        ));
 
         (cmd_tx, evt_rx, handle)
     }
@@ -143,7 +154,7 @@ mod tests {
         let llm = FakeLlmProvider::new();
         llm.push_text("Hello back!");
         let store = FakeSessionStore::new();
-        let (cmd_tx, mut evt_rx, handle) = start_backend(llm, store);
+        let (cmd_tx, mut evt_rx, handle) = start_backend(llm, store, None);
 
         cmd_tx
             .send(BackendCommand::SendMessage {
@@ -171,7 +182,7 @@ mod tests {
         llm.push_text("first reply");
         llm.push_text("second reply");
         let store = FakeSessionStore::new();
-        let (cmd_tx, mut evt_rx, handle) = start_backend(llm, store);
+        let (cmd_tx, mut evt_rx, handle) = start_backend(llm, store, None);
 
         // First message — triggers start()
         cmd_tx
@@ -204,11 +215,120 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn initial_session_id_resumes_on_first_message() {
+        // Seed the store with a session so resume() can find it.
+        let id = SessionId::new_v4();
+        let store = FakeSessionStore::new();
+        store.insert(Session::new(id, "/test/project".into()));
+
+        let llm = FakeLlmProvider::new();
+        llm.push_text("resumed!");
+
+        let (cmd_tx, mut evt_rx, handle) = start_backend(llm, store, Some(id));
+
+        // First message should call resume(), not start().
+        cmd_tx
+            .send(BackendCommand::SendMessage {
+                input: "continue".into(),
+            })
+            .unwrap();
+
+        let (_deltas, event) = recv_past_deltas(&mut evt_rx).await;
+        match event {
+            BackendEvent::AssistantMessage(msg) => {
+                assert_eq!(msg.text(), "resumed!");
+            }
+            BackendEvent::Error(e) => panic!("expected AssistantMessage, got Error: {e}"),
+            _ => panic!("unexpected event"),
+        }
+
+        drop(cmd_tx);
+        let final_id = handle.await.unwrap();
+        assert_eq!(final_id, Some(id));
+    }
+
+    #[tokio::test]
+    async fn returns_none_when_no_message_sent() {
+        let llm = FakeLlmProvider::new();
+        let store = FakeSessionStore::new();
+        let (cmd_tx, _evt_rx, handle) = start_backend(llm, store, None);
+
+        // Close immediately without sending any message.
+        drop(cmd_tx);
+        let final_id = handle.await.unwrap();
+        assert_eq!(final_id, None);
+    }
+
+    #[tokio::test]
+    async fn returns_session_id_after_successful_message() {
+        let llm = FakeLlmProvider::new();
+        llm.push_text("hello!");
+        let store = FakeSessionStore::new();
+        let (cmd_tx, mut evt_rx, handle) = start_backend(llm, store, None);
+
+        cmd_tx
+            .send(BackendCommand::SendMessage {
+                input: "hi".into(),
+            })
+            .unwrap();
+        let _ = recv_past_deltas(&mut evt_rx).await;
+
+        drop(cmd_tx);
+        let final_id = handle.await.unwrap();
+        assert!(final_id.is_some());
+    }
+
+    #[tokio::test]
+    async fn resumed_session_returns_id_even_without_message() {
+        // When resuming an existing session and the user closes without
+        // sending a message, the session ID should still be returned since
+        // the session exists on disk.
+        let id = SessionId::new_v4();
+        let store = FakeSessionStore::new();
+        store.insert(Session::new(id, "/test/project".into()));
+
+        let llm = FakeLlmProvider::new();
+        let (cmd_tx, _evt_rx, handle) = start_backend(llm, store, Some(id));
+
+        drop(cmd_tx);
+        let final_id = handle.await.unwrap();
+        assert_eq!(final_id, Some(id));
+    }
+
+    #[tokio::test]
+    async fn resume_nonexistent_session_returns_error_and_keeps_id() {
+        // When the backend is started with a session ID that doesn't exist
+        // in the store, resume() fails. The session ID should stay — we
+        // don't fall back to creating a new session for an explicit resume.
+        let id = SessionId::new_v4();
+        let llm = FakeLlmProvider::new();
+        let store = FakeSessionStore::new(); // deliberately empty
+
+        let (cmd_tx, mut evt_rx, handle) = start_backend(llm, store, Some(id));
+
+        cmd_tx
+            .send(BackendCommand::SendMessage {
+                input: "hello".into(),
+            })
+            .unwrap();
+
+        let (_deltas, event) = recv_past_deltas(&mut evt_rx).await;
+        assert!(
+            matches!(&event, BackendEvent::Error(_)),
+            "expected Error for non-existent session"
+        );
+
+        drop(cmd_tx);
+        let final_id = handle.await.unwrap();
+        assert_eq!(final_id, Some(id), "session ID should be preserved after resume failure");
+    }
+
+    #[tokio::test]
     async fn llm_error_becomes_error_event() {
         let llm = FakeLlmProvider::new();
         llm.push_error("model overloaded");
         let store = FakeSessionStore::new();
-        let (cmd_tx, mut evt_rx, handle) = start_backend(llm, store);
+        let (cmd_tx, mut evt_rx, handle) = start_backend(llm, store, None);
 
         cmd_tx
             .send(BackendCommand::SendMessage { input: "hi".into() })
@@ -238,7 +358,7 @@ mod tests {
         llm.push_error("connection refused");
         llm.push_text("recovered!");
         let store = FakeSessionStore::new();
-        let (cmd_tx, mut evt_rx, handle) = start_backend(llm, store);
+        let (cmd_tx, mut evt_rx, handle) = start_backend(llm, store, None);
 
         // First message fails.
         cmd_tx
@@ -284,7 +404,7 @@ mod tests {
             },
         ]);
         let store = FakeSessionStore::new();
-        let (cmd_tx, mut evt_rx, handle) = start_backend(llm, store);
+        let (cmd_tx, mut evt_rx, handle) = start_backend(llm, store, None);
 
         cmd_tx
             .send(BackendCommand::SendMessage {
@@ -320,7 +440,7 @@ mod tests {
             "stream interrupted",
         );
         let store = FakeSessionStore::new();
-        let (cmd_tx, mut evt_rx, handle) = start_backend(llm, store);
+        let (cmd_tx, mut evt_rx, handle) = start_backend(llm, store, None);
 
         cmd_tx
             .send(BackendCommand::SendMessage {
@@ -350,7 +470,7 @@ mod tests {
     async fn channel_close_exits_cleanly() {
         let llm = FakeLlmProvider::new();
         let store = FakeSessionStore::new();
-        let (cmd_tx, _evt_rx, handle) = start_backend(llm, store);
+        let (cmd_tx, _evt_rx, handle) = start_backend(llm, store, None);
 
         // Drop the command sender immediately — backend should exit
         // without panicking or hanging.
