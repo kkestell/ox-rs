@@ -177,7 +177,7 @@ impl OxApp {
             split_fracs,
             spawn_config,
             session_id_mirror: mirror.clone(),
-            pending_focus: None,
+            pending_focus: Some(0),
         };
         (app, mirror)
     }
@@ -617,11 +617,15 @@ fn render_blocks(
 
         match block {
             ContentBlock::Text { text } => {
+                let trimmed = text.trim_end_matches(['\n', ' ']);
+                if trimmed.is_empty() {
+                    continue;
+                }
                 let color = match role {
                     Role::User => egui::Color32::from_rgb(100, 149, 237),
                     _ => egui::Color32::WHITE,
                 };
-                ui.label(egui::RichText::new(text).color(color));
+                ui.label(egui::RichText::new(trimmed).color(color));
                 rendered_any = true;
             }
             ContentBlock::Reasoning { content, .. } => {
