@@ -12,6 +12,7 @@ mod agent_client;
 
 pub use agent_client::{AgentClient, AgentSpawnConfig};
 
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
@@ -497,6 +498,25 @@ fn render_split(
         total_rect.max,
     );
 
+    // Build a tool-result index so tool-call blocks can inline their results.
+    // Tool results arrive as separate Role::Tool messages containing ToolResult
+    // blocks. We collect them here and skip those messages in the render loop.
+    let mut tool_results: HashMap<&str, (&str, bool)> = HashMap::new();
+    for msg in &tab.messages {
+        if msg.role == Role::Tool {
+            for block in &msg.content {
+                if let ContentBlock::ToolResult {
+                    tool_call_id,
+                    content,
+                    is_error,
+                } = block
+                {
+                    tool_results.insert(tool_call_id.as_str(), (content.as_str(), *is_error));
+                }
+            }
+        }
+    }
+
     // -- Scroll area with messages --
     let mut scroll_ui = ui.new_child(egui::UiBuilder::new().max_rect(scroll_rect));
     egui::ScrollArea::vertical()
@@ -504,22 +524,22 @@ fn render_split(
         .auto_shrink(false)
         .stick_to_bottom(true)
         .show(&mut scroll_ui, |ui| {
-            for msg in &tab.messages {
-                let label = match msg.role {
-                    Role::User => "You",
-                    Role::Assistant => "Ox",
-                    Role::Tool => "Tool",
-                };
-                ui.label(egui::RichText::new(label).strong());
-                render_blocks(ui, &msg.content);
+            for (msg_index, msg) in tab.messages.iter().enumerate() {
+                // Tool-role messages are consumed via the tool-result index
+                // and rendered inline under their paired tool-call block.
+                if msg.role == Role::Tool {
+                    continue;
+                }
+                render_blocks(ui, &msg.content, &msg.role, msg_index, &tool_results);
                 ui.add_space(8.0);
             }
 
-            // Live view of the in-flight turn.
+            // Live view of the in-flight turn. No tool results exist yet
+            // during streaming — they arrive after the turn completes.
             if let Some(acc) = &tab.streaming {
                 let snapshot = acc.snapshot();
-                ui.label(egui::RichText::new("Ox").strong());
-                render_blocks(ui, snapshot.content);
+                let empty = HashMap::new();
+                render_blocks(ui, snapshot.content, &Role::Assistant, usize::MAX, &empty);
                 ui.add_space(8.0);
             } else if tab.waiting {
                 ui.label("...");
@@ -559,7 +579,7 @@ fn render_split(
     }
 }
 
-/// Render a sequence of `ContentBlock`s as a flat column of labels.
+/// Render a sequence of `ContentBlock`s with role-aware styling.
 ///
 /// One renderer for both history and live streaming: each call takes a
 /// borrowed slice so it doesn't care whether the blocks came from a
@@ -567,49 +587,86 @@ fn render_split(
 /// symmetry is the whole point — the live view and the final view can't
 /// drift apart because they run through the same function.
 ///
-/// Visual treatment is deliberately plain: a `kind:` prefix per non-text
-/// block, no collapsibles, no JSON prettifying. If reasoning or tool-call
-/// volume becomes noisy we can revisit, but flat text is the right default
-/// for now.
-fn render_blocks(ui: &mut egui::Ui, blocks: &[ContentBlock]) {
-    for block in blocks {
+/// - **User text**: cornflower blue, no header.
+/// - **Assistant text**: white, no header.
+/// - **Thinking**: gray, collapsed by default, first line truncated to ~80
+///   chars in the header. Full text visible when expanded.
+/// - **Tool calls**: collapsible header `name(arguments)`, default open.
+///   Body shows the paired tool result from `tool_results`, or a
+///   placeholder while streaming.
+/// - **Tool results**: not rendered standalone — consumed via the tool call
+///   index and shown inside their paired tool call's collapsible body.
+fn render_blocks(
+    ui: &mut egui::Ui,
+    blocks: &[ContentBlock],
+    role: &Role,
+    msg_index: usize,
+    tool_results: &HashMap<&str, (&str, bool)>,
+) {
+    for (block_index, block) in blocks.iter().enumerate() {
         match block {
             ContentBlock::Text { text } => {
-                ui.label(text);
+                let color = match role {
+                    Role::User => egui::Color32::from_rgb(100, 149, 237),
+                    _ => egui::Color32::WHITE,
+                };
+                ui.label(egui::RichText::new(text).color(color));
             }
             ContentBlock::Reasoning { content, .. } => {
-                // An encrypted-only reasoning block carries empty `content`
-                // — the opaque blob is persisted so the provider can
-                // re-verify it, but there's nothing to show the user. Skip
-                // rather than emit a dangling "thinking:" header.
-                //
-                // Red visually separates the model's internal monologue
-                // from its final answer. Works against both light and dark
-                // egui themes.
+                // Encrypted-only reasoning blocks carry empty `content` —
+                // the opaque blob is persisted for provider re-verification
+                // but there's nothing to show the user.
                 if !content.is_empty() {
-                    ui.label(
-                        egui::RichText::new(format!("thinking: {content}"))
-                            .color(egui::Color32::RED),
-                    );
+                    let first_line = content.lines().next().unwrap_or("");
+                    let truncated: String = if first_line.chars().count() > 80 {
+                        let s: String = first_line.chars().take(80).collect();
+                        format!("{s}...")
+                    } else {
+                        first_line.to_string()
+                    };
+                    egui::CollapsingHeader::new(
+                        egui::RichText::new(&truncated).color(egui::Color32::GRAY),
+                    )
+                    .id_salt(egui::Id::new("thinking").with(msg_index).with(block_index))
+                    .default_open(false)
+                    .show(ui, |ui| {
+                        ui.label(egui::RichText::new(content).color(egui::Color32::GRAY));
+                    });
                 }
             }
             ContentBlock::ToolCall {
-                name, arguments, ..
+                id,
+                name,
+                arguments,
             } => {
-                ui.label(format!("tool call: {name}({arguments})"));
-            }
-            ContentBlock::ToolResult {
-                content, is_error, ..
-            } => {
-                // Plain-text "(error)" suffix — no color, no styling,
-                // matches the no-fancy-formatting decision for the rest of
-                // the UI.
-                if *is_error {
-                    ui.label(format!("tool result: {content} (error)"));
+                let header = format!("{name}({arguments})");
+                let has_result = tool_results.contains_key(id.as_str());
+                let mut col = egui::CollapsingHeader::new(
+                    egui::RichText::new(&header).color(egui::Color32::GRAY),
+                )
+                .id_salt(id);
+
+                if has_result {
+                    col = col.default_open(true);
+                    col.show(ui, |ui| {
+                        let (content, is_error) = tool_results[id.as_str()];
+                        let color = if is_error {
+                            egui::Color32::RED
+                        } else {
+                            egui::Color32::GRAY
+                        };
+                        ui.label(egui::RichText::new(content).color(color));
+                    });
                 } else {
-                    ui.label(format!("tool result: {content}"));
+                    col = col.default_open(false);
+                    col.show(ui, |ui| {
+                        ui.label(egui::RichText::new("...").color(egui::Color32::DARK_GRAY));
+                    });
                 }
             }
+            // Tool results are rendered inline under their paired tool-call
+            // block via the tool_results index. Nothing to do here.
+            ContentBlock::ToolResult { .. } => {}
         }
     }
 }
