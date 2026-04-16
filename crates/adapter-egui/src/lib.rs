@@ -350,7 +350,7 @@ impl OxApp {
         new_root: PathBuf,
         mut factory: impl FnMut(usize, &AgentSpawnConfig) -> Result<AgentSplit>,
     ) {
-        let n = self.splits.len();
+        let n = 1;
         let mut next_config = self.spawn_config.clone();
         next_config.workspace_root = new_root;
         next_config.resume = None;
@@ -425,8 +425,7 @@ impl eframe::App for OxApp {
                 ui.vertical(|ui| {
                     ui.heading("Open Workspace");
                     ui.label(
-                        "This will close all current sessions. Resume hints for those sessions \
-                         will not be shown on exit.",
+                        "A turn is in progress.",
                     );
                     ui.add_space(8.0);
                     ui.horizontal(|ui| {
@@ -579,8 +578,12 @@ impl eframe::App for OxApp {
                 }
                 MenuAction::OpenAbout => self.about_open = true,
                 MenuAction::ConfirmReplaceWorkspace(path) => {
-                    self.pending_workspace = Some(path);
-                    self.confirm_replace_workspace = true;
+                    if self.any_turn_in_progress() {
+                        self.pending_workspace = Some(path);
+                        self.confirm_replace_workspace = true;
+                    } else {
+                        self.replace_workspace(path);
+                    }
                 }
                 MenuAction::CancelReplaceWorkspace => {
                     self.pending_workspace = None;
@@ -1352,7 +1355,7 @@ mod tests {
     }
 
     #[test]
-    fn replace_workspace_updates_template_and_rebuilds_split_count() {
+    fn replace_workspace_updates_template_and_replaces_with_one_split() {
         use tokio::runtime::Builder;
         let rt = Builder::new_current_thread().enable_all().build().unwrap();
         let _guard = rt.enter();
@@ -1368,8 +1371,8 @@ mod tests {
 
         assert_eq!(app.spawn_config.workspace_root, new_root);
         assert_eq!(app.spawn_config.resume, None);
-        assert_eq!(app.splits.len(), 3);
-        assert_eq!(seen.len(), 3);
+        assert_eq!(app.splits.len(), 1);
+        assert_eq!(seen.len(), 1);
         assert!(seen.iter().all(|(_, root, resume)| {
             root == &PathBuf::from("/new/workspace") && resume.is_none()
         }));
@@ -1390,10 +1393,10 @@ mod tests {
 
         app.replace_workspace_with(PathBuf::from("/new/workspace"), |_, _| Ok(make_split().0));
 
-        assert_eq!(app.inputs, vec![String::new(), String::new()]);
+        assert_eq!(app.inputs, vec![String::new()]);
         assert_eq!(app.focused, 0);
         assert_eq!(app.pending_focus, Some(0));
-        assert_eq!(app.split_fracs, vec![0.5, 0.5]);
+        assert_eq!(app.split_fracs, vec![1.0]);
     }
 
     #[test]
@@ -1410,7 +1413,7 @@ mod tests {
 
         app.replace_workspace_with(PathBuf::from("/new/workspace"), |_, _| Ok(make_split().0));
 
-        assert_eq!(mirror.lock().unwrap().clone(), vec![None, None]);
+        assert_eq!(mirror.lock().unwrap().clone(), vec![None]);
     }
 
     #[test]
@@ -1427,11 +1430,8 @@ mod tests {
         app.publish_session_ids();
         let old_mirror = mirror.lock().unwrap().clone();
 
-        app.replace_workspace_with(PathBuf::from("/bad/workspace"), |idx, _| {
-            if idx == 1 {
-                anyhow::bail!("boom");
-            }
-            Ok(make_split().0)
+        app.replace_workspace_with(PathBuf::from("/bad/workspace"), |_, _| {
+            anyhow::bail!("boom");
         });
 
         assert_eq!(app.spawn_config.workspace_root, old_root);
