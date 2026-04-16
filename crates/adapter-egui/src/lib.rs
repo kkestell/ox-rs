@@ -132,37 +132,51 @@ impl AgentTab {
 }
 
 /// Top-level GUI state. Owns a vector of agent tabs displayed as resizable
-/// vertical splits (side panels + central panel). `focused` indexes the
-/// split whose input bar receives
+/// vertical splits. `focused` indexes the split whose input bar receives
 /// keystrokes. Each split has its own input string in `inputs` (parallel to
 /// `tabs`) so rendering can borrow `&mut inputs[i]` and `&tabs[i]`
 /// simultaneously — Rust can split-borrow distinct struct fields but not
 /// `&mut tab.input` and `&tab.messages` on the same struct.
+///
+/// Split widths are stored as fractions (`split_fracs`) summing to 1.0.
+/// Dragging a separator transfers width between adjacent splits. Using
+/// fractions rather than absolute pixels means splits scale naturally
+/// when the window is resized.
 pub struct OxApp {
     tabs: Vec<AgentTab>,
     /// Index of the focused split. Keystrokes go to `inputs[focused]`.
     focused: usize,
     /// Per-split input strings, parallel to `tabs`.
     inputs: Vec<String>,
+    /// Fractional width of each split, summing to 1.0. Updated by
+    /// dragging the separator between adjacent splits.
+    split_fracs: Vec<f32>,
     /// Template config for spawning new agents via `/new`. Cloned with
     /// `resume: None` each time a new split is created.
     spawn_config: AgentSpawnConfig,
     /// Slot the app writes session IDs into each frame so the composition
     /// root can read them after `run_native` consumes the app.
     session_id_mirror: SessionIdMirror,
+    /// When set, the next frame will request egui focus on this split's
+    /// input TextEdit, then clear the flag.
+    pending_focus: Option<usize>,
 }
 
 impl OxApp {
     pub fn new(tabs: Vec<AgentTab>, spawn_config: AgentSpawnConfig) -> (Self, SessionIdMirror) {
         assert!(!tabs.is_empty(), "OxApp requires at least one tab");
-        let mirror: SessionIdMirror = Arc::new(Mutex::new(vec![None; tabs.len()]));
-        let inputs = vec![String::new(); tabs.len()];
+        let n = tabs.len();
+        let mirror: SessionIdMirror = Arc::new(Mutex::new(vec![None; n]));
+        let inputs = vec![String::new(); n];
+        let split_fracs = vec![1.0 / n as f32; n];
         let app = Self {
             tabs,
             focused: 0,
             inputs,
+            split_fracs,
             spawn_config,
             session_id_mirror: mirror.clone(),
+            pending_focus: None,
         };
         (app, mirror)
     }
@@ -192,6 +206,10 @@ impl OxApp {
                 self.tabs.push(tab);
                 self.inputs.push(String::new());
                 self.focused = self.tabs.len() - 1;
+                self.pending_focus = Some(self.focused);
+                // Redistribute widths equally.
+                let n = self.tabs.len();
+                self.split_fracs = vec![1.0 / n as f32; n];
             }
             Err(e) => {
                 self.tabs[self.focused].error = Some(format!("failed to spawn agent: {e:#}"));
@@ -208,9 +226,19 @@ impl OxApp {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             return;
         }
+        // Give the removed split's width to its neighbor.
+        let reclaimed = self.split_fracs.remove(split_idx);
+        let neighbor = if split_idx < self.split_fracs.len() {
+            split_idx
+        } else {
+            split_idx - 1
+        };
+        self.split_fracs[neighbor] += reclaimed;
+
         self.tabs.remove(split_idx);
         self.inputs.remove(split_idx);
         adjust_focus_after_remove(&mut self.focused, split_idx, self.tabs.len());
+        self.pending_focus = Some(self.focused);
     }
 
     /// Add a pre-built tab. Used by tests that can't spawn a real agent
@@ -220,12 +248,22 @@ impl OxApp {
         self.tabs.push(tab);
         self.inputs.push(String::new());
         self.focused = self.tabs.len() - 1;
+        let n = self.tabs.len();
+        self.split_fracs = vec![1.0 / n as f32; n];
     }
 
     /// Remove the tab at `split_idx` without viewport commands. Used by
     /// tests that don't have an egui context.
     #[cfg(test)]
     fn remove_tab(&mut self, split_idx: usize) {
+        let reclaimed = self.split_fracs.remove(split_idx);
+        let neighbor = if split_idx < self.split_fracs.len() {
+            split_idx
+        } else {
+            split_idx - 1
+        };
+        self.split_fracs[neighbor] += reclaimed;
+
         self.tabs.remove(split_idx);
         self.inputs.remove(split_idx);
         adjust_focus_after_remove(&mut self.focused, split_idx, self.tabs.len());
@@ -269,41 +307,88 @@ impl eframe::App for OxApp {
         // no post-exit state.
         self.publish_session_ids();
 
-        // Tiling layout: N resizable vertical panels, one per agent
-        // session. The first N-1 splits live in SidePanels (resizable by
-        // dragging their edge); the last split fills the CentralPanel.
+        // Tiling layout: a single CentralPanel divided into N vertical
+        // splits with draggable separators between them. Split widths are
+        // stored as fractions of the available width (`split_fracs`),
+        // updated by dragging a separator.
         //
         // Borrow-checker constraint: we can't call `&mut self` methods
         // while borrowing tabs/inputs, so we collect deferred "actions"
-        // and execute them after all panels are rendered.
+        // and execute them after all splits are rendered.
         let mut actions: Vec<SplitAction> = Vec::new();
         let mut new_focus: Option<usize> = None;
         let any_waiting = self.tabs.iter().any(|t| t.waiting);
         let n = self.tabs.len();
 
-        // Default width for each panel: divide the viewport evenly.
-        let default_width = ctx.screen_rect().width() / n as f32;
+        let panel_frame = egui::Frame::central_panel(ctx.style().as_ref())
+            .inner_margin(0.0);
+        egui::CentralPanel::default()
+            .frame(panel_frame)
+            .show(ctx, |ui| {
+            let total_rect = ui.available_rect_before_wrap();
+            let sep_width = 6.0;
+            let total_sep = sep_width * (n.saturating_sub(1)) as f32;
+            let content_width = total_rect.width() - total_sep;
+            // Minimum fraction a split can shrink to (60px equivalent).
+            let min_frac = (60.0 / content_width).min(1.0 / n as f32);
 
-        // Splits 0..N-2 go in SidePanels.
-        for i in 0..n.saturating_sub(1) {
-            egui::SidePanel::left(format!("split_{i}"))
-                .default_width(default_width)
-                .min_width(120.0)
-                .resizable(true)
-                .show(ctx, |ui| {
-                    let tab = &self.tabs[i];
-                    let input = &mut self.inputs[i];
-                    render_split(ui, tab, input, i, &mut actions, &mut new_focus);
-                });
-        }
+            let mut x = total_rect.left();
 
-        // The last split fills the remaining space.
-        let last = n - 1;
-        egui::CentralPanel::default().show(ctx, |ui| {
-            let tab = &self.tabs[last];
-            let input = &mut self.inputs[last];
-            render_split(ui, tab, input, last, &mut actions, &mut new_focus);
+            for i in 0..n {
+                // -- Split content area --
+                let w = content_width * self.split_fracs[i];
+                let split_rect = egui::Rect::from_min_max(
+                    egui::pos2(x, total_rect.top()),
+                    egui::pos2(x + w, total_rect.bottom()),
+                );
+
+                let mut child = ui.new_child(egui::UiBuilder::new().max_rect(split_rect));
+                let tab = &self.tabs[i];
+                let input = &mut self.inputs[i];
+                let grab_focus = self.pending_focus == Some(i);
+                render_split(&mut child, tab, input, i, grab_focus, &mut actions, &mut new_focus);
+
+                x += w;
+
+                // -- Draggable separator --
+                if i < n - 1 {
+                    let sep_rect = egui::Rect::from_min_max(
+                        egui::pos2(x, total_rect.top()),
+                        egui::pos2(x + sep_width, total_rect.bottom()),
+                    );
+                    let sep_id = egui::Id::new("split_sep").with(i);
+                    let sep_response = ui.interact(sep_rect, sep_id, egui::Sense::drag());
+
+                    if sep_response.dragged() {
+                        let delta = sep_response.drag_delta().x / content_width;
+                        let left = (self.split_fracs[i] + delta).max(min_frac);
+                        let right = (self.split_fracs[i + 1] - delta).max(min_frac);
+                        self.split_fracs[i] = left;
+                        self.split_fracs[i + 1] = right;
+                    }
+
+                    // Visual: thin line, highlighted on hover/drag.
+                    let color = if sep_response.hovered() || sep_response.dragged() {
+                        ui.visuals().widgets.active.bg_fill
+                    } else {
+                        ui.visuals().widgets.noninteractive.bg_stroke.color
+                    };
+                    ui.painter().rect_filled(
+                        sep_rect.shrink2(egui::vec2(2.0, 0.0)),
+                        0.0,
+                        color,
+                    );
+
+                    if sep_response.hovered() || sep_response.dragged() {
+                        ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+                    }
+
+                    x += sep_width;
+                }
+            }
         });
+
+        self.pending_focus = None;
 
         // Apply focus changes detected inside the render closure.
         if let Some(idx) = new_focus {
@@ -381,6 +466,7 @@ fn render_split(
     tab: &AgentTab,
     input: &mut String,
     split_idx: usize,
+    grab_focus: bool,
     actions: &mut Vec<SplitAction>,
     new_focus: &mut Option<usize>,
 ) {
@@ -388,15 +474,13 @@ fn render_split(
     // the bottom using `bottom_up` layout; the scroll area fills the rest.
     // We use `with_layout` to render the input bar first (so it claims its
     // space), then render the scroll area in the remaining space above.
-    let waiting = tab.waiting;
-
     // Reserve a stable area at the bottom for the input bar. We render the
     // scroll area first (top-down), then the input bar in the remaining
     // space at the bottom, by using nested allocations.
-    let total_rect = ui.available_rect_before_wrap();
+    let padding = 8.0;
+    let total_rect = ui.available_rect_before_wrap().shrink(padding);
 
-    // Input bar height: text field + padding.
-    let input_height = 32.0;
+    let input_height = ui.spacing().interact_size.y;
     let scroll_rect = egui::Rect::from_min_max(
         total_rect.min,
         egui::pos2(total_rect.max.x, total_rect.max.y - input_height),
@@ -441,35 +525,32 @@ fn render_split(
 
     // -- Input bar --
     let mut input_ui = ui.new_child(egui::UiBuilder::new().max_rect(input_rect));
-    input_ui.horizontal(|ui| {
-        let input_response = ui.add_sized(
-            [ui.available_width() - 60.0, 24.0],
-            egui::TextEdit::singleline(input).hint_text("Type a message..."),
-        );
+    let input_response = input_ui.add(
+        egui::TextEdit::singleline(input).desired_width(f32::INFINITY),
+    );
 
-        // Track focus: clicking a split's input bar makes it focused.
-        if input_response.gained_focus() {
-            *new_focus = Some(split_idx);
+    if grab_focus {
+        input_response.request_focus();
+    }
+
+    // Track focus: clicking a split's input bar makes it focused.
+    if input_response.gained_focus() {
+        *new_focus = Some(split_idx);
+    }
+
+    let enter_pressed =
+        input_response.lost_focus() && input_ui.input(|i| i.key_pressed(egui::Key::Enter));
+
+    if enter_pressed {
+        let action = classify_input(input, split_idx);
+        // Commands are consumed here; regular messages are consumed
+        // by `send_message` after the closure returns.
+        if matches!(action, SplitAction::New | SplitAction::Quit(_)) {
+            input.clear();
         }
-
-        let enter_pressed =
-            input_response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-
-        let send_clicked = ui
-            .add_enabled(!waiting, egui::Button::new("Send"))
-            .clicked();
-
-        if enter_pressed || send_clicked {
-            let action = classify_input(input, split_idx);
-            // Commands are consumed here; regular messages are consumed
-            // by `send_message` after the closure returns.
-            if matches!(action, SplitAction::New | SplitAction::Quit(_)) {
-                input.clear();
-            }
-            actions.push(action);
-            input_response.request_focus();
-        }
-    });
+        actions.push(action);
+        input_response.request_focus();
+    }
 }
 
 /// Render a sequence of `ContentBlock`s as a flat column of labels.
