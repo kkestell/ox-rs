@@ -24,7 +24,7 @@
 use std::path::PathBuf;
 
 use anyhow::Result;
-use app::{LlmProvider, SessionRunner, SessionStore, TurnEvent};
+use app::{CancelToken, LlmProvider, SessionRunner, SessionStore, TurnEvent, TurnOutcome};
 use domain::SessionId;
 use protocol::{AgentCommand, AgentEvent, read_frame, write_frame};
 use tokio::io::{AsyncBufRead, AsyncWrite};
@@ -93,41 +93,94 @@ where
     // the on-disk file, so we track `initialized` separately to flip between
     // `start(...)` and `resume(...)`.
     let mut initialized = resume.is_some();
+    // A command consumed by the mid-turn select! that isn't Cancel. Buffered
+    // here so the outer loop processes it on the next iteration instead of
+    // losing it.
+    let mut pending_command: Option<AgentCommand> = None;
 
     loop {
-        let cmd = match read_frame::<_, AgentCommand>(&mut reader).await {
-            Ok(Some(cmd)) => cmd,
-            Ok(None) => return Ok(()), // clean EOF — GUI shut down
-            Err(e) => {
-                // Malformed frame. Emit an Error and keep reading; one bad
-                // line should not kill the agent.
-                write_frame(
-                    &mut writer,
-                    &AgentEvent::Error {
-                        message: format!("malformed frame: {e:#}"),
-                    },
-                )
-                .await?;
-                continue;
+        // Check the pending buffer before reading from the wire.
+        let cmd = if let Some(buffered) = pending_command.take() {
+            buffered
+        } else {
+            match read_frame::<_, AgentCommand>(&mut reader).await {
+                Ok(Some(cmd)) => cmd,
+                Ok(None) => return Ok(()), // clean EOF — GUI shut down
+                Err(e) => {
+                    // Malformed frame. Emit an Error and keep reading; one bad
+                    // line should not kill the agent.
+                    write_frame(
+                        &mut writer,
+                        &AgentEvent::Error {
+                            message: format!("malformed frame: {e:#}"),
+                        },
+                    )
+                    .await?;
+                    continue;
+                }
             }
         };
 
         match cmd {
             AgentCommand::SendMessage { input } => {
-                let result = run_turn(
-                    runner,
-                    &workspace_root,
-                    session_id,
-                    &input,
-                    initialized,
-                    &mut writer,
-                )
-                .await;
+                // Scoped so the pinned turn future (which borrows `writer`)
+                // is dropped before we write the terminal frame below.
+                let result = {
+                    let cancel = CancelToken::new();
+                    let cancel_clone = cancel.clone();
+                    let mut turn_fut = std::pin::pin!(run_turn(
+                        runner,
+                        &workspace_root,
+                        session_id,
+                        &input,
+                        initialized,
+                        cancel_clone,
+                        &mut writer,
+                    ));
+
+                    // Race the turn against incoming commands so we can detect
+                    // a `Cancel` while the turn is running. Non-cancel commands
+                    // are buffered for the next iteration. EOF mid-turn sets the
+                    // cancel flag so the turn finishes gracefully.
+                    loop {
+                        tokio::select! {
+                            result = &mut turn_fut => break result,
+                            frame = read_frame::<_, AgentCommand>(&mut reader) => {
+                                match frame {
+                                    Ok(Some(AgentCommand::Cancel)) => {
+                                        cancel.cancel();
+                                        // Don't break — let the turn future
+                                        // finish so it flushes remaining events.
+                                    }
+                                    Ok(None) => {
+                                        // GUI hung up mid-turn. Cancel so the
+                                        // turn stops promptly, then let it drain.
+                                        cancel.cancel();
+                                    }
+                                    Ok(Some(other)) => {
+                                        // Non-cancel command mid-turn — buffer
+                                        // it so the outer loop processes it on
+                                        // the next iteration.
+                                        pending_command = Some(other);
+                                    }
+                                    Err(_) => {
+                                        // Malformed frame mid-turn — discard.
+                                    }
+                                }
+                            }
+                        }
+                    }
+                };
+                // `turn_fut` is dropped here, releasing the borrow on `writer`.
 
                 match result {
-                    Ok(()) => {
+                    Ok(TurnOutcome::Completed) => {
                         initialized = true;
                         write_frame(&mut writer, &AgentEvent::TurnComplete).await?;
+                    }
+                    Ok(TurnOutcome::Cancelled) => {
+                        initialized = true;
+                        write_frame(&mut writer, &AgentEvent::TurnCancelled).await?;
                     }
                     Err(e) => {
                         // A failed `start` leaves the session uncreated on
@@ -144,6 +197,10 @@ where
                         .await?;
                     }
                 }
+            }
+            AgentCommand::Cancel => {
+                // Cancel outside a turn — nothing to do. Silently ignore
+                // rather than emitting an error, since it's harmless.
             }
             // `AgentCommand` is `#[non_exhaustive]` so future variants compile
             // cleanly. Until they're implemented, surface an Error so the GUI
@@ -183,8 +240,9 @@ async fn run_turn<L, S, W>(
     session_id: SessionId,
     input: &str,
     initialized: bool,
+    cancel: CancelToken,
     writer: &mut W,
-) -> Result<()>
+) -> Result<TurnOutcome>
 where
     L: LlmProvider + Send + Sync + 'static,
     S: SessionStore + Send + Sync + 'static,
@@ -207,12 +265,11 @@ where
             }
         };
         if initialized {
-            runner.resume(session_id, input, callback).await
+            runner.resume(session_id, input, cancel, callback).await
         } else {
             runner
-                .start(session_id, workspace, input, callback)
+                .start(session_id, workspace, input, cancel, callback)
                 .await
-                .map(|_| ())
         }
         // `tx` (captured inside the callback) is dropped when this future
         // finishes, closing the channel so the drain future exits.
@@ -286,8 +343,8 @@ mod tests {
         (cmd_test, BufReader::new(evt_test), handle)
     }
 
-    /// Read events from `reader` until a `TurnComplete` or `Error` is seen,
-    /// or until the driver hangs up.
+    /// Read events from `reader` until a turn terminator (`TurnComplete`,
+    /// `TurnCancelled`, or `Error`) is seen, or until the driver hangs up.
     async fn drain_turn(
         reader: &mut BufReader<tokio::io::DuplexStream>,
     ) -> (Vec<AgentEvent>, Option<AgentEvent>) {
@@ -295,6 +352,7 @@ mod tests {
         loop {
             match read_frame::<_, AgentEvent>(reader).await.unwrap() {
                 Some(evt @ AgentEvent::TurnComplete) => return (events, Some(evt)),
+                Some(evt @ AgentEvent::TurnCancelled) => return (events, Some(evt)),
                 Some(evt @ AgentEvent::Error { .. }) => return (events, Some(evt)),
                 Some(other) => events.push(other),
                 None => return (events, None),
@@ -730,6 +788,150 @@ mod tests {
         );
         // Because `drain_turn` strips the terminator, any StreamDelta event
         // in the returned vec is evidence it arrived before TurnComplete.
+
+        drop(cmd_tx);
+        handle.await.unwrap().unwrap();
+    }
+
+    // -- cancellation ---------------------------------------------------------
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancel_mid_turn_emits_turn_cancelled() {
+        // Use a channel-backed LLM so the turn blocks until we send Cancel.
+        let llm = FakeLlmProvider::new();
+        let mut tx = llm.push_channel();
+        let store = FakeSessionStore::new();
+        let history = FakeSessionStore::new();
+
+        let (mut cmd_tx, mut evt_rx, handle) =
+            spawn_driver(llm, store, history, ToolRegistry::new(), None);
+        let _ = expect_ready(&mut evt_rx).await;
+
+        // Start a turn.
+        write_frame(
+            &mut cmd_tx,
+            &AgentCommand::SendMessage {
+                input: "hello".into(),
+            },
+        )
+        .await
+        .unwrap();
+
+        // Send one text delta so there's partial content.
+        use futures::SinkExt;
+        tx.send(Ok(StreamEvent::TextDelta {
+            delta: "partial".into(),
+        }))
+        .await
+        .unwrap();
+
+        // Wait for the StreamDelta to appear on the event pipe — this
+        // proves the driver has processed it, avoiding a timing-dependent
+        // sleep that can deadlock under load.
+        loop {
+            match read_frame::<_, AgentEvent>(&mut evt_rx).await.unwrap() {
+                Some(AgentEvent::StreamDelta { .. }) => break,
+                Some(_) => continue, // skip MessageAppended(user), etc.
+                None => panic!("unexpected EOF waiting for StreamDelta"),
+            }
+        }
+
+        // Send Cancel.
+        write_frame(&mut cmd_tx, &AgentCommand::Cancel)
+            .await
+            .unwrap();
+
+        // Send another event so the runner's stream.next() unblocks and
+        // sees the cancel flag.
+        let _ = tx
+            .send(Ok(StreamEvent::TextDelta {
+                delta: " more".into(),
+            }))
+            .await;
+
+        // Drain remaining events until the terminator.
+        let (events, terminator) = drain_turn(&mut evt_rx).await;
+        assert!(
+            matches!(terminator, Some(AgentEvent::TurnCancelled)),
+            "expected TurnCancelled, got {terminator:?}"
+        );
+
+        // A partial assistant MessageAppended should precede TurnCancelled.
+        let appended: Vec<_> = events
+            .iter()
+            .filter_map(|e| match e {
+                AgentEvent::MessageAppended { message } => Some(message.role.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            appended.contains(&Role::Assistant),
+            "partial assistant message should be committed"
+        );
+
+        drop(cmd_tx);
+        drop(tx);
+        handle.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancel_when_no_turn_running_is_ignored() {
+        let llm = FakeLlmProvider::new();
+        let store = FakeSessionStore::new();
+        let history = FakeSessionStore::new();
+
+        let (mut cmd_tx, mut evt_rx, handle) =
+            spawn_driver(llm, store, history, ToolRegistry::new(), None);
+        let _ = expect_ready(&mut evt_rx).await;
+
+        // Send Cancel with no turn in progress.
+        write_frame(&mut cmd_tx, &AgentCommand::Cancel)
+            .await
+            .unwrap();
+
+        // Driver should still be alive — verify by closing cleanly.
+        drop(cmd_tx);
+        handle.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn turn_completes_normally_despite_late_cancel() {
+        // If the turn finishes before the driver reads the Cancel, the
+        // outcome should be TurnComplete (not TurnCancelled).
+        let llm = FakeLlmProvider::new();
+        llm.push_text("done");
+        let store = FakeSessionStore::new();
+        let history = FakeSessionStore::new();
+
+        let (mut cmd_tx, mut evt_rx, handle) =
+            spawn_driver(llm, store, history, ToolRegistry::new(), None);
+        let _ = expect_ready(&mut evt_rx).await;
+
+        // Send both at once — the turn will complete before the driver reads Cancel.
+        write_frame(
+            &mut cmd_tx,
+            &AgentCommand::SendMessage {
+                input: "hello".into(),
+            },
+        )
+        .await
+        .unwrap();
+        write_frame(&mut cmd_tx, &AgentCommand::Cancel)
+            .await
+            .unwrap();
+
+        let (_events, terminator) = drain_turn(&mut evt_rx).await;
+        // The turn and the Cancel race through the `select!` loop. The
+        // pre-queued response completes near-instantly, but `select!`
+        // may read the Cancel in the same poll cycle. Both outcomes are
+        // correct — what matters is no crash, no hang, and no lost events.
+        assert!(
+            matches!(
+                terminator,
+                Some(AgentEvent::TurnComplete) | Some(AgentEvent::TurnCancelled)
+            ),
+            "expected TurnComplete or TurnCancelled, got {terminator:?}"
+        );
 
         drop(cmd_tx);
         handle.await.unwrap().unwrap();

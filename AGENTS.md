@@ -12,7 +12,7 @@ Ox is a desktop AI coding assistant built in Rust. It uses a hexagonal (ports-an
 ## Codebase Map
 
 - `crates/domain/` — Core types: `Session`, `Message`, `ContentBlock`, `Role`, `SessionId`, `SessionSummary`, `StreamEvent`, `Usage`. All serde-derived so the same shapes serialize to disk *and* cross the GUI↔agent wire.
-- `crates/app/` — Application layer: port traits (`LlmProvider`, `SessionStore`, `SecretStore`, `FileSystem`, `Shell`), use cases (`SessionRunner`, `TurnEvent`), streaming (`StreamAccumulator`, `ToolDef`), tools (`Tool` trait, `ToolRegistry`, `ReadFileTool`, `WriteFileTool`, `EditFileTool`, `GlobTool`, `GrepTool`, `BashTool`, hashline helpers, spill-to-file utility). Re-exports `StreamEvent`/`Usage` from domain for caller convenience.
+- `crates/app/` — Application layer: port traits (`LlmProvider`, `SessionStore`, `SecretStore`, `FileSystem`, `Shell`), use cases (`SessionRunner`, `TurnEvent`, `TurnOutcome`), cancellation (`CancelToken`), streaming (`StreamAccumulator`, `ToolDef`), tools (`Tool` trait, `ToolRegistry`, `ReadFileTool`, `WriteFileTool`, `EditFileTool`, `GlobTool`, `GrepTool`, `BashTool`, hashline helpers, spill-to-file utility). Re-exports `StreamEvent`/`Usage` from domain for caller convenience.
 - `crates/protocol/` — Wire protocol between `ox-gui` and `ox-agent`: `AgentCommand`, `AgentEvent`, and `read_frame`/`write_frame` helpers. Depends only on `domain` — no dep on `app` so the wire types cannot accidentally leak application-layer concerns.
 - `crates/adapter-llm/` — LLM provider implementations: OpenRouter (streaming via SSE), Ollama (stub).
 - `crates/adapter-storage/` — Session persistence: `DiskSessionStore` (one JSON file per session).
@@ -139,8 +139,21 @@ sequenceDiagram
     end
 
     SR->>SS: save(updated session)
-    D-->>C: AgentEvent::TurnComplete
-    C-->>T: turn_complete
+
+    alt user pressed Escape mid-turn
+        T->>C: AgentCommand::Cancel
+        C->>D: NDJSON on stdin (select! reads Cancel mid-turn)
+        D->>SR: cancel_token.cancel()
+        Note over SR: next is_cancelled() check fires
+        SR->>SR: commit partial content (if any)
+        D-->>C: AgentEvent::MessageAppended(partial assistant)
+        D-->>C: AgentEvent::TurnCancelled
+        C-->>T: cancelled=true, show red label
+    else turn completed normally
+        D-->>C: AgentEvent::TurnComplete
+        C-->>T: turn_complete
+    end
+
     Note over M: GUI exits — AgentClient drops — kill_on_drop SIGKILLs ox-agent
     Note over M: bin-gui prints "ox-gui --resume <id>" per active tab
 ```
@@ -148,8 +161,8 @@ sequenceDiagram
 Current status:
 - `bin-gui`: composition root for the GUI process. CLI (`--resume <id>`, `--model`), API key from env, locates `ox-agent` next to `current_exe()`, spawns the initial agent, passes a cloneable spawn config to `OxApp` for `/new`, runs the egui window, prints one resume command per active session on shutdown.
 - `bin-agent`: composition root for the agent process. CLI (`--workspace-root`, `--model`, `--sessions-dir`, `--resume`), wires adapters, runs `driver::agent_driver` over stdin/stdout. On fatal error, emits an `AgentEvent::Error` frame and exits non-zero.
-- `protocol`: `AgentCommand` (`SendMessage`), `AgentEvent` (`Ready`, `StreamDelta`, `MessageAppended`, `TurnComplete`, `Error`), `read_frame`/`write_frame` helpers. All enums `#[non_exhaustive]` for forward compatibility.
-- `adapter-egui`: `OxApp` renders all sessions as equal-width vertical splits via `ui.columns(N)`. `/new` spawns a new agent and appends a split; `/quit` closes the focused split (or exits the app on the last one). Focus is mouse-driven — clicking a split's input bar makes it active. Per-split state (messages, streaming accumulator, waiting flag, error, session_id) lives on `AgentTab`; per-split input strings live as a parallel `Vec<String>` on `OxApp` to avoid borrow conflicts. `AgentClient` owns the tokio::process `Child` with `kill_on_drop(true)`, runs reader/writer tasks, exposes a channel API.
+- `protocol`: `AgentCommand` (`SendMessage`, `Cancel`), `AgentEvent` (`Ready`, `StreamDelta`, `MessageAppended`, `TurnComplete`, `TurnCancelled`, `Error`), `read_frame`/`write_frame` helpers. All enums `#[non_exhaustive]` for forward compatibility.
+- `adapter-egui`: `OxApp` renders all sessions as equal-width vertical splits via `ui.columns(N)`. `/new` spawns a new agent and appends a split; `/quit` closes the focused split (or exits the app on the last one). Escape cancels the in-progress turn (sends `AgentCommand::Cancel`). Focus is mouse-driven — clicking a split's input bar makes it active. Per-split state (messages, streaming accumulator, waiting flag, cancelled flag, error, session_id) lives on `AgentTab`; per-split input strings live as a parallel `Vec<String>` on `OxApp` to avoid borrow conflicts. On `TurnCancelled`, the GUI commits any partial streaming content, shows a red "Cancelled" label, and re-enables input. `AgentClient` owns the tokio::process `Child` with `kill_on_drop(true)`, runs reader/writer tasks, exposes a channel API.
 - `app::tools`: tool suite — `read_file` (hashlined output with offset/limit), `write_file` (creates parent dirs), `edit_file` (replace/insert_after operations anchored by hashlines with mismatch detection), `glob` (find files by name pattern, sorted, large results spill to file), `grep` (search file contents by regex, returns path:line matches, large results spill to file, skips binary files), `bash` (execute shell commands with configurable timeout, byte-capped output, large stdout/stderr spill to file). Shared `spill` module: when tool output exceeds 200 lines or 50 KB, the full content is written to `.ox/tmp/` and a preview (first 50 lines) is shown inline.
 - `adapter-llm/OpenRouterProvider`: implemented streaming path.
 - `adapter-llm/OllamaProvider`: stub.
@@ -157,11 +170,11 @@ Current status:
 - `adapter-fs/LocalFileSystem`: implemented.
 - `adapter-fs/BashShell`: implemented (spawns `/bin/bash -c`, concurrent stdout/stderr, timeout with kill).
 - `adapter-secrets/EnvSecretStore`: implemented.
+- Turn cancellation: cooperative cancel via `CancelToken` (defined in `app`). The driver's `select!` loop races the turn future against incoming commands; on `Cancel`, it sets the token. `SessionRunner::run_turn` checks the token between stream events and before each tool call, committing partial content before returning `TurnOutcome::Cancelled`. The GUI binds Escape to send `Cancel` and shows a red "Cancelled" label. Limitations: cancellation is cooperative — a stalled LLM stream or long-running tool blocks detection until the next check point. HTTP request abort and tool-subprocess kill are not yet implemented.
 
 Not yet implemented:
 - Model/config selection in-app (passed from GUI to agent at spawn; no UI to change mid-session).
 - Session management UI (sessions can be resumed via CLI, but no in-app session browser/switcher).
 - Error recovery UI (errors displayed but no retry/dismiss).
-- Graceful cancel of an in-progress turn. Today the model is "kill the agent subprocess" — dropping the `AgentClient` / `AgentTab` SIGKILLs the agent. A future `AgentCommand::Cancel` that preserves partial state is not yet wired.
 - Keyboard focus switching between splits (Ctrl+Left/Right or similar). Focus is mouse-driven only.
 - Tool-approval flow (tools auto-execute; destructive tools have no permission gate). Would require an `AgentEvent::ToolCallPending` + `AgentCommand::ApproveToolCall` protocol extension.

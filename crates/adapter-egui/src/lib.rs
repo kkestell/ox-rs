@@ -60,6 +60,10 @@ pub struct AgentTab {
     waiting: bool,
     error: Option<String>,
     session_id: Option<SessionId>,
+    /// Set when the most recent turn was cancelled by the user. Cleared
+    /// on the next `SendMessage`. The renderer shows a red "Cancelled"
+    /// label when this is true.
+    cancelled: bool,
 }
 
 impl AgentTab {
@@ -71,6 +75,7 @@ impl AgentTab {
             waiting: false,
             error: None,
             session_id: None,
+            cancelled: false,
         }
     }
 
@@ -109,6 +114,19 @@ impl AgentTab {
                 Ok(AgentEvent::TurnComplete) => {
                     self.waiting = false;
                     self.streaming = None;
+                    self.error = None;
+                }
+                Ok(AgentEvent::TurnCancelled) => {
+                    self.waiting = false;
+                    // Commit any partial streaming content as a message
+                    // before discarding the accumulator.
+                    if let Some(acc) = self.streaming.take() {
+                        let msg = acc.into_message();
+                        if !msg.content.is_empty() {
+                            self.messages.push(msg);
+                        }
+                    }
+                    self.cancelled = true;
                     self.error = None;
                 }
                 Ok(AgentEvent::Error { message }) => {
@@ -294,6 +312,7 @@ impl OxApp {
         let _ = tab.client.send(AgentCommand::SendMessage { input: text });
         tab.waiting = true;
         tab.error = None;
+        tab.cancelled = false;
     }
 }
 
@@ -410,6 +429,9 @@ impl eframe::App for OxApp {
                 SplitAction::Send(idx) => self.send_message(idx),
                 SplitAction::New => self.handle_new(ctx),
                 SplitAction::Quit(idx) => self.handle_quit(idx, ctx),
+                SplitAction::Cancel(idx) => {
+                    let _ = self.tabs[idx].client.send(AgentCommand::Cancel);
+                }
             }
         }
 
@@ -461,6 +483,8 @@ enum SplitAction {
     /// Close the split at this index. Drops the agent (SIGKILL via
     /// `kill_on_drop`).
     Quit(usize),
+    /// Cancel the in-progress turn on this split's agent.
+    Cancel(usize),
 }
 
 /// Render one vertical split: scroll area with message history, streaming
@@ -545,6 +569,10 @@ fn render_split(
                 ui.label("...");
             }
 
+            if tab.cancelled {
+                ui.colored_label(egui::Color32::RED, "Cancelled");
+            }
+
             if let Some(err) = &tab.error {
                 ui.colored_label(egui::Color32::RED, err);
             }
@@ -576,6 +604,12 @@ fn render_split(
         }
         actions.push(action);
         input_response.request_focus();
+    }
+
+    // Escape cancels the in-progress turn. Checked globally (not just on
+    // the input widget) so it works even if the input doesn't have focus.
+    if tab.waiting && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+        actions.push(SplitAction::Cancel(split_idx));
     }
 }
 
@@ -1291,5 +1325,155 @@ mod tests {
         let (app2, mirror2) = OxApp::new(vec![tab2], dummy_spawn_config());
         app2.publish_session_ids();
         assert_eq!(mirror2.lock().unwrap().clone(), vec![expected]);
+    }
+
+    // -- TurnCancelled state transitions --------------------------------------
+
+    #[tokio::test]
+    async fn turn_cancelled_sets_cancelled_and_clears_waiting_and_streaming() {
+        let (mut tab, mut writer) = make_tab();
+        tab.waiting = true;
+        tab.streaming = Some(app::StreamAccumulator::new());
+
+        write_frame(&mut writer, &AgentEvent::TurnCancelled)
+            .await
+            .unwrap();
+        wait_until(&mut tab, Duration::from_secs(1), |t| t.cancelled)
+            .await
+            .unwrap();
+
+        assert!(!tab.waiting, "waiting must be cleared");
+        assert!(tab.streaming.is_none(), "streaming must be cleared");
+        assert!(tab.error.is_none(), "error must be cleared");
+        assert!(tab.cancelled, "cancelled must be set");
+    }
+
+    #[tokio::test]
+    async fn turn_cancelled_commits_streaming_content_as_message() {
+        let (mut tab, mut writer) = make_tab();
+        tab.waiting = true;
+
+        // Seed the streaming accumulator with content.
+        write_frame(
+            &mut writer,
+            &AgentEvent::StreamDelta {
+                event: StreamEvent::TextDelta {
+                    delta: "partial output".into(),
+                },
+            },
+        )
+        .await
+        .unwrap();
+        wait_until(&mut tab, Duration::from_secs(1), |t| t.streaming.is_some())
+            .await
+            .unwrap();
+
+        write_frame(&mut writer, &AgentEvent::TurnCancelled)
+            .await
+            .unwrap();
+        wait_until(&mut tab, Duration::from_secs(1), |t| t.cancelled)
+            .await
+            .unwrap();
+
+        // The streaming content should be committed as a message.
+        assert_eq!(tab.messages.len(), 1);
+        assert_eq!(tab.messages[0].role, Role::Assistant);
+        assert_eq!(tab.messages[0].text(), "partial output");
+        assert!(tab.streaming.is_none());
+    }
+
+    #[tokio::test]
+    async fn turn_cancelled_with_no_streaming_appends_no_message() {
+        let (mut tab, mut writer) = make_tab();
+        tab.waiting = true;
+        // No streaming accumulator — cancel arrived before any deltas.
+
+        write_frame(&mut writer, &AgentEvent::TurnCancelled)
+            .await
+            .unwrap();
+        wait_until(&mut tab, Duration::from_secs(1), |t| t.cancelled)
+            .await
+            .unwrap();
+
+        assert!(tab.messages.is_empty(), "no message should be appended");
+        assert!(tab.cancelled);
+    }
+
+    #[tokio::test]
+    async fn turn_cancelled_after_message_appended_does_not_double_commit() {
+        // Realistic wire sequence: the agent commits the partial assistant
+        // message via MessageAppended *before* sending TurnCancelled.
+        // The GUI's MessageAppended handler clears the streaming accumulator,
+        // so the TurnCancelled handler should find no accumulator and not
+        // append a duplicate message.
+        let (mut tab, mut writer) = make_tab();
+        tab.waiting = true;
+
+        // 1. StreamDelta seeds the accumulator.
+        write_frame(
+            &mut writer,
+            &AgentEvent::StreamDelta {
+                event: StreamEvent::TextDelta {
+                    delta: "partial".into(),
+                },
+            },
+        )
+        .await
+        .unwrap();
+        wait_until(&mut tab, Duration::from_secs(1), |t| t.streaming.is_some())
+            .await
+            .unwrap();
+
+        // 2. Agent commits the partial message.
+        write_frame(
+            &mut writer,
+            &AgentEvent::MessageAppended {
+                message: Message::assistant(vec![domain::ContentBlock::Text {
+                    text: "partial".into(),
+                }]),
+            },
+        )
+        .await
+        .unwrap();
+        wait_until(&mut tab, Duration::from_secs(1), |t| t.messages.len() == 1)
+            .await
+            .unwrap();
+        assert!(
+            tab.streaming.is_none(),
+            "MessageAppended should clear the accumulator"
+        );
+
+        // 3. TurnCancelled arrives — no accumulator to commit.
+        write_frame(&mut writer, &AgentEvent::TurnCancelled)
+            .await
+            .unwrap();
+        wait_until(&mut tab, Duration::from_secs(1), |t| t.cancelled)
+            .await
+            .unwrap();
+
+        // Only one message — no double-commit.
+        assert_eq!(
+            tab.messages.len(),
+            1,
+            "message must not be double-committed"
+        );
+        assert_eq!(tab.messages[0].text(), "partial");
+        assert!(tab.cancelled);
+        assert!(!tab.waiting);
+    }
+
+    #[test]
+    fn send_message_clears_cancelled_flag() {
+        use tokio::runtime::Builder;
+        let rt = Builder::new_current_thread().enable_all().build().unwrap();
+        let _guard = rt.enter();
+
+        let (mut app, _, _writers) = make_app(1);
+        app.tabs[0].cancelled = true;
+        app.inputs[0] = "next message".into();
+        app.send_message(0);
+
+        assert!(!app.tabs[0].cancelled, "cancelled must be cleared on send");
+        assert!(app.tabs[0].waiting, "tab should be in waiting state");
     }
 }

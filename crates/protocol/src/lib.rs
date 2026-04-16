@@ -38,6 +38,11 @@ pub enum AgentCommand {
     /// User submitted a chat message. The agent appends it to the session
     /// and drives a turn.
     SendMessage { input: String },
+    /// Request cancellation of the in-progress turn. The agent sets a
+    /// cooperative cancel flag; actual cancellation happens at the next
+    /// check point (between stream events, before tool calls). Idempotent
+    /// — sending multiple `Cancel` commands is harmless.
+    Cancel,
 }
 
 /// Events the agent streams back to the GUI.
@@ -73,6 +78,11 @@ pub enum AgentEvent {
     MessageAppended { message: Message },
     /// The current turn ended successfully. The GUI may re-enable input.
     TurnComplete,
+    /// The current turn was cancelled at the user's request. Partial
+    /// content (if any) has already been committed via `MessageAppended`
+    /// before this event. The GUI should re-enable input and show a
+    /// cancellation indicator.
+    TurnCancelled,
     /// Fatal error for the current turn (or, pre-`Ready`, for startup).
     /// No `TurnComplete` follows.
     Error { message: String },
@@ -287,6 +297,18 @@ mod tests {
         let msg = Message::tool_result("call_1", "output", false);
         assert_eq!(msg.role, Role::Tool);
         roundtrip_json(AgentEvent::MessageAppended { message: msg });
+    }
+
+    #[test]
+    fn roundtrip_cancel_command() {
+        let json = roundtrip_json(AgentCommand::Cancel);
+        assert_eq!(json, r#"{"type":"cancel"}"#);
+    }
+
+    #[test]
+    fn roundtrip_turn_cancelled() {
+        let json = roundtrip_json(AgentEvent::TurnCancelled);
+        assert_eq!(json, r#"{"type":"turn_cancelled"}"#);
     }
 
     #[test]

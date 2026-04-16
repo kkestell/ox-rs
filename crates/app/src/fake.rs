@@ -14,7 +14,7 @@ use crate::stream::ToolDef;
 use crate::tools::Tool;
 
 /// A queued response: a sequence of stream events (success), a connection-time
-/// error, or a mid-stream error that fires after some successful events.
+/// error, a mid-stream error, or a channel for fine-grained timing control.
 enum QueuedResponse {
     Events(Vec<StreamEvent>),
     Error(String),
@@ -23,6 +23,10 @@ enum QueuedResponse {
         events: Vec<StreamEvent>,
         error: String,
     },
+    /// A live channel the test pushes events through. Gives tests precise
+    /// control over when each event arrives relative to external state
+    /// changes (e.g. setting a `CancelToken`).
+    Channel(futures::channel::mpsc::Receiver<Result<StreamEvent>>),
 }
 
 /// Test double for `LlmProvider`. Queue responses ahead of time; each
@@ -98,6 +102,18 @@ impl FakeLlmProvider {
             });
     }
 
+    /// Queue a channel-based response. Returns the sender side; the test
+    /// pushes `Ok(StreamEvent)` or `Err(...)` items through it. The stream
+    /// ends when the sender is dropped.
+    pub fn push_channel(&self) -> futures::channel::mpsc::Sender<Result<StreamEvent>> {
+        let (tx, rx) = futures::channel::mpsc::channel(64);
+        self.responses
+            .lock()
+            .unwrap()
+            .push_back(QueuedResponse::Channel(rx));
+        tx
+    }
+
     /// Convenience: queue a single tool call response.
     pub fn push_tool_call(&self, id: &str, name: &str, arguments: &str) {
         self.push_response(vec![
@@ -153,6 +169,7 @@ impl LlmProvider for FakeLlmProvider {
                     .collect();
                 Ok(Box::pin(stream::iter(items)))
             }
+            QueuedResponse::Channel(rx) => Ok(Box::pin(rx)),
         }
     }
 }

@@ -4,9 +4,18 @@ use anyhow::{Result, bail};
 use domain::{Message, Session, SessionId, StreamEvent};
 use futures::StreamExt;
 
+use crate::cancel::CancelToken;
 use crate::ports::{LlmProvider, SessionStore};
 use crate::stream::StreamAccumulator;
 use crate::tools::{ToolRegistry, extract_tool_calls};
+
+/// Result of a completed turn — either it ran to natural completion or was
+/// cancelled cooperatively via a `CancelToken`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TurnOutcome {
+    Completed,
+    Cancelled,
+}
 
 /// Events surfaced to the caller during a turn.
 ///
@@ -71,11 +80,11 @@ impl<L: LlmProvider, S: SessionStore> SessionRunner<L, S> {
         id: SessionId,
         workspace_root: PathBuf,
         input: &str,
+        cancel: CancelToken,
         on_event: impl FnMut(TurnEvent<'_>) + Send,
-    ) -> Result<SessionId> {
+    ) -> Result<TurnOutcome> {
         let mut session = Session::new(id, workspace_root);
-        self.run_turn(&mut session, input, on_event).await?;
-        Ok(id)
+        self.run_turn(&mut session, input, cancel, on_event).await
     }
 
     /// Load an existing session and run the next turn.
@@ -83,11 +92,11 @@ impl<L: LlmProvider, S: SessionStore> SessionRunner<L, S> {
         &self,
         id: SessionId,
         input: &str,
+        cancel: CancelToken,
         on_event: impl FnMut(TurnEvent<'_>) + Send,
-    ) -> Result<()> {
+    ) -> Result<TurnOutcome> {
         let mut session = self.store.load(id).await?;
-        self.run_turn(&mut session, input, on_event).await?;
-        Ok(())
+        self.run_turn(&mut session, input, cancel, on_event).await
     }
 
     /// Core turn loop. Appends the user input, then iteratively:
@@ -111,8 +120,9 @@ impl<L: LlmProvider, S: SessionStore> SessionRunner<L, S> {
         &self,
         session: &mut Session,
         input: &str,
+        cancel: CancelToken,
         mut on_event: impl FnMut(TurnEvent<'_>) + Send,
-    ) -> Result<()> {
+    ) -> Result<TurnOutcome> {
         // Commit the user message before any network work — its presence in
         // `session.messages` is what keeps the final persisted session valid
         // if a later error aborts the turn.
@@ -123,6 +133,13 @@ impl<L: LlmProvider, S: SessionStore> SessionRunner<L, S> {
         self.store.save(session).await?;
 
         for _ in 0..MAX_LOOP_ITERATIONS {
+            // Check cancellation before starting a new LLM stream. This
+            // catches cancels that arrived during tool execution or between
+            // iterations.
+            if cancel.is_cancelled() {
+                return Ok(TurnOutcome::Cancelled);
+            }
+
             // Expose tool schemas only if we actually have tools registered
             // — keeps the wire payload minimal for tool-free compositions.
             let defs = self.tools.defs();
@@ -136,6 +153,22 @@ impl<L: LlmProvider, S: SessionStore> SessionRunner<L, S> {
                 let event = event?;
                 on_event(TurnEvent::StreamDelta(&event));
                 acc.push(event);
+
+                if cancel.is_cancelled() {
+                    // Commit whatever the accumulator has collected so far.
+                    // Skip the commit if nothing meaningful arrived — avoids
+                    // polluting the session with a zero-content assistant
+                    // message.
+                    let partial = acc.into_message();
+                    if !partial.content.is_empty() {
+                        session.push_message(partial);
+                        on_event(TurnEvent::MessageAppended(
+                            session.messages.last().expect("just pushed"),
+                        ));
+                        self.store.save(session).await?;
+                    }
+                    return Ok(TurnOutcome::Cancelled);
+                }
             }
             let response = acc.into_message();
             session.push_message(response.clone());
@@ -146,7 +179,7 @@ impl<L: LlmProvider, S: SessionStore> SessionRunner<L, S> {
 
             let tool_calls = extract_tool_calls(&response);
             if tool_calls.is_empty() {
-                return Ok(());
+                return Ok(TurnOutcome::Completed);
             }
 
             // If the model is asking for a tool but we have no registry, we
@@ -157,6 +190,9 @@ impl<L: LlmProvider, S: SessionStore> SessionRunner<L, S> {
             }
 
             for (id, name, arguments) in tool_calls {
+                if cancel.is_cancelled() {
+                    return Ok(TurnOutcome::Cancelled);
+                }
                 let (content, is_error) = match self.tools.execute(&name, &arguments).await {
                     Ok(out) => (out, false),
                     Err(e) => (format!("{e:#}"), true),
@@ -182,6 +218,7 @@ mod tests {
 
     use super::*;
     use crate::Tool;
+    use crate::cancel::CancelToken;
     use crate::fake::{FakeLlmProvider, FakeSessionStore, FakeTool, tool_registry_with};
     use domain::Usage;
 
@@ -203,11 +240,11 @@ mod tests {
 
         let runner = make_runner(llm, store, ToolRegistry::new());
         let id = SessionId::new_v4();
-        let returned_id = runner
-            .start(id, "/project".into(), "Hello", |_| {})
+        let outcome = runner
+            .start(id, "/project".into(), "Hello", CancelToken::new(), |_| {})
             .await
             .unwrap();
-        assert_eq!(returned_id, id);
+        assert_eq!(outcome, TurnOutcome::Completed);
 
         let saved = runner.store.get(id).expect("session saved");
         assert_eq!(saved.messages.len(), 2);
@@ -226,7 +263,7 @@ mod tests {
 
         let mut appended_texts = Vec::new();
         runner
-            .start(id, "/project".into(), "hi", |evt| {
+            .start(id, "/project".into(), "hi", CancelToken::new(), |evt| {
                 if let TurnEvent::MessageAppended(m) = evt {
                     appended_texts.push((m.role.clone(), m.text()));
                 }
@@ -260,7 +297,10 @@ mod tests {
         store.insert(existing);
 
         let runner = make_runner(llm, store, ToolRegistry::new());
-        runner.resume(id, "turn 2", |_| {}).await.unwrap();
+        runner
+            .resume(id, "turn 2", CancelToken::new(), |_| {})
+            .await
+            .unwrap();
 
         let saved = runner.store.get(id).unwrap();
         assert_eq!(saved.messages.len(), 4);
@@ -274,7 +314,9 @@ mod tests {
         let store = FakeSessionStore::new();
         let runner = make_runner(llm, store, ToolRegistry::new());
 
-        let result = runner.resume(SessionId::new_v4(), "hi", |_| {}).await;
+        let result = runner
+            .resume(SessionId::new_v4(), "hi", CancelToken::new(), |_| {})
+            .await;
         assert!(result.is_err());
     }
 
@@ -304,7 +346,7 @@ mod tests {
         let id = SessionId::new_v4();
         let mut deltas: Vec<StreamEvent> = Vec::new();
         runner
-            .start(id, "/project".into(), "hi", |evt| {
+            .start(id, "/project".into(), "hi", CancelToken::new(), |evt| {
                 if let TurnEvent::StreamDelta(e) = evt {
                     deltas.push(e.clone());
                 }
@@ -334,7 +376,7 @@ mod tests {
 
         let mut deltas: Vec<StreamEvent> = Vec::new();
         let result = runner
-            .start(id, "/p".into(), "hi", |evt| {
+            .start(id, "/p".into(), "hi", CancelToken::new(), |evt| {
                 if let TurnEvent::StreamDelta(e) = evt {
                     deltas.push(e.clone());
                 }
@@ -359,7 +401,9 @@ mod tests {
         let runner = make_runner(llm, store, ToolRegistry::new());
         let id = SessionId::new_v4();
 
-        let result = runner.start(id, "/p".into(), "hi", |_| {}).await;
+        let result = runner
+            .start(id, "/p".into(), "hi", CancelToken::new(), |_| {})
+            .await;
         assert!(result.is_err());
 
         // The session should be on disk with the user message.
@@ -386,7 +430,9 @@ mod tests {
         let runner = make_runner(llm, store, tools);
         let id = SessionId::new_v4();
 
-        let result = runner.start(id, "/p".into(), "hi", |_| {}).await;
+        let result = runner
+            .start(id, "/p".into(), "hi", CancelToken::new(), |_| {})
+            .await;
         assert!(result.is_err());
 
         let saved = runner.store.get(id).expect("session should be persisted");
@@ -413,7 +459,7 @@ mod tests {
         let id = SessionId::new_v4();
         let mut deltas: Vec<StreamEvent> = Vec::new();
         let result = runner
-            .start(id, "/project".into(), "hi", |evt| {
+            .start(id, "/project".into(), "hi", CancelToken::new(), |evt| {
                 if let TurnEvent::StreamDelta(e) = evt {
                     deltas.push(e.clone());
                 }
@@ -438,7 +484,13 @@ mod tests {
         let runner = make_runner(llm, store, ToolRegistry::new());
 
         runner
-            .start(SessionId::new_v4(), "/p".into(), "hi", |_| {})
+            .start(
+                SessionId::new_v4(),
+                "/p".into(),
+                "hi",
+                CancelToken::new(),
+                |_| {},
+            )
             .await
             .unwrap();
     }
@@ -459,7 +511,10 @@ mod tests {
         let store = FakeSessionStore::new();
         let runner = make_runner(llm, store, tools);
         let id = SessionId::new_v4();
-        runner.start(id, "/p".into(), "hi", |_| {}).await.unwrap();
+        runner
+            .start(id, "/p".into(), "hi", CancelToken::new(), |_| {})
+            .await
+            .unwrap();
 
         // Session: user + asst(tool_call) + tool_result + asst("all done") = 4.
         let saved = runner.store.get(id).unwrap();
@@ -529,7 +584,10 @@ mod tests {
         let store = FakeSessionStore::new();
         let runner = make_runner(llm, store, tools);
         let id = SessionId::new_v4();
-        runner.start(id, "/p".into(), "hi", |_| {}).await.unwrap();
+        runner
+            .start(id, "/p".into(), "hi", CancelToken::new(), |_| {})
+            .await
+            .unwrap();
 
         // user + asst(2 tool calls) + tool_result_a + tool_result_b + asst("finished") = 5.
         let saved = runner.store.get(id).unwrap();
@@ -571,7 +629,10 @@ mod tests {
         let store = FakeSessionStore::new();
         let runner = make_runner(llm, store, tools);
         let id = SessionId::new_v4();
-        runner.start(id, "/p".into(), "hi", |_| {}).await.unwrap();
+        runner
+            .start(id, "/p".into(), "hi", CancelToken::new(), |_| {})
+            .await
+            .unwrap();
 
         let saved = runner.store.get(id).unwrap();
         assert_eq!(saved.messages.len(), 4);
@@ -601,7 +662,10 @@ mod tests {
         let store = FakeSessionStore::new();
         let runner = make_runner(llm, store, tools);
         let id = SessionId::new_v4();
-        runner.start(id, "/p".into(), "hi", |_| {}).await.unwrap();
+        runner
+            .start(id, "/p".into(), "hi", CancelToken::new(), |_| {})
+            .await
+            .unwrap();
 
         let saved = runner.store.get(id).unwrap();
         match &saved.messages[2].content[0] {
@@ -625,7 +689,13 @@ mod tests {
         let store = FakeSessionStore::new();
         let runner = make_runner(llm, store, ToolRegistry::new());
         let result = runner
-            .start(SessionId::new_v4(), "/p".into(), "hi", |_| {})
+            .start(
+                SessionId::new_v4(),
+                "/p".into(),
+                "hi",
+                CancelToken::new(),
+                |_| {},
+            )
             .await;
         assert!(result.is_err());
         assert!(
@@ -652,11 +722,17 @@ mod tests {
 
         let mut appended_roles: Vec<Role> = Vec::new();
         runner
-            .start(SessionId::new_v4(), "/p".into(), "hi", |evt| {
-                if let TurnEvent::MessageAppended(m) = evt {
-                    appended_roles.push(m.role.clone());
-                }
-            })
+            .start(
+                SessionId::new_v4(),
+                "/p".into(),
+                "hi",
+                CancelToken::new(),
+                |evt| {
+                    if let TurnEvent::MessageAppended(m) = evt {
+                        appended_roles.push(m.role.clone());
+                    }
+                },
+            )
             .await
             .unwrap();
 
@@ -687,7 +763,13 @@ mod tests {
         let store = FakeSessionStore::new();
         let runner = make_runner(llm, store, tools);
         let result = runner
-            .start(SessionId::new_v4(), "/p".into(), "hi", |_| {})
+            .start(
+                SessionId::new_v4(),
+                "/p".into(),
+                "hi",
+                CancelToken::new(),
+                |_| {},
+            )
             .await;
         assert!(result.is_err());
         assert!(
@@ -710,12 +792,283 @@ mod tests {
             "You are a coding assistant.".to_owned(),
         );
         runner
-            .start(SessionId::new_v4(), "/p".into(), "hi", |_| {})
+            .start(
+                SessionId::new_v4(),
+                "/p".into(),
+                "hi",
+                CancelToken::new(),
+                |_| {},
+            )
             .await
             .unwrap();
         assert_eq!(
             runner.llm.system_prompts(),
             vec!["You are a coding assistant."]
         );
+    }
+
+    // -- cancellation ---------------------------------------------------------
+
+    #[tokio::test]
+    async fn cancel_before_streaming_returns_cancelled_with_no_assistant_message() {
+        let llm = FakeLlmProvider::new();
+        llm.push_text("should not appear");
+        let store = FakeSessionStore::new();
+        let runner = make_runner(llm, store, ToolRegistry::new());
+        let id = SessionId::new_v4();
+
+        // Pre-set the token before the turn starts.
+        let token = CancelToken::new();
+        token.cancel();
+
+        let mut appended_roles = Vec::new();
+        let outcome = runner
+            .start(id, "/p".into(), "hi", token, |evt| {
+                if let TurnEvent::MessageAppended(m) = evt {
+                    appended_roles.push(m.role.clone());
+                }
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(outcome, TurnOutcome::Cancelled);
+        // Only the user message should be committed — no assistant message.
+        assert_eq!(appended_roles, vec![Role::User]);
+        let saved = runner.store.get(id).unwrap();
+        assert_eq!(saved.messages.len(), 1);
+        assert_eq!(saved.messages[0].role, Role::User);
+    }
+
+    #[tokio::test]
+    async fn cancel_mid_stream_commits_partial_assistant_message() {
+        use futures::SinkExt;
+
+        let llm = FakeLlmProvider::new();
+        let mut tx = llm.push_channel();
+        let store = FakeSessionStore::new();
+        let runner = make_runner(llm, store, ToolRegistry::new());
+        let id = SessionId::new_v4();
+        let token = CancelToken::new();
+        let token_clone = token.clone();
+
+        let mut appended_roles = Vec::new();
+        let handle = tokio::spawn(async move {
+            runner
+                .start(id, "/p".into(), "hi", token_clone, |evt| {
+                    if let TurnEvent::MessageAppended(m) = evt {
+                        appended_roles.push(m.role.clone());
+                    }
+                })
+                .await
+                .map(|outcome| (outcome, appended_roles, runner))
+        });
+
+        // Send one text delta, then cancel.
+        tx.send(Ok(StreamEvent::TextDelta {
+            delta: "partial".into(),
+        }))
+        .await
+        .unwrap();
+
+        // Small yield to let the runner process the event.
+        tokio::task::yield_now().await;
+        token.cancel();
+
+        // Send another event so the runner's `next().await` unblocks and
+        // sees the cancel flag. The runner checks `is_cancelled()` after
+        // each event.
+        let _ = tx
+            .send(Ok(StreamEvent::TextDelta {
+                delta: " ignored".into(),
+            }))
+            .await;
+
+        let (outcome, appended_roles, runner) = handle.await.unwrap().unwrap();
+        assert_eq!(outcome, TurnOutcome::Cancelled);
+        // user + partial assistant
+        assert_eq!(appended_roles, vec![Role::User, Role::Assistant]);
+
+        let saved = runner.store.get(id).unwrap();
+        assert_eq!(saved.messages.len(), 2);
+        assert_eq!(saved.messages[0].role, Role::User);
+        assert_eq!(saved.messages[1].role, Role::Assistant);
+        // The partial message must contain "partial" (the first delta).
+        // It may also contain " ignored" depending on timing, but
+        // "partial" must always be present.
+        let text = saved.messages[1].text();
+        assert!(
+            text.contains("partial"),
+            "partial assistant message should contain 'partial', got: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancel_pre_set_skips_streaming_entirely() {
+        // Token is set before the turn starts. The check at the top of the
+        // loop iteration fires before the LLM stream is opened, so no
+        // assistant message is created. This exercises the early exit at
+        // the loop-top cancel check — distinct from `cancel_before_streaming`
+        // which pre-sets the token before `start()` is even called.
+        let llm = FakeLlmProvider::new();
+        let token = CancelToken::new();
+        token.cancel(); // cancel immediately
+
+        llm.push_text("should not appear");
+        let store = FakeSessionStore::new();
+        let runner = make_runner(llm, store, ToolRegistry::new());
+        let id = SessionId::new_v4();
+
+        let mut appended_roles = Vec::new();
+        let outcome = runner
+            .start(id, "/p".into(), "hi", token, |evt| {
+                if let TurnEvent::MessageAppended(m) = evt {
+                    appended_roles.push(m.role.clone());
+                }
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(outcome, TurnOutcome::Cancelled);
+        assert_eq!(appended_roles, vec![Role::User]);
+        let saved = runner.store.get(id).unwrap();
+        assert_eq!(saved.messages.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn cancel_between_tool_calls_skips_remaining_calls() {
+        // Two parallel tool calls; cancel after the first executes.
+        let llm = FakeLlmProvider::new();
+        llm.push_response(vec![
+            StreamEvent::ToolCallStart {
+                index: 0,
+                id: "c1".into(),
+                name: "t".into(),
+            },
+            StreamEvent::ToolCallArgumentDelta {
+                index: 0,
+                delta: "{}".into(),
+            },
+            StreamEvent::ToolCallStart {
+                index: 1,
+                id: "c2".into(),
+                name: "t".into(),
+            },
+            StreamEvent::ToolCallArgumentDelta {
+                index: 1,
+                delta: "{}".into(),
+            },
+            StreamEvent::Finished {
+                usage: Usage {
+                    prompt_tokens: 0,
+                    completion_tokens: 1,
+                    reasoning_tokens: 0,
+                },
+            },
+        ]);
+
+        let t = Arc::new(FakeTool::new("t"));
+        t.push_ok("first-result");
+        t.push_ok("should-not-run"); // second call queued but should be skipped
+        let tools = tool_registry_with(vec![t.clone() as Arc<dyn Tool>]);
+
+        let store = FakeSessionStore::new();
+        let runner = make_runner(llm, store, tools);
+        let id = SessionId::new_v4();
+        let token = CancelToken::new();
+        let token_clone = token.clone();
+
+        let mut appended_roles = Vec::new();
+        let outcome = runner
+            .start(id, "/p".into(), "hi", token_clone, |evt| {
+                if let TurnEvent::MessageAppended(m) = evt {
+                    appended_roles.push(m.role.clone());
+                    // Cancel after the first tool result is committed.
+                    if m.role == Role::Tool {
+                        token.cancel();
+                    }
+                }
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(outcome, TurnOutcome::Cancelled);
+        // user + assistant(tool calls) + first tool result = 3
+        assert_eq!(
+            appended_roles,
+            vec![Role::User, Role::Assistant, Role::Tool]
+        );
+        // Only one tool call was executed.
+        assert_eq!(t.calls().len(), 1);
+
+        let saved = runner.store.get(id).unwrap();
+        assert_eq!(saved.messages.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn cancel_after_assistant_committed_skips_all_tool_calls() {
+        // Edge case: cancel arrives after the assistant message (containing
+        // tool calls) is committed but before any tool executes. The cancel
+        // check at the top of the tool-execution loop should fire, skipping
+        // all tool calls.
+        let llm = FakeLlmProvider::new();
+        llm.push_tool_call("c1", "t", "{}");
+
+        let t = Arc::new(FakeTool::new("t"));
+        t.push_ok("should-not-run");
+        let tools = tool_registry_with(vec![t.clone() as Arc<dyn Tool>]);
+
+        let store = FakeSessionStore::new();
+        let runner = make_runner(llm, store, tools);
+        let id = SessionId::new_v4();
+        let token = CancelToken::new();
+        let token_clone = token.clone();
+
+        let mut appended_roles = Vec::new();
+        let outcome = runner
+            .start(id, "/p".into(), "hi", token_clone, |evt| {
+                if let TurnEvent::MessageAppended(m) = evt {
+                    appended_roles.push(m.role.clone());
+                    // Cancel right after the assistant message with tool calls
+                    // is committed — before any tool call executes.
+                    if m.role == Role::Assistant {
+                        token.cancel();
+                    }
+                }
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(outcome, TurnOutcome::Cancelled);
+        // user + assistant(tool call) = 2, no tool results
+        assert_eq!(appended_roles, vec![Role::User, Role::Assistant]);
+        // No tool calls were executed.
+        assert_eq!(t.calls().len(), 0);
+
+        let saved = runner.store.get(id).unwrap();
+        assert_eq!(saved.messages.len(), 2);
+        assert_eq!(saved.messages[0].role, Role::User);
+        assert_eq!(saved.messages[1].role, Role::Assistant);
+    }
+
+    #[tokio::test]
+    async fn no_cancel_returns_completed() {
+        // Regression guard: a turn with no cancellation still returns Completed.
+        let llm = FakeLlmProvider::new();
+        llm.push_text("done");
+        let store = FakeSessionStore::new();
+        let runner = make_runner(llm, store, ToolRegistry::new());
+
+        let outcome = runner
+            .start(
+                SessionId::new_v4(),
+                "/p".into(),
+                "hi",
+                CancelToken::new(),
+                |_| {},
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(outcome, TurnOutcome::Completed);
     }
 }

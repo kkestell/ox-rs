@@ -594,6 +594,7 @@ dependencies = [
  "app",
  "clap",
  "domain",
+ "futures",
  "protocol",
  "tokio",
 ]
