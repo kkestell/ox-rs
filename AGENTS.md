@@ -12,7 +12,7 @@ Ox is a desktop AI coding assistant built in Rust. It uses a hexagonal (ports-an
 ## Codebase Map
 
 - `crates/domain/` — Core types: `Session`, `Message`, `ContentBlock`, `Role`, `SessionId`, `SessionSummary`, `StreamEvent`, `Usage`. All serde-derived so the same shapes serialize to disk *and* cross the GUI↔agent wire.
-- `crates/app/` — Application layer: port traits (`LlmProvider`, `SessionStore`, `SecretStore`, `FileSystem`, `Shell`), use cases (`SessionRunner`, `TurnEvent`), streaming (`StreamAccumulator`, `ToolDef`), tools (`Tool` trait, `ToolRegistry`, `ReadFileTool`, `WriteFileTool`, `EditFileTool`, hashline helpers). Re-exports `StreamEvent`/`Usage` from domain for caller convenience.
+- `crates/app/` — Application layer: port traits (`LlmProvider`, `SessionStore`, `SecretStore`, `FileSystem`, `Shell`), use cases (`SessionRunner`, `TurnEvent`), streaming (`StreamAccumulator`, `ToolDef`), tools (`Tool` trait, `ToolRegistry`, `ReadFileTool`, `WriteFileTool`, `EditFileTool`, `GlobTool`, `GrepTool`, hashline helpers). Re-exports `StreamEvent`/`Usage` from domain for caller convenience.
 - `crates/protocol/` — Wire protocol between `ox-gui` and `ox-agent`: `AgentCommand`, `AgentEvent`, and `read_frame`/`write_frame` helpers. Depends only on `domain` — no dep on `app` so the wire types cannot accidentally leak application-layer concerns.
 - `crates/adapter-llm/` — LLM provider implementations: OpenRouter (streaming via SSE), Ollama (stub).
 - `crates/adapter-storage/` — Session persistence: `DiskSessionStore` (one JSON file per session).
@@ -150,7 +150,7 @@ Current status:
 - `bin-agent`: composition root for the agent process. CLI (`--workspace-root`, `--model`, `--sessions-dir`, `--resume`), wires adapters, runs `driver::agent_driver` over stdin/stdout. On fatal error, emits an `AgentEvent::Error` frame and exits non-zero.
 - `protocol`: `AgentCommand` (`SendMessage`), `AgentEvent` (`Ready`, `StreamDelta`, `MessageAppended`, `TurnComplete`, `Error`), `read_frame`/`write_frame` helpers. All enums `#[non_exhaustive]` for forward compatibility.
 - `adapter-egui`: `OxApp` renders all sessions as equal-width vertical splits via `ui.columns(N)`. `/new` spawns a new agent and appends a split; `/quit` closes the focused split (or exits the app on the last one). Focus is mouse-driven — clicking a split's input bar makes it active. Per-split state (messages, streaming accumulator, waiting flag, error, session_id) lives on `AgentTab`; per-split input strings live as a parallel `Vec<String>` on `OxApp` to avoid borrow conflicts. `AgentClient` owns the tokio::process `Child` with `kill_on_drop(true)`, runs reader/writer tasks, exposes a channel API.
-- `app::tools`: file-editing tool suite — `read_file` (hashlined output with offset/limit), `write_file` (creates parent dirs), `edit_file` (replace/insert_after operations anchored by hashlines with mismatch detection).
+- `app::tools`: file tool suite — `read_file` (hashlined output with offset/limit), `write_file` (creates parent dirs), `edit_file` (replace/insert_after operations anchored by hashlines with mismatch detection), `glob` (find files by name pattern, sorted, truncated at 200), `grep` (search file contents by regex, returns path:line matches, truncated at 200, skips binary files).
 - `adapter-llm/OpenRouterProvider`: implemented streaming path.
 - `adapter-llm/OllamaProvider`: stub.
 - `adapter-storage/DiskSessionStore`: implemented (load, save, list).

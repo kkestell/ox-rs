@@ -8,7 +8,9 @@ pub mod fake;
 
 pub use ports::*;
 pub use stream::{Snapshot, StreamAccumulator, ToolDef};
-pub use tools::{EditFileTool, ReadFileTool, Tool, ToolRegistry, WriteFileTool};
+pub use tools::{
+    EditFileTool, GlobTool, GrepTool, ReadFileTool, Tool, ToolRegistry, WriteFileTool,
+};
 pub use use_cases::{SessionRunner, TurnEvent};
 
 // `StreamEvent` and `Usage` live in `domain` now — they're serializable data

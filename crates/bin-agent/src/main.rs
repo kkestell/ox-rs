@@ -17,7 +17,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use app::tools::{EditFileTool, ReadFileTool, WriteFileTool};
-use app::{SecretStore, SessionRunner, Tool, ToolRegistry};
+use app::{GlobTool, GrepTool, SecretStore, SessionRunner, Tool, ToolRegistry};
 use clap::Parser;
 use domain::SessionId;
 use protocol::{AgentEvent, write_frame};
@@ -105,6 +105,10 @@ async fn run(cli: AgentCli) -> Result<()> {
     tools.register(
         Arc::new(EditFileTool::new(fs.clone(), cli.workspace_root.clone())) as Arc<dyn Tool>,
     );
+    tools
+        .register(Arc::new(GlobTool::new(fs.clone(), cli.workspace_root.clone())) as Arc<dyn Tool>);
+    tools
+        .register(Arc::new(GrepTool::new(fs.clone(), cli.workspace_root.clone())) as Arc<dyn Tool>);
 
     let store = adapter_storage::DiskSessionStore::new(cli.sessions_dir.clone())?;
     let history_store = adapter_storage::DiskSessionStore::new(cli.sessions_dir)?;

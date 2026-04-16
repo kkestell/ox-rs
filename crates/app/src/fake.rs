@@ -224,6 +224,10 @@ pub struct FakeFileSystem {
     /// filesystem doesn't track this separately, but tests benefit from a
     /// way to assert "yes, this write implicitly created that dir tree."
     created_dirs: Mutex<Vec<PathBuf>>,
+    /// Paths that `walk_glob` includes in results but `read` knows nothing
+    /// about. Simulates files that are discovered by directory walking but
+    /// fail to read (e.g. permission errors, deleted between walk and read).
+    ghost_paths: Mutex<Vec<PathBuf>>,
 }
 
 impl FakeFileSystem {
@@ -231,6 +235,7 @@ impl FakeFileSystem {
         Self {
             files: Mutex::new(HashMap::new()),
             created_dirs: Mutex::new(Vec::new()),
+            ghost_paths: Mutex::new(Vec::new()),
         }
     }
 
@@ -250,6 +255,13 @@ impl FakeFileSystem {
     /// Set of parent directories that `write` has "created" via this fake.
     pub fn created_dirs(&self) -> Vec<PathBuf> {
         self.created_dirs.lock().unwrap().clone()
+    }
+
+    /// Register a path that `walk_glob` will include in results but `read`
+    /// will fail on. Used to test tool behavior when a file disappears or
+    /// becomes unreadable between discovery and read.
+    pub fn insert_ghost(&self, path: impl Into<PathBuf>) {
+        self.ghost_paths.lock().unwrap().push(path.into());
     }
 }
 
@@ -283,6 +295,27 @@ impl FileSystem for FakeFileSystem {
             .unwrap()
             .insert(path.to_path_buf(), content.to_owned());
         Ok(())
+    }
+
+    async fn walk_glob(&self, root: &Path, pattern: &str) -> Result<Vec<PathBuf>> {
+        let pat = glob::Pattern::new(pattern)
+            .map_err(|e| anyhow::anyhow!("invalid glob pattern: {e}"))?;
+        let matches_filter = |path: &PathBuf| -> bool {
+            let Some(relative) = path.strip_prefix(root).ok() else {
+                return false;
+            };
+            pat.matches_path(relative)
+        };
+        let files = self.files.lock().unwrap();
+        let ghosts = self.ghost_paths.lock().unwrap();
+        let mut matches: Vec<PathBuf> = files
+            .keys()
+            .chain(ghosts.iter())
+            .filter(|path| matches_filter(path))
+            .cloned()
+            .collect();
+        matches.sort();
+        Ok(matches)
     }
 }
 

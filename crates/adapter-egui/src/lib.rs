@@ -320,73 +320,80 @@ impl eframe::App for OxApp {
         let any_waiting = self.tabs.iter().any(|t| t.waiting);
         let n = self.tabs.len();
 
-        let panel_frame = egui::Frame::central_panel(ctx.style().as_ref())
-            .inner_margin(0.0);
+        let panel_frame = egui::Frame::central_panel(ctx.style().as_ref()).inner_margin(0.0);
         egui::CentralPanel::default()
             .frame(panel_frame)
             .show(ctx, |ui| {
-            let total_rect = ui.available_rect_before_wrap();
-            let sep_width = 6.0;
-            let total_sep = sep_width * (n.saturating_sub(1)) as f32;
-            let content_width = total_rect.width() - total_sep;
-            // Minimum fraction a split can shrink to (60px equivalent).
-            let min_frac = (60.0 / content_width).min(1.0 / n as f32);
+                let total_rect = ui.available_rect_before_wrap();
+                let sep_width = 6.0;
+                let total_sep = sep_width * (n.saturating_sub(1)) as f32;
+                let content_width = total_rect.width() - total_sep;
+                // Minimum fraction a split can shrink to (60px equivalent).
+                let min_frac = (60.0 / content_width).min(1.0 / n as f32);
 
-            let mut x = total_rect.left();
+                let mut x = total_rect.left();
 
-            for i in 0..n {
-                // -- Split content area --
-                let w = content_width * self.split_fracs[i];
-                let split_rect = egui::Rect::from_min_max(
-                    egui::pos2(x, total_rect.top()),
-                    egui::pos2(x + w, total_rect.bottom()),
-                );
-
-                let mut child = ui.new_child(egui::UiBuilder::new().max_rect(split_rect));
-                let tab = &self.tabs[i];
-                let input = &mut self.inputs[i];
-                let grab_focus = self.pending_focus == Some(i);
-                render_split(&mut child, tab, input, i, grab_focus, &mut actions, &mut new_focus);
-
-                x += w;
-
-                // -- Draggable separator --
-                if i < n - 1 {
-                    let sep_rect = egui::Rect::from_min_max(
+                for i in 0..n {
+                    // -- Split content area --
+                    let w = content_width * self.split_fracs[i];
+                    let split_rect = egui::Rect::from_min_max(
                         egui::pos2(x, total_rect.top()),
-                        egui::pos2(x + sep_width, total_rect.bottom()),
-                    );
-                    let sep_id = egui::Id::new("split_sep").with(i);
-                    let sep_response = ui.interact(sep_rect, sep_id, egui::Sense::drag());
-
-                    if sep_response.dragged() {
-                        let delta = sep_response.drag_delta().x / content_width;
-                        let left = (self.split_fracs[i] + delta).max(min_frac);
-                        let right = (self.split_fracs[i + 1] - delta).max(min_frac);
-                        self.split_fracs[i] = left;
-                        self.split_fracs[i + 1] = right;
-                    }
-
-                    // Visual: thin line, highlighted on hover/drag.
-                    let color = if sep_response.hovered() || sep_response.dragged() {
-                        ui.visuals().widgets.active.bg_fill
-                    } else {
-                        ui.visuals().widgets.noninteractive.bg_stroke.color
-                    };
-                    ui.painter().rect_filled(
-                        sep_rect.shrink2(egui::vec2(2.0, 0.0)),
-                        0.0,
-                        color,
+                        egui::pos2(x + w, total_rect.bottom()),
                     );
 
-                    if sep_response.hovered() || sep_response.dragged() {
-                        ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
-                    }
+                    let mut child = ui.new_child(egui::UiBuilder::new().max_rect(split_rect));
+                    let tab = &self.tabs[i];
+                    let input = &mut self.inputs[i];
+                    let grab_focus = self.pending_focus == Some(i);
+                    render_split(
+                        &mut child,
+                        tab,
+                        input,
+                        i,
+                        grab_focus,
+                        &mut actions,
+                        &mut new_focus,
+                    );
 
-                    x += sep_width;
+                    x += w;
+
+                    // -- Draggable separator --
+                    if i < n - 1 {
+                        let sep_rect = egui::Rect::from_min_max(
+                            egui::pos2(x, total_rect.top()),
+                            egui::pos2(x + sep_width, total_rect.bottom()),
+                        );
+                        let sep_id = egui::Id::new("split_sep").with(i);
+                        let sep_response = ui.interact(sep_rect, sep_id, egui::Sense::drag());
+
+                        if sep_response.dragged() {
+                            let delta = sep_response.drag_delta().x / content_width;
+                            let left = (self.split_fracs[i] + delta).max(min_frac);
+                            let right = (self.split_fracs[i + 1] - delta).max(min_frac);
+                            self.split_fracs[i] = left;
+                            self.split_fracs[i + 1] = right;
+                        }
+
+                        // Visual: thin line, highlighted on hover/drag.
+                        let color = if sep_response.hovered() || sep_response.dragged() {
+                            ui.visuals().widgets.active.bg_fill
+                        } else {
+                            ui.visuals().widgets.noninteractive.bg_stroke.color
+                        };
+                        ui.painter().rect_filled(
+                            sep_rect.shrink2(egui::vec2(2.0, 0.0)),
+                            0.0,
+                            color,
+                        );
+
+                        if sep_response.hovered() || sep_response.dragged() {
+                            ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+                        }
+
+                        x += sep_width;
+                    }
                 }
-            }
-        });
+            });
 
         self.pending_focus = None;
 
@@ -525,9 +532,8 @@ fn render_split(
 
     // -- Input bar --
     let mut input_ui = ui.new_child(egui::UiBuilder::new().max_rect(input_rect));
-    let input_response = input_ui.add(
-        egui::TextEdit::singleline(input).desired_width(f32::INFINITY),
-    );
+    let input_response =
+        input_ui.add(egui::TextEdit::singleline(input).desired_width(f32::INFINITY));
 
     if grab_focus {
         input_response.request_focus();

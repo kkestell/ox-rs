@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 
 use anyhow::Result;
@@ -32,6 +32,15 @@ pub trait SecretStore {
 pub trait FileSystem: Send + Sync {
     fn read(&self, path: &Path) -> impl Future<Output = Result<String>> + Send;
     fn write(&self, path: &Path, content: &str) -> impl Future<Output = Result<()>> + Send;
+
+    /// Return all file paths under `root` that match `pattern` (a glob
+    /// expression like `**/*.rs`). Results are sorted and contain only files,
+    /// not directories. `pattern` is interpreted relative to `root`.
+    fn walk_glob(
+        &self,
+        root: &Path,
+        pattern: &str,
+    ) -> impl Future<Output = Result<Vec<PathBuf>>> + Send;
 }
 
 pub trait Shell {
