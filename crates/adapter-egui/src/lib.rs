@@ -656,8 +656,10 @@ fn render_blocks(
                 let clicked = ui
                     .horizontal(|ui| {
                         ui.spacing_mut().item_spacing.x = item_spacing;
-                        let (tri_rect, tri_response) =
-                            ui.allocate_exact_size(egui::vec2(tri_size, font_height), egui::Sense::click());
+                        let (tri_rect, tri_response) = ui.allocate_exact_size(
+                            egui::vec2(tri_size, font_height),
+                            egui::Sense::click(),
+                        );
                         let center = tri_rect.center();
                         let half = tri_size * 0.5;
                         let points = if open {
@@ -696,9 +698,7 @@ fn render_blocks(
                     ui.ctx().data_mut(|d| d.insert_temp(toggle_id, open));
                 }
 
-                if open
-                    && let Some(&(content, is_error)) = tool_results.get(id.as_str())
-                {
+                if open && let Some(&(content, is_error)) = tool_results.get(id.as_str()) {
                     let output_color = if is_error {
                         egui::Color32::RED
                     } else {
@@ -707,11 +707,7 @@ fn render_blocks(
                     let trimmed = content.trim_end_matches(['\n', ' ']);
                     ui.horizontal(|ui| {
                         ui.add_space(output_indent);
-                        ui.label(
-                            egui::RichText::new(trimmed)
-                                .color(output_color)
-                                .monospace(),
-                        );
+                        ui.label(egui::RichText::new(trimmed).color(output_color).monospace());
                     });
                 }
                 rendered_any = true;

@@ -297,7 +297,12 @@ impl FileSystem for FakeFileSystem {
         Ok(())
     }
 
-    async fn walk_glob(&self, root: &Path, pattern: &str) -> Result<Vec<PathBuf>> {
+    async fn walk_glob(
+        &self,
+        root: &Path,
+        pattern: &str,
+        max_bytes: usize,
+    ) -> Result<crate::ports::WalkResult> {
         let pat = glob::Pattern::new(pattern)
             .map_err(|e| anyhow::anyhow!("invalid glob pattern: {e}"))?;
         let matches_filter = |path: &PathBuf| -> bool {
@@ -308,14 +313,31 @@ impl FileSystem for FakeFileSystem {
         };
         let files = self.files.lock().unwrap();
         let ghosts = self.ghost_paths.lock().unwrap();
-        let mut matches: Vec<PathBuf> = files
+        let mut all: Vec<PathBuf> = files
             .keys()
             .chain(ghosts.iter())
             .filter(|path| matches_filter(path))
             .cloned()
             .collect();
-        matches.sort();
-        Ok(matches)
+        all.sort();
+
+        let mut results = Vec::new();
+        let mut cumulative_bytes: usize = 0;
+        let mut truncated = false;
+        for path in all {
+            let path_bytes = path.to_string_lossy().len();
+            if cumulative_bytes + path_bytes > max_bytes {
+                truncated = true;
+                break;
+            }
+            cumulative_bytes += path_bytes;
+            results.push(path);
+        }
+
+        Ok(crate::ports::WalkResult {
+            paths: results,
+            truncated,
+        })
     }
 }
 
@@ -396,10 +418,10 @@ impl Tool for FakeTool {
 // ---------------------------------------------------------------------------
 
 /// Test double for `Shell`. Queued `CommandOutput` results consumed in FIFO
-/// order. Records every (command, timeout) pair for assertion.
+/// order. Records every (command, timeout, max_bytes) triple for assertion.
 pub struct FakeShell {
     results: Mutex<VecDeque<Result<CommandOutput, String>>>,
-    calls: Mutex<Vec<(String, std::time::Duration)>>,
+    calls: Mutex<Vec<(String, std::time::Duration, usize)>>,
 }
 
 impl Default for FakeShell {
@@ -426,18 +448,23 @@ impl FakeShell {
         self.results.lock().unwrap().push_back(Err(msg.into()));
     }
 
-    /// All (command, timeout) pairs passed to `run` so far.
-    pub fn calls(&self) -> Vec<(String, std::time::Duration)> {
+    /// All (command, timeout, max_bytes) triples passed to `run` so far.
+    pub fn calls(&self) -> Vec<(String, std::time::Duration, usize)> {
         self.calls.lock().unwrap().clone()
     }
 }
 
 impl crate::ports::Shell for FakeShell {
-    async fn run(&self, command: &str, timeout: std::time::Duration) -> Result<CommandOutput> {
+    async fn run(
+        &self,
+        command: &str,
+        timeout: std::time::Duration,
+        max_bytes: usize,
+    ) -> Result<CommandOutput> {
         self.calls
             .lock()
             .unwrap()
-            .push((command.to_owned(), timeout));
+            .push((command.to_owned(), timeout, max_bytes));
         match self
             .results
             .lock()

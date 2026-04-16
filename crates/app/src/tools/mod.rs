@@ -31,6 +31,7 @@ pub mod glob;
 pub mod grep;
 pub mod hashlines;
 pub mod read_file;
+pub(crate) mod spill;
 pub mod write_file;
 
 pub use bash::BashTool;

@@ -1,8 +1,8 @@
 //! `glob` tool.
 //!
 //! Finds files by name pattern within the workspace. Returns
-//! workspace-relative paths sorted alphabetically, truncated at a cap to
-//! keep context-window cost bounded.
+//! workspace-relative paths sorted alphabetically. Large result sets are
+//! spilled to a temp file under `.ox/tmp/` with a preview shown inline.
 
 use std::future::Future;
 use std::path::PathBuf;
@@ -12,12 +12,13 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use serde::Deserialize;
 
+use super::spill::{self, PREVIEW_LINES};
 use super::{Tool, display_path, require_non_empty, resolve_path};
 use crate::ports::FileSystem;
 use crate::stream::ToolDef;
 
-/// Maximum number of file paths returned before truncation.
-const MAX_RESULTS: usize = 200;
+/// Byte cap for walk_glob to prevent unbounded memory consumption.
+const WALK_MAX_BYTES: usize = 10 * 1024 * 1024; // 10 MB
 
 pub struct GlobTool<F> {
     fs: Arc<F>,
@@ -78,33 +79,44 @@ impl<F: FileSystem + Send + Sync + 'static> Tool for GlobTool<F> {
                 None => self.workspace_root.clone(),
             };
 
-            let matches = self
+            let result = self
                 .fs
-                .walk_glob(&root, &parsed.pattern)
+                .walk_glob(&root, &parsed.pattern, WALK_MAX_BYTES)
                 .await
                 .with_context(|| {
                     format!("glob: walk_glob failed for pattern {:?}", parsed.pattern)
                 })?;
 
-            if matches.is_empty() {
+            if result.paths.is_empty() {
                 return Ok("No files matched.".into());
             }
 
-            let total = matches.len();
-            let truncated = total > MAX_RESULTS;
-            let display: Vec<String> = matches
+            let total = result.paths.len();
+            let display: Vec<String> = result
+                .paths
                 .iter()
-                .take(MAX_RESULTS)
                 .map(|p| display_path(&self.workspace_root, p))
                 .collect();
 
-            let mut out = if truncated {
-                format!("Found {total} files (showing first {MAX_RESULTS}):\n")
-            } else {
-                format!("Found {total} file{}:\n", if total == 1 { "" } else { "s" })
-            };
+            let mut out = format!("Found {total} file{}:\n", if total == 1 { "" } else { "s" });
             out.push_str(&display.join("\n"));
-            Ok(out)
+
+            if result.truncated {
+                out.push_str("\n[results truncated due to size]");
+            }
+
+            if spill::needs_spill(&out) {
+                let info =
+                    spill::spill(self.fs.as_ref(), &self.workspace_root, &out, "glob").await?;
+                let preview = spill::preview(&out, PREVIEW_LINES);
+                Ok(format!(
+                    "Found {total} files (showing first {PREVIEW_LINES} lines, full output: {}):\n{}",
+                    info.display_path,
+                    preview.trim_end(),
+                ))
+            } else {
+                Ok(out)
+            }
         })
     }
 }
@@ -174,7 +186,6 @@ mod tests {
             .await
             .unwrap();
         assert!(out.contains("Found 1 file:"));
-        // Path outside workspace shows as absolute.
         assert!(out.contains("/other/f.rs"));
     }
 
@@ -198,19 +209,32 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn truncates_at_cap() {
+    async fn large_result_set_spills() {
         let fs = Arc::new(FakeFileSystem::new());
-        // Insert more files than MAX_RESULTS.
-        for i in 0..250 {
+        for i in 0..500 {
             fs.insert(format!("/ws/file_{i:04}.txt"), "");
         }
         let t = tool(fs, "/ws");
 
         let out = t.execute(r#"{"pattern":"*.txt"}"#).await.unwrap();
-        assert!(out.contains("Found 250 files (showing first 200):"));
-        // Count the file lines (skip the header).
-        let file_lines = out.lines().skip(1).count();
-        assert_eq!(file_lines, 200);
+        assert!(out.contains("500 files"), "got: {out}");
+        assert!(out.contains(".ox/tmp/glob-"), "got: {out}");
+        // Preview should show first PREVIEW_LINES, not all 500+.
+        assert!(out.contains("file_0000.txt"), "got: {out}");
+        assert!(!out.contains("file_0499.txt"), "got: {out}");
+    }
+
+    #[tokio::test]
+    async fn small_result_set_stays_inline() {
+        let fs = Arc::new(FakeFileSystem::new());
+        for i in 0..10 {
+            fs.insert(format!("/ws/file_{i:04}.txt"), "");
+        }
+        let t = tool(fs, "/ws");
+
+        let out = t.execute(r#"{"pattern":"*.txt"}"#).await.unwrap();
+        assert!(out.contains("Found 10 files:"), "got: {out}");
+        assert!(!out.contains(".ox/tmp/"), "got: {out}");
     }
 
     #[tokio::test]

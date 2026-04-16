@@ -111,7 +111,9 @@ async fn run(cli: AgentCli) -> Result<()> {
         .register(Arc::new(GrepTool::new(fs.clone(), cli.workspace_root.clone())) as Arc<dyn Tool>);
 
     let shell = Arc::new(adapter_fs::BashShell::new(cli.workspace_root.clone()));
-    tools.register(Arc::new(BashTool::new(shell)) as Arc<dyn Tool>);
+    tools.register(
+        Arc::new(BashTool::new(shell, fs.clone(), cli.workspace_root.clone())) as Arc<dyn Tool>,
+    );
 
     let store = adapter_storage::DiskSessionStore::new(cli.sessions_dir.clone())?;
     let history_store = adapter_storage::DiskSessionStore::new(cli.sessions_dir)?;

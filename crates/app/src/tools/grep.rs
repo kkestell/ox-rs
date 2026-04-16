@@ -2,8 +2,8 @@
 //!
 //! Searches file contents by regex across the workspace. Walks files via
 //! `walk_glob`, reads each one, and collects matching lines with file path
-//! and line number. Output is truncated at a cap to keep context-window
-//! cost bounded.
+//! and line number. Large result sets are spilled to a temp file under
+//! `.ox/tmp/` with a preview shown inline.
 
 use std::future::Future;
 use std::path::PathBuf;
@@ -14,12 +14,18 @@ use anyhow::{Context, Result};
 use regex::Regex;
 use serde::Deserialize;
 
+use super::spill::{self, PREVIEW_LINES};
 use super::{Tool, display_path, require_non_empty, resolve_path};
 use crate::ports::FileSystem;
 use crate::stream::ToolDef;
 
-/// Maximum number of matching lines returned before truncation.
-const MAX_MATCHES: usize = 200;
+/// Byte cap for walk_glob — generous because the file list is rarely the
+/// memory problem; the match accumulation is.
+const WALK_MAX_BYTES: usize = 10 * 1024 * 1024; // 10 MB
+
+/// Byte budget for accumulated match output. Stops collecting when this
+/// limit is reached to prevent unbounded memory consumption.
+const MATCH_MAX_BYTES: usize = 10 * 1024 * 1024; // 10 MB
 
 /// Default glob pattern when no file filter is provided — matches
 /// every file recursively.
@@ -96,22 +102,22 @@ impl<F: FileSystem + Send + Sync + 'static> Tool for GrepTool<F> {
             };
             let glob_pattern = parsed.glob.as_deref().unwrap_or(DEFAULT_GLOB);
 
-            let files = self
+            let walk = self
                 .fs
-                .walk_glob(&root, glob_pattern)
+                .walk_glob(&root, glob_pattern, WALK_MAX_BYTES)
                 .await
                 .with_context(|| {
                     format!("grep: walk_glob failed for pattern {:?}", glob_pattern)
                 })?;
+            let files = walk.paths;
 
-            // Collect matches across all files: (display_path, line_number, line_content).
-            let mut matches: Vec<(String, usize, String)> = Vec::new();
+            // Accumulate formatted match lines, tracking byte size.
+            let mut match_output = String::new();
+            let mut match_count: usize = 0;
             let mut files_with_errors: Vec<String> = Vec::new();
-            // Tracks whether we hit the cap and stopped early, as opposed
-            // to naturally finding exactly MAX_MATCHES results.
-            let mut hit_cap = false;
+            let mut hit_byte_cap = false;
 
-            for file_path in &files {
+            'outer: for file_path in &files {
                 let content = match self.fs.read(file_path).await {
                     Ok(c) => c,
                     Err(_) => {
@@ -131,50 +137,37 @@ impl<F: FileSystem + Send + Sync + 'static> Tool for GrepTool<F> {
                 let dp = display_path(&self.workspace_root, file_path);
                 for (line_idx, line) in content.lines().enumerate() {
                     if re.is_match(line) {
-                        matches.push((dp.clone(), line_idx + 1, line.to_string()));
-                        // Collect one past the cap so we can distinguish
-                        // "exactly MAX_MATCHES" from "more than MAX_MATCHES".
-                        if matches.len() > MAX_MATCHES {
-                            hit_cap = true;
-                            break;
+                        let formatted = format!("{dp}:{}: {line}\n", line_idx + 1);
+                        if match_output.len() + formatted.len() > MATCH_MAX_BYTES {
+                            hit_byte_cap = true;
+                            break 'outer;
                         }
+                        match_output.push_str(&formatted);
+                        match_count += 1;
                     }
-                }
-                if hit_cap {
-                    break;
                 }
             }
 
-            if matches.is_empty() && files_with_errors.is_empty() {
+            if match_count == 0 && files_with_errors.is_empty() {
                 return Ok("No matches found.".into());
             }
 
-            // If we collected an overflow sentinel, remove it before display.
-            if hit_cap {
-                matches.truncate(MAX_MATCHES);
-            }
-            let total = matches.len();
-
+            // Build the full result text, then decide whether to spill.
             let mut out = String::new();
-            if hit_cap {
-                out.push_str(&format!(
-                    "Found {MAX_MATCHES}+ matches (showing first {MAX_MATCHES}):\n"
-                ));
-            } else {
-                out.push_str(&format!(
-                    "Found {total} match{}:\n",
-                    if total == 1 { "" } else { "es" }
-                ));
-            }
+            out.push_str(&format!(
+                "Found {match_count} match{}:\n",
+                if match_count == 1 { "" } else { "es" }
+            ));
+            out.push_str(&match_output);
 
-            for (path, line_num, content) in &matches {
-                out.push_str(&format!("{path}:{line_num}: {content}\n"));
+            if hit_byte_cap {
+                out.push_str("[match collection stopped — byte cap reached]\n");
             }
 
             // Note any files that failed to read.
             if !files_with_errors.is_empty() {
                 out.push_str(&format!(
-                    "\n[skipped {} file{} due to read errors: {}]",
+                    "\n[skipped {} file{} due to read errors: {}]\n",
                     files_with_errors.len(),
                     if files_with_errors.len() == 1 {
                         ""
@@ -185,8 +178,20 @@ impl<F: FileSystem + Send + Sync + 'static> Tool for GrepTool<F> {
                 ));
             }
 
-            // Trim trailing whitespace.
-            Ok(out.trim_end().to_string())
+            let trimmed = out.trim_end().to_string();
+
+            if spill::needs_spill(&trimmed) {
+                let info =
+                    spill::spill(self.fs.as_ref(), &self.workspace_root, &trimmed, "grep").await?;
+                let preview = spill::preview(&trimmed, PREVIEW_LINES);
+                Ok(format!(
+                    "Found {match_count} matches (showing first {PREVIEW_LINES} lines, full output: {}):\n{}",
+                    info.display_path,
+                    preview.trim_end(),
+                ))
+            } else {
+                Ok(trimmed)
+            }
         })
     }
 }
@@ -277,26 +282,42 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn truncates_at_cap() {
+    async fn large_result_set_spills() {
         let fs = Arc::new(FakeFileSystem::new());
-        // Build a file with more lines than MAX_MATCHES, all matching.
-        let content: String = (0..250).map(|i| format!("match_{i}\n")).collect();
+        // 500 matching lines — exceeds INLINE_MAX_LINES (200).
+        let content: String = (0..500).map(|i| format!("match_{i}\n")).collect();
         fs.insert("/ws/big.txt", &content);
         let t = tool(fs, "/ws");
 
         let out = t.execute(r#"{"pattern":"match_"}"#).await.unwrap();
-        assert!(out.contains("200+ matches"));
-        assert!(out.contains("showing first 200"));
-        // Count data lines (skip the header).
-        let data_lines = out.lines().skip(1).count();
-        assert_eq!(data_lines, 200);
+        assert!(out.contains("500 matches"), "got: {out}");
+        assert!(
+            out.contains("[full output:") || out.contains("full output:"),
+            "got: {out}"
+        );
+        assert!(out.contains(".ox/tmp/grep-"), "got: {out}");
+        // Preview should show first PREVIEW_LINES lines, not all 500+.
+        assert!(out.contains("match_0"), "got: {out}");
+        assert!(!out.contains("match_499"), "got: {out}");
+    }
+
+    #[tokio::test]
+    async fn at_inline_threshold_does_not_spill() {
+        let fs = Arc::new(FakeFileSystem::new());
+        // 199 matches + 1 header line = 200 formatted lines, exactly at threshold.
+        let content: String = (0..199).map(|i| format!("line_{i}\n")).collect();
+        fs.insert("/ws/exact.txt", &content);
+        let t = tool(fs, "/ws");
+
+        let out = t.execute(r#"{"pattern":"line_"}"#).await.unwrap();
+        assert!(out.contains("Found 199 matches:"), "got: {out}");
+        assert!(!out.contains(".ox/tmp/"), "got: {out}");
     }
 
     #[tokio::test]
     async fn skips_unreadable_files_with_note() {
         let fs = Arc::new(FakeFileSystem::new());
         fs.insert("/ws/ok.txt", "found it\n");
-        // Ghost path: walk_glob discovers it, but read() will fail.
         fs.insert_ghost("/ws/gone.txt");
         let t = tool(fs, "/ws");
 
@@ -354,19 +375,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn exactly_at_cap_is_not_truncated() {
-        let fs = Arc::new(FakeFileSystem::new());
-        // Exactly MAX_MATCHES lines, all matching — no truncation.
-        let content: String = (0..200).map(|i| format!("line_{i}\n")).collect();
-        fs.insert("/ws/exact.txt", &content);
-        let t = tool(fs, "/ws");
-
-        let out = t.execute(r#"{"pattern":"line_"}"#).await.unwrap();
-        assert!(out.contains("Found 200 matches:"), "got: {out}");
-        assert!(!out.contains("200+"), "got: {out}");
-    }
-
-    #[tokio::test]
     async fn absolute_path_outside_workspace() {
         let fs = Arc::new(FakeFileSystem::new());
         fs.insert("/other/f.rs", "fn hello() {}\n");
@@ -378,7 +386,6 @@ mod tests {
             .await
             .unwrap();
         assert!(out.contains("Found 1 match:"));
-        // Path outside workspace shows as absolute.
         assert!(out.contains("/other/f.rs:1:"));
         assert!(!out.contains("g.rs"));
     }

@@ -19,7 +19,7 @@
 //! disambiguate collisions. That's enough: the hash exists to detect *drift*,
 //! not to globally identify lines.
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 
 /// Encodes a `u32` as a left-padded 3-character base-36 string.
 ///
