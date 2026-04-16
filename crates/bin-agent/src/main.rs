@@ -25,6 +25,11 @@ use tokio::io::{AsyncWriteExt, BufReader};
 
 mod driver;
 
+const SYSTEM_PROMPT: &str = "\
+You are an AI coding assistant. You help users understand, write, and modify \
+code within their projects. Be concise and direct in your responses. Use tools \
+only when necessary — prefer answering from context when possible.";
+
 #[derive(Parser, Debug)]
 #[command(name = "ox-agent", about = "Headless session runner driven over stdio")]
 struct AgentCli {
@@ -117,7 +122,7 @@ async fn run(cli: AgentCli) -> Result<()> {
 
     let store = adapter_storage::DiskSessionStore::new(cli.sessions_dir.clone())?;
     let history_store = adapter_storage::DiskSessionStore::new(cli.sessions_dir)?;
-    let runner = SessionRunner::new(llm, store, tools);
+    let runner = SessionRunner::new(llm, store, tools, SYSTEM_PROMPT.to_owned());
 
     let stdin = tokio::io::stdin();
     let stdout = tokio::io::stdout();

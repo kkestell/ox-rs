@@ -31,9 +31,10 @@ impl app::LlmProvider for OpenRouterProvider {
     async fn stream(
         &self,
         messages: &[Message],
+        system_prompt: &str,
         tools: &[ToolDef],
     ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamEvent>> + Send>>> {
-        let body = RequestBody::from_messages(&self.model, messages, tools)?;
+        let body = RequestBody::from_messages(&self.model, messages, system_prompt, tools)?;
 
         let response = self
             .client

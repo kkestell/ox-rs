@@ -124,11 +124,31 @@ pub struct SseUsage {
 // ---------------------------------------------------------------------------
 
 impl RequestBody {
-    pub fn from_messages(model: &str, messages: &[Message], tools: &[ToolDef]) -> Result<Self> {
-        let wire_messages: Vec<WireMessage> = messages
-            .iter()
-            .map(wire_message)
-            .collect::<Result<Vec<_>>>()?;
+    pub fn from_messages(
+        model: &str,
+        messages: &[Message],
+        system_prompt: &str,
+        tools: &[ToolDef],
+    ) -> Result<Self> {
+        let mut wire_messages: Vec<WireMessage> = Vec::new();
+
+        // Prepend the system prompt as a system-role message when provided.
+        // This stays out of the domain model — it's a wire-level concern.
+        if !system_prompt.is_empty() {
+            wire_messages.push(WireMessage {
+                role: "system".to_owned(),
+                content: Some(system_prompt.to_owned()),
+                tool_calls: None,
+                tool_call_id: None,
+            });
+        }
+
+        wire_messages.extend(
+            messages
+                .iter()
+                .map(wire_message)
+                .collect::<Result<Vec<_>>>()?,
+        );
 
         let wire_tools: Vec<WireTool> = tools
             .iter()
@@ -328,10 +348,32 @@ mod tests {
             description: "Read a file".into(),
             parameters: serde_json::json!({"type": "object"}),
         }];
-        let body = RequestBody::from_messages("test-model", &[], &tools).unwrap();
+        let body = RequestBody::from_messages("test-model", &[], "", &tools).unwrap();
         assert_eq!(body.model, "test-model");
         assert!(body.stream);
         assert_eq!(body.tools.len(), 1);
         assert_eq!(body.tools[0].function.name, "read_file");
+    }
+
+    #[test]
+    fn system_prompt_prepended_as_first_message() {
+        let msgs = vec![Message::user("hello")];
+        let body =
+            RequestBody::from_messages("m", &msgs, "You are a coding assistant.", &[]).unwrap();
+        assert_eq!(body.messages.len(), 2);
+        assert_eq!(body.messages[0].role, "system");
+        assert_eq!(
+            body.messages[0].content.as_deref(),
+            Some("You are a coding assistant.")
+        );
+        assert_eq!(body.messages[1].role, "user");
+    }
+
+    #[test]
+    fn empty_system_prompt_produces_no_system_message() {
+        let msgs = vec![Message::user("hello")];
+        let body = RequestBody::from_messages("m", &msgs, "", &[]).unwrap();
+        assert_eq!(body.messages.len(), 1);
+        assert_eq!(body.messages[0].role, "user");
     }
 }

@@ -15,6 +15,7 @@ pub trait LlmProvider {
     fn stream(
         &self,
         messages: &[Message],
+        system_prompt: &str,
         tools: &[ToolDef],
     ) -> impl Future<Output = Result<Pin<Box<dyn Stream<Item = Result<StreamEvent>> + Send>>>> + Send;
 }

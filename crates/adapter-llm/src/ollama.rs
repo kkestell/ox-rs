@@ -23,6 +23,7 @@ impl app::LlmProvider for OllamaProvider {
     async fn stream(
         &self,
         _messages: &[Message],
+        _system_prompt: &str,
         _tools: &[ToolDef],
     ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamEvent>> + Send>>> {
         todo!()

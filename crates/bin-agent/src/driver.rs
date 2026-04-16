@@ -271,7 +271,7 @@ mod tests {
         let (evt_drv, evt_test) = duplex(64 * 1024);
 
         let handle = tokio::spawn(async move {
-            let runner = SessionRunner::new(llm, store, tools);
+            let runner = SessionRunner::new(llm, store, tools, String::new());
             agent_driver(
                 &runner,
                 &history,

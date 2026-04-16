@@ -48,11 +48,17 @@ pub struct SessionRunner<L, S> {
     llm: L,
     store: S,
     tools: ToolRegistry,
+    system_prompt: String,
 }
 
 impl<L: LlmProvider, S: SessionStore> SessionRunner<L, S> {
-    pub fn new(llm: L, store: S, tools: ToolRegistry) -> Self {
-        Self { llm, store, tools }
+    pub fn new(llm: L, store: S, tools: ToolRegistry, system_prompt: String) -> Self {
+        Self {
+            llm,
+            store,
+            tools,
+            system_prompt,
+        }
     }
 
     /// Create a new session and run the first turn. The caller is responsible
@@ -121,7 +127,10 @@ impl<L: LlmProvider, S: SessionStore> SessionRunner<L, S> {
             // — keeps the wire payload minimal for tool-free compositions.
             let defs = self.tools.defs();
 
-            let mut event_stream = self.llm.stream(&session.messages, &defs).await?;
+            let mut event_stream = self
+                .llm
+                .stream(&session.messages, &self.system_prompt, &defs)
+                .await?;
             let mut acc = StreamAccumulator::new();
             while let Some(event) = event_stream.next().await {
                 let event = event?;
@@ -181,7 +190,7 @@ mod tests {
         store: FakeSessionStore,
         tools: ToolRegistry,
     ) -> SessionRunner<FakeLlmProvider, FakeSessionStore> {
-        SessionRunner::new(llm, store, tools)
+        SessionRunner::new(llm, store, tools, String::new())
     }
 
     // -- start --
@@ -684,6 +693,29 @@ mod tests {
         assert!(
             result.unwrap_err().to_string().contains("iterations"),
             "iteration-cap error should mention iterations"
+        );
+    }
+
+    // -- system prompt --
+
+    #[tokio::test]
+    async fn system_prompt_forwarded_to_llm_provider() {
+        let llm = FakeLlmProvider::new();
+        llm.push_text("ok");
+        let store = FakeSessionStore::new();
+        let runner = SessionRunner::new(
+            llm,
+            store,
+            ToolRegistry::new(),
+            "You are a coding assistant.".to_owned(),
+        );
+        runner
+            .start(SessionId::new_v4(), "/p".into(), "hi", |_| {})
+            .await
+            .unwrap();
+        assert_eq!(
+            runner.llm.system_prompts(),
+            vec!["You are a coding assistant."]
         );
     }
 }

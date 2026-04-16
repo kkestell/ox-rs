@@ -30,6 +30,8 @@ enum QueuedResponse {
 /// missing response is a test bug, not a graceful failure.
 pub struct FakeLlmProvider {
     responses: Mutex<VecDeque<QueuedResponse>>,
+    /// Every `system_prompt` value passed to `stream()`, in call order.
+    system_prompts: Mutex<Vec<String>>,
 }
 
 impl Default for FakeLlmProvider {
@@ -42,7 +44,13 @@ impl FakeLlmProvider {
     pub fn new() -> Self {
         Self {
             responses: Mutex::new(VecDeque::new()),
+            system_prompts: Mutex::new(Vec::new()),
         }
+    }
+
+    /// All `system_prompt` values passed to `stream()` so far, in call order.
+    pub fn system_prompts(&self) -> Vec<String> {
+        self.system_prompts.lock().unwrap().clone()
     }
 
     /// Queue a raw sequence of events.
@@ -117,8 +125,13 @@ impl LlmProvider for FakeLlmProvider {
     async fn stream(
         &self,
         _messages: &[Message],
+        system_prompt: &str,
         _tools: &[ToolDef],
     ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamEvent>> + Send>>> {
+        self.system_prompts
+            .lock()
+            .unwrap()
+            .push(system_prompt.to_owned());
         let queued = self
             .responses
             .lock()
@@ -503,7 +516,7 @@ mod tests {
         let fake = FakeLlmProvider::new();
         fake.push_text("hello world");
 
-        let mut stream = fake.stream(&[], &[]).await.unwrap();
+        let mut stream = fake.stream(&[], "", &[]).await.unwrap();
         let mut acc = StreamAccumulator::new();
         while let Some(event) = stream.next().await {
             acc.push(event.unwrap());
@@ -518,7 +531,7 @@ mod tests {
         let fake = FakeLlmProvider::new();
         fake.push_tool_call("call_1", "read_file", r#"{"path":"a.rs"}"#);
 
-        let mut stream = fake.stream(&[], &[]).await.unwrap();
+        let mut stream = fake.stream(&[], "", &[]).await.unwrap();
         let mut acc = StreamAccumulator::new();
         while let Some(event) = stream.next().await {
             acc.push(event.unwrap());
@@ -547,7 +560,7 @@ mod tests {
         fake.push_text("second");
 
         // First call
-        let mut s1 = fake.stream(&[], &[]).await.unwrap();
+        let mut s1 = fake.stream(&[], "", &[]).await.unwrap();
         let mut acc1 = StreamAccumulator::new();
         while let Some(e) = s1.next().await {
             acc1.push(e.unwrap());
@@ -555,7 +568,7 @@ mod tests {
         assert_eq!(acc1.into_message().text(), "first");
 
         // Second call
-        let mut s2 = fake.stream(&[], &[]).await.unwrap();
+        let mut s2 = fake.stream(&[], "", &[]).await.unwrap();
         let mut acc2 = StreamAccumulator::new();
         while let Some(e) = s2.next().await {
             acc2.push(e.unwrap());
@@ -567,7 +580,7 @@ mod tests {
     #[should_panic(expected = "no responses queued")]
     async fn panics_when_no_responses_queued() {
         let fake = FakeLlmProvider::new();
-        let _ = fake.stream(&[], &[]).await;
+        let _ = fake.stream(&[], "", &[]).await;
     }
 
     // -- FakeSessionStore tests --
