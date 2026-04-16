@@ -44,9 +44,10 @@ impl<F: FileSystem + Send + Sync + 'static> Tool for GlobTool<F> {
     fn def(&self) -> ToolDef {
         ToolDef {
             name: "glob".into(),
-            description: "Find files by name pattern. Returns workspace-relative paths, \
-                sorted alphabetically. Use glob syntax: `*.rs` for the current directory, \
-                `**/*.rs` for recursive search."
+            description: "Find files by name pattern. Use this instead of `find` or `ls` \
+                via bash. Returns workspace-relative paths, sorted alphabetically. \
+                Use glob syntax: `*.rs` for the current directory, `**/*.rs` for \
+                recursive search."
                 .into(),
             parameters: serde_json::json!({
                 "type": "object",

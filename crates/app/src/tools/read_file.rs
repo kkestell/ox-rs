@@ -52,10 +52,11 @@ impl<F: FileSystem + Send + Sync + 'static> Tool for ReadFileTool<F> {
     fn def(&self) -> ToolDef {
         ToolDef {
             name: "read_file".into(),
-            description: "Read a file from the workspace. Returns its contents with each line \
-                prefixed by a `{line_number}:{hash}|` hashline tag that you can copy \
-                verbatim into an `edit_file` anchor. Supports optional `offset` \
-                (0-indexed) and `limit` (default 2000) for large files."
+            description: "Read a file from the workspace. Use this instead of cat, head, \
+                or tail via bash. Returns contents with each line prefixed by a \
+                `{line_number}:{hash}|` hashline tag that you can copy verbatim \
+                into an `edit_file` anchor. Supports optional `offset` (0-indexed) \
+                and `limit` (default 2000) for large files."
                 .into(),
             parameters: serde_json::json!({
                 "type": "object",

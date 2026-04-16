@@ -59,9 +59,9 @@ impl<F: FileSystem + Send + Sync + 'static> Tool for GrepTool<F> {
     fn def(&self) -> ToolDef {
         ToolDef {
             name: "grep".into(),
-            description: "Search file contents by regex. Returns matching lines with file \
-                paths and line numbers. Supports an optional `glob` filter to restrict \
-                which files are searched."
+            description: "Search file contents by regex. Use this instead of grep or rg \
+                via bash. Returns matching lines with file paths and line numbers. \
+                Supports an optional `glob` filter to restrict which files are searched."
                 .into(),
             parameters: serde_json::json!({
                 "type": "object",

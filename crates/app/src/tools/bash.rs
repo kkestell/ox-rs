@@ -50,7 +50,14 @@ impl<S: Shell + 'static, F: FileSystem + 'static> Tool for BashTool<S, F> {
     fn def(&self) -> ToolDef {
         ToolDef {
             name: "bash".into(),
-            description: "Execute a shell command in the workspace directory.".into(),
+            description: "Execute a shell command in the workspace directory. \
+                Long output is automatically truncated and spilled to a file — \
+                never pipe through head, tail, or grep to manage output length. \
+                Do not use this for tasks that have a dedicated tool: use \
+                `read_file` instead of cat/head/tail, `glob` instead of find/ls, \
+                `grep` instead of grep/rg. Reserve bash for build commands, test \
+                runners, git operations, and other tasks with no dedicated tool."
+                .into(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
