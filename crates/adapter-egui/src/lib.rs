@@ -603,14 +603,15 @@ fn render_blocks(
 ) {
     let mut rendered_any = false;
     for block in blocks {
-        // Spacing between consecutive visible blocks.
+        // Spacing between consecutive visible blocks — same 8px used
+        // between messages so the rhythm is consistent throughout.
         let needs_space = match block {
             ContentBlock::Reasoning { content, .. } => !content.is_empty(),
             ContentBlock::ToolResult { .. } => false,
             _ => true,
         };
         if needs_space && rendered_any {
-            ui.add_space(4.0);
+            ui.add_space(8.0);
         }
 
         match block {
