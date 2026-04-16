@@ -524,13 +524,13 @@ fn render_split(
         .auto_shrink(false)
         .stick_to_bottom(true)
         .show(&mut scroll_ui, |ui| {
-            for (msg_index, msg) in tab.messages.iter().enumerate() {
+            for msg in &tab.messages {
                 // Tool-role messages are consumed via the tool-result index
                 // and rendered inline under their paired tool-call block.
                 if msg.role == Role::Tool {
                     continue;
                 }
-                render_blocks(ui, &msg.content, &msg.role, msg_index, &tool_results);
+                render_blocks(ui, &msg.content, &msg.role, &tool_results);
                 ui.add_space(8.0);
             }
 
@@ -539,7 +539,7 @@ fn render_split(
             if let Some(acc) = &tab.streaming {
                 let snapshot = acc.snapshot();
                 let empty = HashMap::new();
-                render_blocks(ui, snapshot.content, &Role::Assistant, usize::MAX, &empty);
+                render_blocks(ui, snapshot.content, &Role::Assistant, &empty);
                 ui.add_space(8.0);
             } else if tab.waiting {
                 ui.label("...");
@@ -587,23 +587,32 @@ fn render_split(
 /// symmetry is the whole point — the live view and the final view can't
 /// drift apart because they run through the same function.
 ///
-/// - **User text**: cornflower blue, no header.
-/// - **Assistant text**: white, no header.
-/// - **Thinking**: gray, collapsed by default, first line truncated to ~80
-///   chars in the header. Full text visible when expanded.
-/// - **Tool calls**: collapsible header `name(arguments)`, default open.
-///   Body shows the paired tool result from `tool_results`, or a
-///   placeholder while streaming.
+/// - **User text**: cornflower blue.
+/// - **Assistant text**: white.
+/// - **Thinking**: gray, rendered inline (no collapsing).
+/// - **Tool calls**: clickable toggle header `▼ name(args)` / `▶ name(args)`.
+///   Body shows the paired tool result. Open/closed state stored in egui's
+///   per-frame `Memory` keyed by the tool call ID.
 /// - **Tool results**: not rendered standalone — consumed via the tool call
-///   index and shown inside their paired tool call's collapsible body.
+///   index and shown inside their paired tool call's body.
 fn render_blocks(
     ui: &mut egui::Ui,
     blocks: &[ContentBlock],
     role: &Role,
-    msg_index: usize,
     tool_results: &HashMap<&str, (&str, bool)>,
 ) {
-    for (block_index, block) in blocks.iter().enumerate() {
+    let mut rendered_any = false;
+    for block in blocks {
+        // Spacing between consecutive visible blocks.
+        let needs_space = match block {
+            ContentBlock::Reasoning { content, .. } => !content.is_empty(),
+            ContentBlock::ToolResult { .. } => false,
+            _ => true,
+        };
+        if needs_space && rendered_any {
+            ui.add_space(4.0);
+        }
+
         match block {
             ContentBlock::Text { text } => {
                 let color = match role {
@@ -611,27 +620,12 @@ fn render_blocks(
                     _ => egui::Color32::WHITE,
                 };
                 ui.label(egui::RichText::new(text).color(color));
+                rendered_any = true;
             }
             ContentBlock::Reasoning { content, .. } => {
-                // Encrypted-only reasoning blocks carry empty `content` —
-                // the opaque blob is persisted for provider re-verification
-                // but there's nothing to show the user.
                 if !content.is_empty() {
-                    let first_line = content.lines().next().unwrap_or("");
-                    let truncated: String = if first_line.chars().count() > 80 {
-                        let s: String = first_line.chars().take(80).collect();
-                        format!("{s}...")
-                    } else {
-                        first_line.to_string()
-                    };
-                    egui::CollapsingHeader::new(
-                        egui::RichText::new(&truncated).color(egui::Color32::GRAY),
-                    )
-                    .id_salt(egui::Id::new("thinking").with(msg_index).with(block_index))
-                    .default_open(false)
-                    .show(ui, |ui| {
-                        ui.label(egui::RichText::new(content).color(egui::Color32::GRAY));
-                    });
+                    ui.label(egui::RichText::new(content).color(egui::Color32::GRAY));
+                    rendered_any = true;
                 }
             }
             ContentBlock::ToolCall {
@@ -639,30 +633,37 @@ fn render_blocks(
                 name,
                 arguments,
             } => {
-                let header = format!("{name}({arguments})");
-                let has_result = tool_results.contains_key(id.as_str());
-                let mut col = egui::CollapsingHeader::new(
-                    egui::RichText::new(&header).color(egui::Color32::GRAY),
-                )
-                .id_salt(id);
+                // Manual toggle: clickable label with a triangle prefix.
+                // State stored in egui's temp data keyed by the tool call ID,
+                // defaulting to open when a result exists, closed otherwise.
+                let toggle_id = egui::Id::new("tool_toggle").with(id);
+                let default_open = tool_results.contains_key(id.as_str());
+                let mut open = ui
+                    .ctx()
+                    .data_mut(|d| *d.get_temp_mut_or(toggle_id, default_open));
 
-                if has_result {
-                    col = col.default_open(true);
-                    col.show(ui, |ui| {
-                        let (content, is_error) = tool_results[id.as_str()];
-                        let color = if is_error {
-                            egui::Color32::RED
-                        } else {
-                            egui::Color32::GRAY
-                        };
-                        ui.label(egui::RichText::new(content).color(color));
-                    });
-                } else {
-                    col = col.default_open(false);
-                    col.show(ui, |ui| {
-                        ui.label(egui::RichText::new("...").color(egui::Color32::DARK_GRAY));
-                    });
+                let arrow = if open { "▼" } else { "▶" };
+                let header_text = format!("{arrow} {name}({arguments})");
+                let response = ui.add(
+                    egui::Label::new(egui::RichText::new(&header_text).color(egui::Color32::GRAY))
+                        .sense(egui::Sense::click()),
+                );
+                if response.clicked() {
+                    open = !open;
+                    ui.ctx().data_mut(|d| d.insert_temp(toggle_id, open));
                 }
+
+                if open
+                    && let Some(&(content, is_error)) = tool_results.get(id.as_str())
+                {
+                    let color = if is_error {
+                        egui::Color32::RED
+                    } else {
+                        egui::Color32::GRAY
+                    };
+                    ui.label(egui::RichText::new(content).color(color));
+                }
+                rendered_any = true;
             }
             // Tool results are rendered inline under their paired tool-call
             // block via the tool_results index. Nothing to do here.
