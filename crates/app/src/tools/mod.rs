@@ -25,6 +25,7 @@ use anyhow::{Result, bail};
 
 use crate::stream::ToolDef;
 
+pub mod bash;
 pub mod edit_file;
 pub mod glob;
 pub mod grep;
@@ -32,6 +33,7 @@ pub mod hashlines;
 pub mod read_file;
 pub mod write_file;
 
+pub use bash::BashTool;
 pub use edit_file::EditFileTool;
 pub use glob::GlobTool;
 pub use grep::GrepTool;

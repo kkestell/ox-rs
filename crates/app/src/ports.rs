@@ -43,8 +43,12 @@ pub trait FileSystem: Send + Sync {
     ) -> impl Future<Output = Result<Vec<PathBuf>>> + Send;
 }
 
-pub trait Shell {
-    fn run(&self, command: &str) -> impl Future<Output = Result<CommandOutput>> + Send;
+pub trait Shell: Send + Sync {
+    fn run(
+        &self,
+        command: &str,
+        timeout: std::time::Duration,
+    ) -> impl Future<Output = Result<CommandOutput>> + Send;
 }
 
 #[derive(Debug, Clone)]
@@ -52,4 +56,5 @@ pub struct CommandOutput {
     pub stdout: String,
     pub stderr: String,
     pub exit_code: i32,
+    pub timed_out: bool,
 }

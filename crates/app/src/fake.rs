@@ -9,7 +9,7 @@ use domain::{Message, Session, SessionId, SessionSummary, StreamEvent, Usage};
 use futures::stream::{self, Stream};
 
 use crate::LlmProvider;
-use crate::ports::{FileSystem, SessionStore};
+use crate::ports::{CommandOutput, FileSystem, SessionStore};
 use crate::stream::ToolDef;
 use crate::tools::Tool;
 
@@ -388,6 +388,66 @@ impl Tool for FakeTool {
                 Err(e) => Err(anyhow::anyhow!("{e}")),
             }
         })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// FakeShell
+// ---------------------------------------------------------------------------
+
+/// Test double for `Shell`. Queued `CommandOutput` results consumed in FIFO
+/// order. Records every (command, timeout) pair for assertion.
+pub struct FakeShell {
+    results: Mutex<VecDeque<Result<CommandOutput, String>>>,
+    calls: Mutex<Vec<(String, std::time::Duration)>>,
+}
+
+impl Default for FakeShell {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl FakeShell {
+    pub fn new() -> Self {
+        Self {
+            results: Mutex::new(VecDeque::new()),
+            calls: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Queue a successful result.
+    pub fn push_output(&self, output: CommandOutput) {
+        self.results.lock().unwrap().push_back(Ok(output));
+    }
+
+    /// Queue an error result.
+    pub fn push_err(&self, msg: impl Into<String>) {
+        self.results.lock().unwrap().push_back(Err(msg.into()));
+    }
+
+    /// All (command, timeout) pairs passed to `run` so far.
+    pub fn calls(&self) -> Vec<(String, std::time::Duration)> {
+        self.calls.lock().unwrap().clone()
+    }
+}
+
+impl crate::ports::Shell for FakeShell {
+    async fn run(&self, command: &str, timeout: std::time::Duration) -> Result<CommandOutput> {
+        self.calls
+            .lock()
+            .unwrap()
+            .push((command.to_owned(), timeout));
+        match self
+            .results
+            .lock()
+            .unwrap()
+            .pop_front()
+            .expect("FakeShell: no results queued — did you forget to call push_output/push_err?")
+        {
+            Ok(output) => Ok(output),
+            Err(e) => Err(anyhow::anyhow!("{e}")),
+        }
     }
 }
 

@@ -12,12 +12,12 @@ Ox is a desktop AI coding assistant built in Rust. It uses a hexagonal (ports-an
 ## Codebase Map
 
 - `crates/domain/` — Core types: `Session`, `Message`, `ContentBlock`, `Role`, `SessionId`, `SessionSummary`, `StreamEvent`, `Usage`. All serde-derived so the same shapes serialize to disk *and* cross the GUI↔agent wire.
-- `crates/app/` — Application layer: port traits (`LlmProvider`, `SessionStore`, `SecretStore`, `FileSystem`, `Shell`), use cases (`SessionRunner`, `TurnEvent`), streaming (`StreamAccumulator`, `ToolDef`), tools (`Tool` trait, `ToolRegistry`, `ReadFileTool`, `WriteFileTool`, `EditFileTool`, `GlobTool`, `GrepTool`, hashline helpers). Re-exports `StreamEvent`/`Usage` from domain for caller convenience.
+- `crates/app/` — Application layer: port traits (`LlmProvider`, `SessionStore`, `SecretStore`, `FileSystem`, `Shell`), use cases (`SessionRunner`, `TurnEvent`), streaming (`StreamAccumulator`, `ToolDef`), tools (`Tool` trait, `ToolRegistry`, `ReadFileTool`, `WriteFileTool`, `EditFileTool`, `GlobTool`, `GrepTool`, `BashTool`, hashline helpers). Re-exports `StreamEvent`/`Usage` from domain for caller convenience.
 - `crates/protocol/` — Wire protocol between `ox-gui` and `ox-agent`: `AgentCommand`, `AgentEvent`, and `read_frame`/`write_frame` helpers. Depends only on `domain` — no dep on `app` so the wire types cannot accidentally leak application-layer concerns.
 - `crates/adapter-llm/` — LLM provider implementations: OpenRouter (streaming via SSE), Ollama (stub).
 - `crates/adapter-storage/` — Session persistence: `DiskSessionStore` (one JSON file per session).
 - `crates/adapter-egui/` — GUI library: `OxApp` (egui root), `AgentTab` (per-agent state), `AgentClient` (IPC client over stdio with reader/writer tasks), `AgentSpawnConfig`.
-- `crates/adapter-fs/` — Filesystem and shell: `LocalFileSystem` (implemented), `BashShell` (stub).
+- `crates/adapter-fs/` — Filesystem and shell: `LocalFileSystem` (implemented), `BashShell` (implemented — spawns `/bin/bash -c`, concurrent stdout/stderr capture, timeout via `tokio::time::timeout`, kill on timeout).
 - `crates/adapter-secrets/` — Secret retrieval: `EnvSecretStore` (implemented).
 - `crates/bin-gui/` — `ox-gui` binary: composition root for the GUI process. Parses CLI, locates the `ox-agent` binary, spawns the initial agent, passes a cloneable `AgentSpawnConfig` template to `OxApp` for `/new`, runs the egui window. Prints `ox-gui --resume <id>` per active session on shutdown.
 - `crates/bin-agent/` — `ox-agent` binary: composition root for the agent process. Parses CLI, wires adapters, builds a `SessionRunner`, and hands control to `driver::agent_driver` which drives NDJSON I/O over stdin/stdout.
@@ -150,12 +150,12 @@ Current status:
 - `bin-agent`: composition root for the agent process. CLI (`--workspace-root`, `--model`, `--sessions-dir`, `--resume`), wires adapters, runs `driver::agent_driver` over stdin/stdout. On fatal error, emits an `AgentEvent::Error` frame and exits non-zero.
 - `protocol`: `AgentCommand` (`SendMessage`), `AgentEvent` (`Ready`, `StreamDelta`, `MessageAppended`, `TurnComplete`, `Error`), `read_frame`/`write_frame` helpers. All enums `#[non_exhaustive]` for forward compatibility.
 - `adapter-egui`: `OxApp` renders all sessions as equal-width vertical splits via `ui.columns(N)`. `/new` spawns a new agent and appends a split; `/quit` closes the focused split (or exits the app on the last one). Focus is mouse-driven — clicking a split's input bar makes it active. Per-split state (messages, streaming accumulator, waiting flag, error, session_id) lives on `AgentTab`; per-split input strings live as a parallel `Vec<String>` on `OxApp` to avoid borrow conflicts. `AgentClient` owns the tokio::process `Child` with `kill_on_drop(true)`, runs reader/writer tasks, exposes a channel API.
-- `app::tools`: file tool suite — `read_file` (hashlined output with offset/limit), `write_file` (creates parent dirs), `edit_file` (replace/insert_after operations anchored by hashlines with mismatch detection), `glob` (find files by name pattern, sorted, truncated at 200), `grep` (search file contents by regex, returns path:line matches, truncated at 200, skips binary files).
+- `app::tools`: tool suite — `read_file` (hashlined output with offset/limit), `write_file` (creates parent dirs), `edit_file` (replace/insert_after operations anchored by hashlines with mismatch detection), `glob` (find files by name pattern, sorted, truncated at 200), `grep` (search file contents by regex, returns path:line matches, truncated at 200, skips binary files), `bash` (execute shell commands with configurable timeout, output truncation at 2000 lines / 100KB).
 - `adapter-llm/OpenRouterProvider`: implemented streaming path.
 - `adapter-llm/OllamaProvider`: stub.
 - `adapter-storage/DiskSessionStore`: implemented (load, save, list).
 - `adapter-fs/LocalFileSystem`: implemented.
-- `adapter-fs/BashShell`: stub.
+- `adapter-fs/BashShell`: implemented (spawns `/bin/bash -c`, concurrent stdout/stderr, timeout with kill).
 - `adapter-secrets/EnvSecretStore`: implemented.
 
 Not yet implemented:
@@ -165,4 +165,3 @@ Not yet implemented:
 - Graceful cancel of an in-progress turn. Today the model is "kill the agent subprocess" — dropping the `AgentClient` / `AgentTab` SIGKILLs the agent. A future `AgentCommand::Cancel` that preserves partial state is not yet wired.
 - Keyboard focus switching between splits (Ctrl+Left/Right or similar). Focus is mouse-driven only.
 - Tool-approval flow (tools auto-execute; destructive tools have no permission gate). Would require an `AgentEvent::ToolCallPending` + `AgentCommand::ApproveToolCall` protocol extension.
-- Bash tool (trait and registry are ready; `BashShell` is still a stub).

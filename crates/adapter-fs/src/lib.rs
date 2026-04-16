@@ -47,12 +47,66 @@ impl app::FileSystem for LocalFileSystem {
     }
 }
 
-pub struct BashShell;
+pub struct BashShell {
+    workspace_root: PathBuf,
+}
+
+impl BashShell {
+    pub fn new(workspace_root: PathBuf) -> Self {
+        Self { workspace_root }
+    }
+}
 
 impl app::Shell for BashShell {
-    async fn run(&self, _command: &str) -> Result<app::CommandOutput> {
-        // TODO: implement shell execution
-        todo!()
+    async fn run(&self, command: &str, timeout: std::time::Duration) -> Result<app::CommandOutput> {
+        use tokio::io::AsyncReadExt;
+
+        let mut child = tokio::process::Command::new("/bin/bash")
+            .args(["-c", command])
+            .current_dir(&self.workspace_root)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .context("failed to spawn /bin/bash")?;
+
+        // Take ownership of the pipe handles so we can read them concurrently.
+        // Reading both via tokio::join! avoids pipe-buffer deadlocks that would
+        // occur if we read one to completion before touching the other.
+        let mut stdout_pipe = child.stdout.take().expect("stdout piped");
+        let mut stderr_pipe = child.stderr.take().expect("stderr piped");
+
+        let io_and_wait = async {
+            let mut stdout_buf = Vec::new();
+            let mut stderr_buf = Vec::new();
+            let (stdout_res, stderr_res) = tokio::join!(
+                stdout_pipe.read_to_end(&mut stdout_buf),
+                stderr_pipe.read_to_end(&mut stderr_buf),
+            );
+            stdout_res.context("reading stdout")?;
+            stderr_res.context("reading stderr")?;
+            let status = child.wait().await.context("waiting for child")?;
+            Ok::<_, anyhow::Error>((stdout_buf, stderr_buf, status))
+        };
+
+        match tokio::time::timeout(timeout, io_and_wait).await {
+            Ok(Ok((stdout_buf, stderr_buf, status))) => Ok(app::CommandOutput {
+                stdout: String::from_utf8_lossy(&stdout_buf).into_owned(),
+                stderr: String::from_utf8_lossy(&stderr_buf).into_owned(),
+                exit_code: status.code().unwrap_or(-1),
+                timed_out: false,
+            }),
+            Ok(Err(e)) => Err(e),
+            Err(_elapsed) => {
+                // Timeout — kill the process and recover any partial output.
+                let _ = child.kill().await;
+                Ok(app::CommandOutput {
+                    stdout: String::new(),
+                    stderr: String::new(),
+                    exit_code: -1,
+                    timed_out: true,
+                })
+            }
+        }
     }
 }
 
@@ -190,5 +244,94 @@ mod tests {
         // not an error — so walk_glob returns an empty vec.
         let results = fs().walk_glob(&missing, "*.rs").await.unwrap();
         assert!(results.is_empty());
+    }
+
+    // -- BashShell tests --
+
+    use app::Shell;
+
+    fn shell(dir: &std::path::Path) -> BashShell {
+        BashShell::new(dir.to_path_buf())
+    }
+
+    /// Default timeout for BashShell integration tests — generous enough that
+    /// even slow CI runners won't flake.
+    const TEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+    #[tokio::test]
+    async fn bash_echo_captures_stdout() {
+        let tmp = TempDir::new().unwrap();
+        let out = shell(tmp.path())
+            .run("echo hello", TEST_TIMEOUT)
+            .await
+            .unwrap();
+        assert_eq!(out.stdout.trim(), "hello");
+        assert_eq!(out.exit_code, 0);
+        assert!(!out.timed_out);
+    }
+
+    #[tokio::test]
+    async fn bash_pwd_uses_workspace_root() {
+        let tmp = TempDir::new().unwrap();
+        let out = shell(tmp.path()).run("pwd", TEST_TIMEOUT).await.unwrap();
+        // Canonicalize both sides because tmpdir may be behind a symlink
+        // (e.g. /tmp -> /private/tmp on macOS).
+        let expected = tmp.path().canonicalize().unwrap();
+        let actual = PathBuf::from(out.stdout.trim()).canonicalize().unwrap();
+        assert_eq!(actual, expected);
+    }
+
+    #[tokio::test]
+    async fn bash_captures_stderr() {
+        let tmp = TempDir::new().unwrap();
+        let out = shell(tmp.path())
+            .run("echo oops >&2", TEST_TIMEOUT)
+            .await
+            .unwrap();
+        assert_eq!(out.stderr.trim(), "oops");
+        assert!(out.stdout.trim().is_empty());
+    }
+
+    #[tokio::test]
+    async fn bash_nonzero_exit_code() {
+        let tmp = TempDir::new().unwrap();
+        let out = shell(tmp.path())
+            .run("exit 42", TEST_TIMEOUT)
+            .await
+            .unwrap();
+        assert_eq!(out.exit_code, 42);
+        assert!(!out.timed_out);
+    }
+
+    #[tokio::test]
+    async fn bash_timeout_kills_process() {
+        let tmp = TempDir::new().unwrap();
+        let out = shell(tmp.path())
+            .run("sleep 999", std::time::Duration::from_millis(100))
+            .await
+            .unwrap();
+        assert!(out.timed_out);
+        assert_eq!(out.exit_code, -1);
+        assert!(out.stdout.is_empty());
+        assert!(out.stderr.is_empty());
+    }
+
+    #[tokio::test]
+    async fn bash_concurrent_stdout_stderr_no_deadlock() {
+        let tmp = TempDir::new().unwrap();
+        // Write enough data to both pipes that sequential reads would
+        // deadlock on a full pipe buffer (~64KB on Linux).
+        let out = shell(tmp.path())
+            .run(
+                "for i in $(seq 1 5000); do echo out_$i; echo err_$i >&2; done",
+                TEST_TIMEOUT,
+            )
+            .await
+            .unwrap();
+        assert_eq!(out.exit_code, 0);
+        assert!(!out.timed_out);
+        // Spot-check that output from both pipes was captured.
+        assert!(out.stdout.contains("out_5000"));
+        assert!(out.stderr.contains("err_5000"));
     }
 }
