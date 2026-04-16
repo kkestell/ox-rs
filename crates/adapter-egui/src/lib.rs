@@ -131,8 +131,9 @@ impl AgentTab {
     }
 }
 
-/// Top-level GUI state. Owns a vector of agent tabs displayed as equal-width
-/// vertical splits. `focused` indexes the split whose input bar receives
+/// Top-level GUI state. Owns a vector of agent tabs displayed as resizable
+/// vertical splits (side panels + central panel). `focused` indexes the
+/// split whose input bar receives
 /// keystrokes. Each split has its own input string in `inputs` (parallel to
 /// `tabs`) so rendering can borrow `&mut inputs[i]` and `&tabs[i]`
 /// simultaneously — Rust can split-borrow distinct struct fields but not
@@ -268,28 +269,40 @@ impl eframe::App for OxApp {
         // no post-exit state.
         self.publish_session_ids();
 
-        // Tiling layout: N equal-width vertical columns, one per agent
-        // session. Each column is a self-contained split with its own
-        // scroll area, message history, streaming view, error display,
-        // and input bar.
+        // Tiling layout: N resizable vertical panels, one per agent
+        // session. The first N-1 splits live in SidePanels (resizable by
+        // dragging their edge); the last split fills the CentralPanel.
         //
-        // Borrow-checker constraint: inside the `columns()` closure we
-        // can't call `&mut self` methods, so we collect "actions to
-        // perform" into a local vec and execute them after the closure.
+        // Borrow-checker constraint: we can't call `&mut self` methods
+        // while borrowing tabs/inputs, so we collect deferred "actions"
+        // and execute them after all panels are rendered.
         let mut actions: Vec<SplitAction> = Vec::new();
         let mut new_focus: Option<usize> = None;
         let any_waiting = self.tabs.iter().any(|t| t.waiting);
+        let n = self.tabs.len();
 
-        egui::CentralPanel::default().show(ctx, |ui| {
-            let n = self.tabs.len();
-            ui.columns(n, |cols| {
-                for (i, col) in cols.iter_mut().enumerate() {
+        // Default width for each panel: divide the viewport evenly.
+        let default_width = ctx.screen_rect().width() / n as f32;
+
+        // Splits 0..N-2 go in SidePanels.
+        for i in 0..n.saturating_sub(1) {
+            egui::SidePanel::left(format!("split_{i}"))
+                .default_width(default_width)
+                .min_width(120.0)
+                .resizable(true)
+                .show(ctx, |ui| {
                     let tab = &self.tabs[i];
                     let input = &mut self.inputs[i];
+                    render_split(ui, tab, input, i, &mut actions, &mut new_focus);
+                });
+        }
 
-                    render_split(col, tab, input, i, &mut actions, &mut new_focus);
-                }
-            });
+        // The last split fills the remaining space.
+        let last = n - 1;
+        egui::CentralPanel::default().show(ctx, |ui| {
+            let tab = &self.tabs[last];
+            let input = &mut self.inputs[last];
+            render_split(ui, tab, input, last, &mut actions, &mut new_focus);
         });
 
         // Apply focus changes detected inside the render closure.
