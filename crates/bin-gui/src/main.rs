@@ -28,8 +28,8 @@ struct Cli {
     #[arg(long)]
     resume: Option<SessionId>,
 
-    /// Override the OpenRouter model ID. Defaults to DeepSeek R1.
-    #[arg(long, default_value = "deepseek/deepseek-r1")]
+    /// Override the OpenRouter model ID.
+    #[arg(long, default_value = "qwen/qwen3-235b-a22b-2507")]
     model: String,
 }
 
