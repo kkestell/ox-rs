@@ -69,7 +69,6 @@ impl<L: LlmProvider, S: SessionStore> SessionRunner<L, S> {
     ) -> Result<SessionId> {
         let mut session = Session::new(id, workspace_root);
         self.run_turn(&mut session, input, on_event).await?;
-        self.store.save(&session).await?;
         Ok(id)
     }
 
@@ -82,7 +81,6 @@ impl<L: LlmProvider, S: SessionStore> SessionRunner<L, S> {
     ) -> Result<()> {
         let mut session = self.store.load(id).await?;
         self.run_turn(&mut session, input, on_event).await?;
-        self.store.save(&session).await?;
         Ok(())
     }
 
@@ -100,6 +98,9 @@ impl<L: LlmProvider, S: SessionStore> SessionRunner<L, S> {
     /// `ToolResult { is_error: true }` messages rather than bubbling up;
     /// the LLM then gets to see the error and try again. Only *structural*
     /// failures (LLM stream error, storage failure, iteration cap) propagate.
+    ///
+    /// The session is persisted after every message append so that a killed
+    /// agent never loses work that was already streamed to the GUI.
     async fn run_turn(
         &self,
         session: &mut Session,
@@ -113,6 +114,7 @@ impl<L: LlmProvider, S: SessionStore> SessionRunner<L, S> {
         on_event(TurnEvent::MessageAppended(
             session.messages.last().expect("just pushed"),
         ));
+        self.store.save(session).await?;
 
         for _ in 0..MAX_LOOP_ITERATIONS {
             // Expose tool schemas only if we actually have tools registered
@@ -131,6 +133,7 @@ impl<L: LlmProvider, S: SessionStore> SessionRunner<L, S> {
             on_event(TurnEvent::MessageAppended(
                 session.messages.last().expect("just pushed"),
             ));
+            self.store.save(session).await?;
 
             let tool_calls = extract_tool_calls(&response);
             if tool_calls.is_empty() {
@@ -154,6 +157,7 @@ impl<L: LlmProvider, S: SessionStore> SessionRunner<L, S> {
                 on_event(TurnEvent::MessageAppended(
                     session.messages.last().expect("just pushed"),
                 ));
+                self.store.save(session).await?;
             }
         }
 
@@ -331,6 +335,56 @@ mod tests {
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("dns failure"));
         assert!(deltas.is_empty());
+    }
+
+    // -- incremental persistence --
+
+    #[tokio::test]
+    async fn user_message_persisted_even_when_llm_fails() {
+        // Before this fix, a connection error meant the session was never
+        // saved — the user message was lost entirely. Now save() fires
+        // after each push_message, so the user message survives.
+        let llm = FakeLlmProvider::new();
+        llm.push_error("connection refused");
+        let store = FakeSessionStore::new();
+        let runner = make_runner(llm, store, ToolRegistry::new());
+        let id = SessionId::new_v4();
+
+        let result = runner.start(id, "/p".into(), "hi", |_| {}).await;
+        assert!(result.is_err());
+
+        // The session should be on disk with the user message.
+        let saved = runner.store.get(id).expect("session should be persisted");
+        assert_eq!(saved.messages.len(), 1);
+        assert_eq!(saved.messages[0].role, Role::User);
+        assert_eq!(saved.messages[0].text(), "hi");
+    }
+
+    #[tokio::test]
+    async fn partial_tool_loop_persisted_on_error() {
+        // If the LLM fails on the second iteration (after one tool call
+        // completed), the session should contain everything up to the
+        // failure point: user + assistant(tool_call) + tool_result.
+        let llm = FakeLlmProvider::new();
+        llm.push_tool_call("c1", "t", "{}");
+        llm.push_error("server error");
+
+        let t = Arc::new(FakeTool::new("t"));
+        t.push_ok("tool-output");
+        let tools = tool_registry_with(vec![t as Arc<dyn Tool>]);
+
+        let store = FakeSessionStore::new();
+        let runner = make_runner(llm, store, tools);
+        let id = SessionId::new_v4();
+
+        let result = runner.start(id, "/p".into(), "hi", |_| {}).await;
+        assert!(result.is_err());
+
+        let saved = runner.store.get(id).expect("session should be persisted");
+        assert_eq!(saved.messages.len(), 3);
+        assert_eq!(saved.messages[0].role, Role::User);
+        assert_eq!(saved.messages[1].role, Role::Assistant);
+        assert_eq!(saved.messages[2].role, Role::Tool);
     }
 
     // -- mid-stream error --
