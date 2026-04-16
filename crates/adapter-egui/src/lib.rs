@@ -590,9 +590,10 @@ fn render_split(
 /// - **User text**: cornflower blue.
 /// - **Assistant text**: white.
 /// - **Thinking**: gray, rendered inline (no collapsing).
-/// - **Tool calls**: clickable toggle header `▼ name(args)` / `▶ name(args)`.
-///   Body shows the paired tool result. Open/closed state stored in egui's
-///   per-frame `Memory` keyed by the tool call ID.
+/// - **Tool calls**: clickable toggle header with white triangle + gray
+///   monospace `name(args)`. Body shows the paired tool result indented and
+///   in gray monospace. Open/closed state stored in egui's per-frame
+///   `Memory` keyed by the tool call ID.
 /// - **Tool results**: not rendered standalone — consumed via the tool call
 ///   index and shown inside their paired tool call's body.
 fn render_blocks(
@@ -625,7 +626,7 @@ fn render_blocks(
             }
             ContentBlock::Reasoning { content, .. } => {
                 if !content.is_empty() {
-                    ui.label(egui::RichText::new(content).color(egui::Color32::GRAY));
+                    ui.label(egui::RichText::new(content).color(egui::Color32::WHITE));
                     rendered_any = true;
                 }
             }
@@ -634,7 +635,7 @@ fn render_blocks(
                 name,
                 arguments,
             } => {
-                // Manual toggle: clickable label with a triangle prefix.
+                // Manual toggle: clickable header with a triangle prefix.
                 // State stored in egui's temp data keyed by the tool call ID,
                 // defaulting to open when a result exists, closed otherwise.
                 let toggle_id = egui::Id::new("tool_toggle").with(id);
@@ -643,13 +644,54 @@ fn render_blocks(
                     .ctx()
                     .data_mut(|d| *d.get_temp_mut_or(toggle_id, default_open));
 
-                let arrow = if open { "▼" } else { "▶" };
-                let header_text = format!("{arrow} {name}({arguments})");
-                let response = ui.add(
-                    egui::Label::new(egui::RichText::new(&header_text).color(egui::Color32::GREEN))
-                        .sense(egui::Sense::click()),
-                );
-                if response.clicked() {
+                let tool_color = egui::Color32::from_rgb(160, 160, 160);
+                let header_text = format!("{name}({arguments})");
+                let item_spacing = 4.0_f32;
+                let font_height = ui.text_style_height(&egui::TextStyle::Body);
+                let tri_size = font_height * 0.5;
+                // Total left offset from the triangle widget + gap so
+                // the output text aligns with the tool name.
+                let output_indent = tri_size + item_spacing;
+
+                let clicked = ui
+                    .horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = item_spacing;
+                        let (tri_rect, tri_response) =
+                            ui.allocate_exact_size(egui::vec2(tri_size, font_height), egui::Sense::click());
+                        let center = tri_rect.center();
+                        let half = tri_size * 0.5;
+                        let points = if open {
+                            // Down-pointing triangle
+                            vec![
+                                egui::pos2(center.x - half, center.y - half * 0.5),
+                                egui::pos2(center.x + half, center.y - half * 0.5),
+                                egui::pos2(center.x, center.y + half * 0.5),
+                            ]
+                        } else {
+                            // Right-pointing triangle
+                            vec![
+                                egui::pos2(center.x - half * 0.5, center.y - half),
+                                egui::pos2(center.x + half * 0.5, center.y),
+                                egui::pos2(center.x - half * 0.5, center.y + half),
+                            ]
+                        };
+                        ui.painter().add(egui::Shape::convex_polygon(
+                            points,
+                            egui::Color32::WHITE,
+                            egui::Stroke::NONE,
+                        ));
+                        let r2 = ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(&header_text)
+                                    .color(tool_color)
+                                    .monospace(),
+                            )
+                            .sense(egui::Sense::click()),
+                        );
+                        tri_response.clicked() || r2.clicked()
+                    })
+                    .inner;
+                if clicked {
                     open = !open;
                     ui.ctx().data_mut(|d| d.insert_temp(toggle_id, open));
                 }
@@ -657,12 +699,20 @@ fn render_blocks(
                 if open
                     && let Some(&(content, is_error)) = tool_results.get(id.as_str())
                 {
-                    let color = if is_error {
+                    let output_color = if is_error {
                         egui::Color32::RED
                     } else {
-                        egui::Color32::GREEN
+                        egui::Color32::from_rgb(140, 140, 140)
                     };
-                    ui.label(egui::RichText::new(content).color(color));
+                    let trimmed = content.trim_end_matches(|c| c == '\n' || c == ' ');
+                    ui.horizontal(|ui| {
+                        ui.add_space(output_indent);
+                        ui.label(
+                            egui::RichText::new(trimmed)
+                                .color(output_color)
+                                .monospace(),
+                        );
+                    });
                 }
                 rendered_any = true;
             }

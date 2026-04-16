@@ -19,7 +19,7 @@
 //! disambiguate collisions. That's enough: the hash exists to detect *drift*,
 //! not to globally identify lines.
 
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 
 /// Encodes a `u32` as a left-padded 3-character base-36 string.
 ///
@@ -95,7 +95,7 @@ pub fn render_with_hashlines(text: &str, start_line_1_indexed: usize) -> String 
     let mut out = String::with_capacity(text.len() + lines.len() * 8);
     for (i, line) in lines.iter().enumerate() {
         let n = start_line_1_indexed + i;
-        out.push_str(&format!("{n}:{}| {line}", hash_line(line)));
+        out.push_str(&format!("{n:04}:{}| {line}", hash_line(line)));
         // Every rendered line gets its own newline except optionally the last
         // one, which matches the input's trailing shape.
         if i + 1 < lines.len() || trailing_newline {
@@ -243,15 +243,15 @@ mod tests {
     fn render_uses_provided_start_line() {
         let out = render_with_hashlines("x\ny\n", 10);
         // First line is numbered 10, second 11.
-        assert!(out.starts_with("10:"), "got {out:?}");
+        assert!(out.starts_with("0010:"), "got {out:?}");
         let second_line = out.lines().nth(1).unwrap();
-        assert!(second_line.starts_with("11:"), "got {second_line:?}");
+        assert!(second_line.starts_with("0011:"), "got {second_line:?}");
     }
 
     #[test]
     fn render_single_line_no_newline() {
         let out = render_with_hashlines("solo", 1);
-        assert!(out.starts_with("1:"));
+        assert!(out.starts_with("0001:"));
         assert!(out.contains("| solo"));
         assert!(!out.ends_with('\n'));
     }

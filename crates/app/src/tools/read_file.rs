@@ -194,8 +194,8 @@ mod tests {
         // Two lines, each with a hashline prefix.
         let lines: Vec<_> = out.lines().collect();
         assert_eq!(lines.len(), 2);
-        assert!(lines[0].starts_with(&format!("1:{}| alpha", hash_line("alpha"))));
-        assert!(lines[1].starts_with(&format!("2:{}| beta", hash_line("beta"))));
+        assert!(lines[0].starts_with(&format!("0001:{}| alpha", hash_line("alpha"))));
+        assert!(lines[1].starts_with(&format!("0002:{}| beta", hash_line("beta"))));
         // No truncation notice — whole file fit.
         assert!(!out.contains("[truncated"));
     }
@@ -245,8 +245,8 @@ mod tests {
         // 2 content lines + 1 truncation notice line.
         assert_eq!(lines.len(), 3, "got {lines:?}");
         // Line numbers in hashlines are 1-indexed ABSOLUTE — line 3, line 4.
-        assert!(lines[0].starts_with("3:"), "got {:?}", lines[0]);
-        assert!(lines[1].starts_with("4:"), "got {:?}", lines[1]);
+        assert!(lines[0].starts_with("0003:"), "got {:?}", lines[0]);
+        assert!(lines[1].starts_with("0004:"), "got {:?}", lines[1]);
         // Truncation notice mentions the window and the total.
         assert!(lines[2].contains("[truncated"), "got {:?}", lines[2]);
         assert!(lines[2].contains("3-4"), "got {:?}", lines[2]);
