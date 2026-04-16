@@ -704,7 +704,7 @@ fn render_blocks(
                     } else {
                         egui::Color32::from_rgb(140, 140, 140)
                     };
-                    let trimmed = content.trim_end_matches(|c| c == '\n' || c == ' ');
+                    let trimmed = content.trim_end_matches(['\n', ' ']);
                     ui.horizontal(|ui| {
                         ui.add_space(output_indent);
                         ui.label(
