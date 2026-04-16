@@ -43,26 +43,13 @@ Ox is a desktop AI coding assistant built in Rust. It uses a hexagonal (ports-an
 
 ## Architecture
 
-These diagrams must be kept up to date at all times.
+Layered from top (composition) to bottom (pure types):
 
-Use separate diagrams for separate questions. Do not collapse structure, crate dependencies, and runtime flow into one graph.
+- **Binaries** (`bin-gui`, `bin-agent`) — compose adapters; `bin-agent` also depends on `protocol` directly.
+- **Adapters** (`adapter-egui`, `adapter-llm`, `adapter-storage`, `adapter-fs`, `adapter-secrets`) — depend on `app` ports; `adapter-egui` also depends on `protocol`.
+- **Application** (`app`) and **Wire protocol** (`protocol`) — siblings; both depend on `domain` and neither depends on the other. `protocol` deliberately avoids `app` so wire types can't drag in application behavior.
+- **Domain** (`domain`) — no internal deps.
 
-### Structural Layers
+`bin-gui` doesn't depend on `bin-agent` — the only coupling between the two processes is the `protocol` crate.
 
-The stable architectural shape.
-
-```mermaid
-flowchart TB
-    binaries["Binaries<br/>bin-gui (ox-gui) · bin-agent (ox-agent)"]
-    adapters["Adapters<br/>adapter-egui · adapter-llm · adapter-storage · adapter-fs · adapter-secrets"]
-    app_layer["Application<br/>app: ports · use_cases · stream · tools"]
-    protocol["Wire protocol<br/>protocol: AgentCommand · AgentEvent · framing"]
-    domain["Domain<br/>Session · Message · ContentBlock · Role · SessionId · SessionSummary · StreamEvent · Usage"]
-
-    binaries --> adapters
-    binaries --> protocol
-    adapters --> protocol
-    adapters --> app_layer
-    app_layer --> domain
-    protocol --> domain
-```
+(No diagrams. Mermaid can't lay out a 5-node DAG without crossing edges, so prose wins.)
