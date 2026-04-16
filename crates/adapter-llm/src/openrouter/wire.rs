@@ -1,3 +1,4 @@
+use anyhow::Result;
 use app::ToolDef;
 use domain::{ContentBlock, Message, Role};
 use serde::{Deserialize, Serialize};
@@ -123,8 +124,11 @@ pub struct SseUsage {
 // ---------------------------------------------------------------------------
 
 impl RequestBody {
-    pub fn from_messages(model: &str, messages: &[Message], tools: &[ToolDef]) -> Self {
-        let wire_messages: Vec<WireMessage> = messages.iter().map(wire_message).collect();
+    pub fn from_messages(model: &str, messages: &[Message], tools: &[ToolDef]) -> Result<Self> {
+        let wire_messages: Vec<WireMessage> = messages
+            .iter()
+            .map(wire_message)
+            .collect::<Result<Vec<_>>>()?;
 
         let wire_tools: Vec<WireTool> = tools
             .iter()
@@ -138,28 +142,28 @@ impl RequestBody {
             })
             .collect();
 
-        Self {
+        Ok(Self {
             model: model.to_owned(),
             messages: wire_messages,
             stream: true,
             reasoning: Some(serde_json::json!({})),
             include_reasoning: Some(true),
             tools: wire_tools,
-        }
+        })
     }
 }
 
 /// Convert a domain `Message` into the wire format OpenRouter expects.
 /// Reasoning blocks are intentionally omitted — the API does not accept them
 /// as input, only produces them in responses.
-fn wire_message(msg: &Message) -> WireMessage {
+fn wire_message(msg: &Message) -> Result<WireMessage> {
     match msg.role {
-        Role::User => WireMessage {
+        Role::User => Ok(WireMessage {
             role: "user".to_owned(),
             content: Some(msg.text()),
             tool_calls: None,
             tool_call_id: None,
-        },
+        }),
         Role::Assistant => {
             let tool_calls: Vec<WireToolCall> = msg
                 .content
@@ -181,7 +185,7 @@ fn wire_message(msg: &Message) -> WireMessage {
                 })
                 .collect();
 
-            WireMessage {
+            Ok(WireMessage {
                 role: "assistant".to_owned(),
                 content: {
                     let t = msg.text();
@@ -193,10 +197,12 @@ fn wire_message(msg: &Message) -> WireMessage {
                     Some(tool_calls)
                 },
                 tool_call_id: None,
-            }
+            })
         }
         Role::Tool => {
-            // A tool message has exactly one ToolResult block.
+            // A tool message must have exactly one ToolResult block — producing
+            // an empty tool_call_id / empty content would silently poison the
+            // wire request, so we fail loudly instead.
             let (call_id, content) = msg
                 .content
                 .iter()
@@ -208,14 +214,14 @@ fn wire_message(msg: &Message) -> WireMessage {
                     } => Some((tool_call_id.clone(), content.clone())),
                     _ => None,
                 })
-                .unwrap_or_default();
+                .ok_or_else(|| anyhow::anyhow!("Role::Tool message has no ToolResult block"))?;
 
-            WireMessage {
+            Ok(WireMessage {
                 role: "tool".to_owned(),
                 content: Some(content),
                 tool_calls: None,
                 tool_call_id: Some(call_id),
-            }
+            })
         }
     }
 }
@@ -227,7 +233,7 @@ mod tests {
     #[test]
     fn user_message_conversion() {
         let msg = Message::user("hello");
-        let wire = wire_message(&msg);
+        let wire = wire_message(&msg).unwrap();
         assert_eq!(wire.role, "user");
         assert_eq!(wire.content.as_deref(), Some("hello"));
         assert!(wire.tool_calls.is_none());
@@ -239,7 +245,7 @@ mod tests {
         let msg = Message::assistant(vec![ContentBlock::Text {
             text: "reply".into(),
         }]);
-        let wire = wire_message(&msg);
+        let wire = wire_message(&msg).unwrap();
         assert_eq!(wire.role, "assistant");
         assert_eq!(wire.content.as_deref(), Some("reply"));
         assert!(wire.tool_calls.is_none());
@@ -252,7 +258,7 @@ mod tests {
             name: "read_file".into(),
             arguments: r#"{"path":"a.rs"}"#.into(),
         }]);
-        let wire = wire_message(&msg);
+        let wire = wire_message(&msg).unwrap();
         assert_eq!(wire.role, "assistant");
         assert!(wire.content.is_none());
         let calls = wire.tool_calls.unwrap();
@@ -265,11 +271,36 @@ mod tests {
     #[test]
     fn tool_result_conversion() {
         let msg = Message::tool_result("call_1", "file contents here", false);
-        let wire = wire_message(&msg);
+        let wire = wire_message(&msg).unwrap();
         assert_eq!(wire.role, "tool");
         assert_eq!(wire.content.as_deref(), Some("file contents here"));
         assert_eq!(wire.tool_call_id.as_deref(), Some("call_1"));
         assert!(wire.tool_calls.is_none());
+    }
+
+    #[test]
+    fn tool_result_with_empty_content_is_valid() {
+        let msg = Message::tool_result("call_1", "", false);
+        let wire = wire_message(&msg).unwrap();
+        assert_eq!(wire.role, "tool");
+        assert_eq!(wire.content.as_deref(), Some(""));
+        assert_eq!(wire.tool_call_id.as_deref(), Some("call_1"));
+    }
+
+    #[test]
+    fn wire_message_errors_on_role_tool_without_tool_result_block() {
+        let msg = Message {
+            role: Role::Tool,
+            content: vec![ContentBlock::Text {
+                text: "wrong".into(),
+            }],
+            token_count: 0,
+        };
+        let err = wire_message(&msg).unwrap_err();
+        assert!(
+            err.to_string().contains("no ToolResult block"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
@@ -285,7 +316,7 @@ mod tests {
                 text: "answer".into(),
             },
         ]);
-        let wire = wire_message(&msg);
+        let wire = wire_message(&msg).unwrap();
         assert_eq!(wire.content.as_deref(), Some("answer"));
         assert!(wire.tool_calls.is_none());
     }
@@ -297,7 +328,7 @@ mod tests {
             description: "Read a file".into(),
             parameters: serde_json::json!({"type": "object"}),
         }];
-        let body = RequestBody::from_messages("test-model", &[], &tools);
+        let body = RequestBody::from_messages("test-model", &[], &tools).unwrap();
         assert_eq!(body.model, "test-model");
         assert!(body.stream);
         assert_eq!(body.tools.len(), 1);

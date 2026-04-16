@@ -130,6 +130,7 @@ dependencies = [
  "app",
  "domain",
  "tempfile",
+ "tokio",
 ]
 
 [[package]]

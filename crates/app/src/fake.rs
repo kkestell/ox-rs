@@ -201,10 +201,7 @@ impl SessionStore for FakeSessionStore {
         let guard = self.sessions.lock().unwrap();
         let summaries = guard
             .values()
-            .map(|s| SessionSummary {
-                id: s.id,
-                message_count: s.messages.len(),
-            })
+            .map(|s| SessionSummary { id: s.id })
             .collect();
         Ok(summaries)
     }
@@ -263,7 +260,7 @@ impl Default for FakeFileSystem {
 }
 
 impl FileSystem for FakeFileSystem {
-    fn read(&self, path: &Path) -> Result<String> {
+    async fn read(&self, path: &Path) -> Result<String> {
         self.files
             .lock()
             .unwrap()
@@ -272,7 +269,7 @@ impl FileSystem for FakeFileSystem {
             .ok_or_else(|| anyhow::anyhow!("FakeFileSystem: no file at {}", path.display()))
     }
 
-    fn write(&self, path: &Path, content: &str) -> Result<()> {
+    async fn write(&self, path: &Path, content: &str) -> Result<()> {
         // Mirror `LocalFileSystem::write`'s parent-dir-creation behavior so
         // tests that exercise "writes into a new subdirectory" produce the
         // same observable outcome in-memory as on disk.
@@ -483,9 +480,7 @@ mod tests {
         let store = FakeSessionStore::new();
 
         let id1 = SessionId::new_v4();
-        let mut s1 = Session::new(id1, "/a".into());
-        s1.push_message(Message::user("hi"));
-        s1.push_message(Message::user("there"));
+        let s1 = Session::new(id1, "/a".into());
         store.save(&s1).await.unwrap();
 
         let id2 = SessionId::new_v4();
@@ -494,11 +489,7 @@ mod tests {
 
         let summaries = store.list().await.unwrap();
         assert_eq!(summaries.len(), 2);
-
-        // Find each summary by ID and check message counts.
-        let sum1 = summaries.iter().find(|s| s.id == id1).unwrap();
-        assert_eq!(sum1.message_count, 2);
-        let sum2 = summaries.iter().find(|s| s.id == id2).unwrap();
-        assert_eq!(sum2.message_count, 0);
+        assert!(summaries.iter().any(|s| s.id == id1));
+        assert!(summaries.iter().any(|s| s.id == id2));
     }
 }

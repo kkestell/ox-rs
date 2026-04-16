@@ -7,7 +7,7 @@ mod use_cases;
 pub mod fake;
 
 pub use ports::*;
-pub use stream::{StreamAccumulator, ToolDef};
+pub use stream::{Snapshot, StreamAccumulator, ToolDef};
 pub use tools::{EditFileTool, ReadFileTool, Tool, ToolRegistry, WriteFileTool};
 pub use use_cases::{SessionRunner, TurnEvent};
 

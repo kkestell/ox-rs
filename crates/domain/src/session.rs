@@ -35,7 +35,6 @@ impl FromStr for SessionId {
 #[derive(Debug, Clone)]
 pub struct SessionSummary {
     pub id: SessionId,
-    pub message_count: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

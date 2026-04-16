@@ -93,6 +93,7 @@ impl<F: FileSystem + Send + Sync + 'static> Tool for ReadFileTool<F> {
             let content = self
                 .fs
                 .read(&path)
+                .await
                 .with_context(|| format!("read_file: could not read {}", path.display()))?;
 
             // Empty files round-trip as empty — no hashlines, no truncation

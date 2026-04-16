@@ -72,6 +72,7 @@ impl<F: FileSystem + Send + Sync + 'static> Tool for WriteFileTool<F> {
             let bytes = parsed.content.len();
             self.fs
                 .write(&path, &parsed.content)
+                .await
                 .with_context(|| format!("write_file: could not write {}", path.display()))?;
 
             Ok(format!(

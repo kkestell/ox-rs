@@ -29,9 +29,9 @@ pub trait SecretStore {
     fn get(&self, key: &str) -> Result<Option<String>>;
 }
 
-pub trait FileSystem {
-    fn read(&self, path: &Path) -> Result<String>;
-    fn write(&self, path: &Path, content: &str) -> Result<()>;
+pub trait FileSystem: Send + Sync {
+    fn read(&self, path: &Path) -> impl Future<Output = Result<String>> + Send;
+    fn write(&self, path: &Path, content: &str) -> impl Future<Output = Result<()>> + Send;
 }
 
 pub trait Shell {

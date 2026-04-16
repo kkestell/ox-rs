@@ -172,6 +172,7 @@ impl<F: FileSystem + Send + Sync + 'static> Tool for EditFileTool<F> {
             let original = self
                 .fs
                 .read(&path)
+                .await
                 .with_context(|| format!("edit_file: could not read {}", path.display()))?;
 
             let had_trailing_newline = original.ends_with('\n');
@@ -207,6 +208,7 @@ impl<F: FileSystem + Send + Sync + 'static> Tool for EditFileTool<F> {
 
             self.fs
                 .write(&path, &output)
+                .await
                 .with_context(|| format!("edit_file: could not write {}", path.display()))?;
 
             Ok(format!(

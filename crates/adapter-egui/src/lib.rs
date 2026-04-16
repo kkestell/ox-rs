@@ -265,7 +265,7 @@ impl eframe::App for OxApp {
                     if let Some(acc) = &tab.streaming {
                         let snapshot = acc.snapshot();
                         ui.label(egui::RichText::new("Ox").strong());
-                        render_blocks(ui, &snapshot.content);
+                        render_blocks(ui, snapshot.content);
                         ui.add_space(8.0);
                     } else if tab.waiting {
                         ui.label("...");
@@ -583,7 +583,10 @@ mod tests {
         .await
         .unwrap();
         let snap = tab.streaming.as_ref().unwrap().snapshot();
-        assert_eq!(snap.text(), "hello world");
+        match &snap.content[0] {
+            ContentBlock::Text { text } => assert_eq!(text, "hello world"),
+            _ => panic!("expected Text block"),
+        }
     }
 
     #[test]

@@ -23,7 +23,8 @@ impl DiskSessionStore {
 impl app::SessionStore for DiskSessionStore {
     async fn load(&self, id: SessionId) -> Result<Session> {
         let path = self.session_path(id);
-        let data = std::fs::read_to_string(&path)
+        let data = tokio::fs::read_to_string(&path)
+            .await
             .with_context(|| format!("failed to read session file {}", path.display()))?;
         let session: Session = serde_json::from_str(&data)
             .with_context(|| format!("failed to deserialize session {id}"))?;
@@ -34,7 +35,8 @@ impl app::SessionStore for DiskSessionStore {
         let path = self.session_path(session.id);
         let data = serde_json::to_string_pretty(session)
             .with_context(|| format!("failed to serialize session {}", session.id))?;
-        std::fs::write(&path, data)
+        tokio::fs::write(&path, data)
+            .await
             .with_context(|| format!("failed to write session file {}", path.display()))?;
         Ok(())
     }
@@ -42,14 +44,15 @@ impl app::SessionStore for DiskSessionStore {
     async fn list(&self) -> Result<Vec<SessionSummary>> {
         let mut summaries = Vec::new();
 
-        let entries = std::fs::read_dir(&self.dir)
+        let mut entries = tokio::fs::read_dir(&self.dir)
+            .await
             .with_context(|| format!("failed to read session directory {}", self.dir.display()))?;
 
-        for entry in entries {
-            let entry = entry?;
+        while let Some(entry) = entries.next_entry().await? {
             let path = entry.path();
 
             // Only consider .json files whose stem is a valid UUID.
+            // No file reads — the filename alone is authoritative.
             let is_json = path.extension().is_some_and(|ext| ext == "json");
             if !is_json {
                 continue;
@@ -61,16 +64,7 @@ impl app::SessionStore for DiskSessionStore {
                 continue;
             };
 
-            let data = std::fs::read_to_string(&path)
-                .with_context(|| format!("failed to read session file {}", path.display()))?;
-            let session: Session = serde_json::from_str(&data).with_context(|| {
-                format!("failed to deserialize session file {}", path.display())
-            })?;
-
-            summaries.push(SessionSummary {
-                id,
-                message_count: session.messages.len(),
-            });
+            summaries.push(SessionSummary { id });
         }
 
         Ok(summaries)
@@ -151,9 +145,7 @@ mod tests {
         let (store, _tmp) = temp_store();
 
         let id1 = SessionId::new_v4();
-        let mut s1 = Session::new(id1, "/a".into());
-        s1.push_message(Message::user("one"));
-        s1.push_message(Message::user("two"));
+        let s1 = Session::new(id1, "/a".into());
         store.save(&s1).await.unwrap();
 
         let id2 = SessionId::new_v4();
@@ -161,17 +153,17 @@ mod tests {
         store.save(&s2).await.unwrap();
 
         let id3 = SessionId::new_v4();
-        let mut s3 = Session::new(id3, "/c".into());
-        s3.push_message(Message::user("only"));
+        let s3 = Session::new(id3, "/c".into());
         store.save(&s3).await.unwrap();
 
         let summaries = store.list().await.unwrap();
         assert_eq!(summaries.len(), 3);
 
-        let find = |id| summaries.iter().find(|s| s.id == id).unwrap();
-        assert_eq!(find(id1).message_count, 2);
-        assert_eq!(find(id2).message_count, 0);
-        assert_eq!(find(id3).message_count, 1);
+        let mut ids: Vec<_> = summaries.iter().map(|s| s.id).collect();
+        ids.sort_by_key(|id| id.0);
+        let mut expected = vec![id1, id2, id3];
+        expected.sort_by_key(|id| id.0);
+        assert_eq!(ids, expected);
     }
 
     #[tokio::test]
@@ -210,6 +202,32 @@ mod tests {
         let summaries = store.list().await.unwrap();
         assert_eq!(summaries.len(), 1);
         assert_eq!(summaries[0].id, id);
+    }
+
+    /// A .json file with a valid UUID stem but malformed body is still returned
+    /// by `list()` — because `list()` never reads the file contents.
+    #[tokio::test]
+    async fn list_succeeds_for_session_file_with_malformed_body() {
+        let (store, tmp) = temp_store();
+
+        // Write a file with a valid UUID stem but garbage JSON body.
+        let id = SessionId::new_v4();
+        std::fs::write(
+            tmp.path().join(format!("{id}.json")),
+            "this is not valid json",
+        )
+        .unwrap();
+
+        let summaries = store.list().await.unwrap();
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].id, id);
+
+        // load() on the same ID should fail with a deserialization error.
+        let err = store.load(id).await.unwrap_err();
+        assert!(
+            err.to_string().contains("deserialize"),
+            "unexpected error: {err}"
+        );
     }
 
     #[tokio::test]

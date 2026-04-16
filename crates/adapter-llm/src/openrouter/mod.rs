@@ -33,7 +33,7 @@ impl app::LlmProvider for OpenRouterProvider {
         messages: &[Message],
         tools: &[ToolDef],
     ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamEvent>> + Send>>> {
-        let body = RequestBody::from_messages(&self.model, messages, tools);
+        let body = RequestBody::from_messages(&self.model, messages, tools)?;
 
         let response = self
             .client

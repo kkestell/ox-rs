@@ -5,8 +5,8 @@ use anyhow::{Context, Result};
 pub struct LocalFileSystem;
 
 impl app::FileSystem for LocalFileSystem {
-    fn read(&self, path: &Path) -> Result<String> {
-        Ok(std::fs::read_to_string(path)?)
+    async fn read(&self, path: &Path) -> Result<String> {
+        Ok(tokio::fs::read_to_string(path).await?)
     }
 
     /// Writes `content` to `path`, creating any missing parent directories
@@ -14,14 +14,17 @@ impl app::FileSystem for LocalFileSystem {
     /// succeed when the LLM targets a new subdirectory — requiring callers
     /// to mkdir-then-write first would be a needless round trip, and no
     /// caller today relies on the strict "fail if parent missing" variant.
-    fn write(&self, path: &Path, content: &str) -> Result<()> {
+    async fn write(&self, path: &Path, content: &str) -> Result<()> {
         if let Some(parent) = path.parent()
             && !parent.as_os_str().is_empty()
         {
-            std::fs::create_dir_all(parent)
+            tokio::fs::create_dir_all(parent)
+                .await
                 .with_context(|| format!("creating parent directories for {}", path.display()))?;
         }
-        std::fs::write(path, content).with_context(|| format!("writing to {}", path.display()))?;
+        tokio::fs::write(path, content)
+            .await
+            .with_context(|| format!("writing to {}", path.display()))?;
         Ok(())
     }
 }
@@ -48,27 +51,35 @@ mod tests {
         LocalFileSystem
     }
 
-    #[test]
-    fn write_creates_missing_parent_dirs() {
+    #[tokio::test]
+    async fn write_creates_missing_parent_dirs() {
         let tmp = TempDir::new().unwrap();
         let nested: PathBuf = tmp.path().join("a/b/c/file.txt");
-        fs().write(&nested, "hello").unwrap();
+        fs().write(&nested, "hello").await.unwrap();
         assert_eq!(std::fs::read_to_string(&nested).unwrap(), "hello");
     }
 
-    #[test]
-    fn write_overwrites_existing_file() {
+    #[tokio::test]
+    async fn write_overwrites_existing_file() {
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("f.txt");
-        fs().write(&path, "first").unwrap();
-        fs().write(&path, "second").unwrap();
+        fs().write(&path, "first").await.unwrap();
+        fs().write(&path, "second").await.unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "second");
     }
 
-    #[test]
-    fn read_missing_file_returns_error() {
+    #[tokio::test]
+    async fn read_returns_file_contents() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("round_trip.txt");
+        tokio::fs::write(&path, "expected content").await.unwrap();
+        assert_eq!(fs().read(&path).await.unwrap(), "expected content");
+    }
+
+    #[tokio::test]
+    async fn read_missing_file_returns_error() {
         let tmp = TempDir::new().unwrap();
         let missing = tmp.path().join("nope.txt");
-        assert!(fs().read(&missing).is_err());
+        assert!(fs().read(&missing).await.is_err());
     }
 }

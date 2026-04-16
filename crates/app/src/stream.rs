@@ -1,3 +1,4 @@
+use std::cell::OnceCell;
 use std::collections::BTreeMap;
 
 use domain::{ContentBlock, Message, Role, StreamEvent, Usage};
@@ -13,6 +14,16 @@ pub struct ToolDef {
     pub name: String,
     pub description: String,
     pub parameters: serde_json::Value,
+}
+
+/// Non-consuming, borrowed view of a `StreamAccumulator`'s current state.
+///
+/// Role is always `Role::Assistant`. The content slice borrows the
+/// accumulator's internal cache and is only rebuilt when new events arrive.
+/// This avoids per-frame cloning during live streaming in the GUI.
+pub struct Snapshot<'a> {
+    pub content: &'a [ContentBlock],
+    pub token_count: usize,
 }
 
 // ---------------------------------------------------------------------------
@@ -31,7 +42,11 @@ struct ToolCallAccum {
 /// Content blocks are ordered: reasoning first, then text, then tool calls.
 /// This matches the logical structure of a model turn even when deltas arrive
 /// interleaved.
-#[derive(Debug, Default)]
+///
+/// Not `Sync` — must remain owned or behind `&mut`. The `OnceCell` cache
+/// requires `&self` to populate and `&mut self` to invalidate, which is
+/// compatible with the current ownership model (moved between threads, never
+/// shared via `&` across threads).
 pub struct StreamAccumulator {
     text: String,
     reasoning: String,
@@ -39,6 +54,24 @@ pub struct StreamAccumulator {
     encrypted: Option<(String, String)>, // (data, format)
     tool_calls: BTreeMap<usize, ToolCallAccum>,
     usage: Usage,
+    /// Lazily built block cache, invalidated on every `push`. Avoids
+    /// rebuilding the block vec on every `snapshot()` call within a single
+    /// frame when the GUI calls it multiple times between events.
+    cached_blocks: OnceCell<Vec<ContentBlock>>,
+}
+
+impl Default for StreamAccumulator {
+    fn default() -> Self {
+        Self {
+            text: String::new(),
+            reasoning: String::new(),
+            signature: None,
+            encrypted: None,
+            tool_calls: BTreeMap::new(),
+            usage: Usage::default(),
+            cached_blocks: OnceCell::new(),
+        }
+    }
 }
 
 impl StreamAccumulator {
@@ -47,6 +80,10 @@ impl StreamAccumulator {
     }
 
     pub fn push(&mut self, event: StreamEvent) {
+        // Any new event invalidates the cached block vec so the next
+        // snapshot() rebuilds it with fresh data.
+        self.cached_blocks.take();
+
         match event {
             StreamEvent::TextDelta { delta } => self.text.push_str(&delta),
             StreamEvent::ReasoningDelta { delta } => self.reasoning.push_str(&delta),
@@ -77,22 +114,28 @@ impl StreamAccumulator {
         }
     }
 
-    pub fn into_message(self) -> Message {
+    pub fn into_message(mut self) -> Message {
+        let blocks = self
+            .cached_blocks
+            .take()
+            .unwrap_or_else(|| self.assemble_blocks());
         Message {
             role: Role::Assistant,
-            content: self.assemble_blocks(),
+            content: blocks,
             token_count: self.usage.completion_tokens as usize,
         }
     }
 
-    /// Non-consuming snapshot of the accumulator as a `Message`. Enables live
-    /// rendering of in-flight state (e.g. in a GUI) using the same ordering
-    /// and block-shape guarantees as `into_message`, so there is no risk of
-    /// drift between the in-progress view and the final stored message.
-    pub fn snapshot(&self) -> Message {
-        Message {
-            role: Role::Assistant,
-            content: self.assemble_blocks(),
+    /// Non-consuming, borrowed view of the accumulator's current state.
+    ///
+    /// Uses a lazily built cache: the first call after a `push` rebuilds the
+    /// block vec; subsequent calls return the same slice until the next
+    /// `push` invalidates the cache. This is the hot path for live GUI
+    /// rendering — called once per egui frame while the model is streaming.
+    pub fn snapshot(&self) -> Snapshot<'_> {
+        let content = self.cached_blocks.get_or_init(|| self.assemble_blocks());
+        Snapshot {
+            content,
             token_count: self.usage.completion_tokens as usize,
         }
     }
@@ -511,13 +554,15 @@ mod tests {
     // drift between the two would cause the final message to "flicker" when
     // the accumulator is consumed and its result replaces the live view.
 
-    /// Helper: the two messages must agree on role, content blocks, and
-    /// token count. `Message` doesn't derive `PartialEq`, so we compare
-    /// field-by-field.
-    fn assert_messages_equal(a: &Message, b: &Message) {
-        assert_eq!(a.role, b.role);
-        assert_eq!(a.content, b.content);
-        assert_eq!(a.token_count, b.token_count);
+    /// Helper: a snapshot must agree with `into_message` on content blocks and
+    /// token count. The snapshot borrows the accumulator, so we take the
+    /// snapshot first, copy its fields, drop the borrow, then consume.
+    fn assert_snapshot_matches_message(acc: StreamAccumulator) {
+        let snap_content = acc.snapshot().content.to_vec();
+        let snap_token_count = acc.snapshot().token_count;
+        let msg = acc.into_message();
+        assert_eq!(snap_content, msg.content);
+        assert_eq!(snap_token_count, msg.token_count);
     }
 
     #[test]
@@ -537,9 +582,7 @@ mod tests {
             },
         });
 
-        let snap = acc.snapshot();
-        let consumed = acc.into_message();
-        assert_messages_equal(&snap, &consumed);
+        assert_snapshot_matches_message(acc);
     }
 
     #[test]
@@ -565,9 +608,7 @@ mod tests {
             },
         });
 
-        let snap = acc.snapshot();
-        let consumed = acc.into_message();
-        assert_messages_equal(&snap, &consumed);
+        assert_snapshot_matches_message(acc);
     }
 
     #[test]
@@ -602,44 +643,46 @@ mod tests {
             },
         });
 
-        let snap = acc.snapshot();
-        let consumed = acc.into_message();
-        assert_messages_equal(&snap, &consumed);
-
         // Independent hand-rolled assertions so that a bug in the shared
         // `assemble_blocks` helper (wrong ordering, dropped blocks, wrong
         // token count) would be visible here rather than hidden behind
         // parity agreement between `snapshot` and `into_message`.
-        assert_eq!(snap.token_count, 10);
-        assert_eq!(snap.content.len(), 3);
-        match &snap.content[0] {
-            ContentBlock::Text { text } => assert_eq!(text, "dispatching..."),
-            _ => panic!("expected Text first"),
-        }
-        match &snap.content[1] {
-            ContentBlock::ToolCall {
-                id,
-                name,
-                arguments,
-            } => {
-                assert_eq!(id, "call_a");
-                assert_eq!(name, "tool_a");
-                assert_eq!(arguments, r#"{"x":1}"#);
+        {
+            let snap = acc.snapshot();
+            assert_eq!(snap.token_count, 10);
+            assert_eq!(snap.content.len(), 3);
+            match &snap.content[0] {
+                ContentBlock::Text { text } => assert_eq!(text, "dispatching..."),
+                _ => panic!("expected Text first"),
             }
-            _ => panic!("expected ToolCall at index 1"),
-        }
-        match &snap.content[2] {
-            ContentBlock::ToolCall {
-                id,
-                name,
-                arguments,
-            } => {
-                assert_eq!(id, "call_b");
-                assert_eq!(name, "tool_b");
-                assert_eq!(arguments, r#"{"y":2}"#);
+            match &snap.content[1] {
+                ContentBlock::ToolCall {
+                    id,
+                    name,
+                    arguments,
+                } => {
+                    assert_eq!(id, "call_a");
+                    assert_eq!(name, "tool_a");
+                    assert_eq!(arguments, r#"{"x":1}"#);
+                }
+                _ => panic!("expected ToolCall at index 1"),
             }
-            _ => panic!("expected ToolCall at index 2"),
+            match &snap.content[2] {
+                ContentBlock::ToolCall {
+                    id,
+                    name,
+                    arguments,
+                } => {
+                    assert_eq!(id, "call_b");
+                    assert_eq!(name, "tool_b");
+                    assert_eq!(arguments, r#"{"y":2}"#);
+                }
+                _ => panic!("expected ToolCall at index 2"),
+            }
         }
+
+        // Now verify parity with into_message.
+        assert_snapshot_matches_message(acc);
     }
 
     #[test]
@@ -664,31 +707,32 @@ mod tests {
             delta: r#"{"query":"hel"#.into(),
         });
 
-        let snap = acc.snapshot();
-        assert_eq!(snap.role, Role::Assistant);
-        // Blocks in canonical order: reasoning, text, tool call.
-        assert_eq!(snap.content.len(), 3);
-        match &snap.content[0] {
-            ContentBlock::Reasoning { content, .. } => {
-                assert_eq!(content, "partial reasoning");
+        {
+            let snap = acc.snapshot();
+            // Blocks in canonical order: reasoning, text, tool call.
+            assert_eq!(snap.content.len(), 3);
+            match &snap.content[0] {
+                ContentBlock::Reasoning { content, .. } => {
+                    assert_eq!(content, "partial reasoning");
+                }
+                _ => panic!("expected Reasoning first"),
             }
-            _ => panic!("expected Reasoning first"),
-        }
-        match &snap.content[1] {
-            ContentBlock::Text { text } => assert_eq!(text, "partial "),
-            _ => panic!("expected Text second"),
-        }
-        match &snap.content[2] {
-            ContentBlock::ToolCall {
-                name, arguments, ..
-            } => {
-                assert_eq!(name, "search");
-                assert_eq!(arguments, r#"{"query":"hel"#);
+            match &snap.content[1] {
+                ContentBlock::Text { text } => assert_eq!(text, "partial "),
+                _ => panic!("expected Text second"),
             }
-            _ => panic!("expected ToolCall third"),
+            match &snap.content[2] {
+                ContentBlock::ToolCall {
+                    name, arguments, ..
+                } => {
+                    assert_eq!(name, "search");
+                    assert_eq!(arguments, r#"{"query":"hel"#);
+                }
+                _ => panic!("expected ToolCall third"),
+            }
+            // No Finished event yet — token count should still be zero.
+            assert_eq!(snap.token_count, 0);
         }
-        // No Finished event yet — token count should still be zero.
-        assert_eq!(snap.token_count, 0);
 
         // Continue streaming and snapshot again — arguments should grow.
         acc.push(StreamEvent::ToolCallArgumentDelta {
@@ -708,7 +752,6 @@ mod tests {
     fn snapshot_of_empty_accumulator_returns_assistant_with_no_blocks() {
         let acc = StreamAccumulator::new();
         let snap = acc.snapshot();
-        assert_eq!(snap.role, Role::Assistant);
         assert!(snap.content.is_empty());
         assert_eq!(snap.token_count, 0);
     }
@@ -779,6 +822,44 @@ mod tests {
                 assert!(encrypted.is_none());
             }
             _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn snapshot_caches_blocks_until_next_push() {
+        let mut acc = StreamAccumulator::new();
+        acc.push(StreamEvent::TextDelta {
+            delta: "hello".into(),
+        });
+
+        // Two consecutive snapshots without an intervening push should
+        // return the same cached block vec (pointer-equal slices).
+        {
+            let snap1 = acc.snapshot();
+            let snap2 = acc.snapshot();
+            assert!(
+                std::ptr::eq(snap1.content, snap2.content),
+                "consecutive snapshots must share the same cached slice"
+            );
+        }
+
+        // A push invalidates the cache — the next snapshot rebuilds.
+        acc.push(StreamEvent::TextDelta {
+            delta: " world".into(),
+        });
+        {
+            let snap3 = acc.snapshot();
+            assert_eq!(snap3.content.len(), 1);
+            match &snap3.content[0] {
+                ContentBlock::Text { text } => assert_eq!(text, "hello world"),
+                _ => panic!("expected Text"),
+            }
+            // The rebuilt cache is itself stable for subsequent calls.
+            let snap4 = acc.snapshot();
+            assert!(
+                std::ptr::eq(snap3.content, snap4.content),
+                "post-push snapshots must share the new cached slice"
+            );
         }
     }
 }
