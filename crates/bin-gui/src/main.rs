@@ -1,12 +1,10 @@
 //! `ox-gui` — the desktop AI coding assistant GUI.
 //!
 //! A thin composition root: locates the `ox-agent` binary, builds an
-//! [`AgentSpawnConfig`] from CLI args + env + defaults, spawns the initial
-//! agent, wraps its client in an [`AgentSplit`], hands `vec![split]` plus a
-//! cloneable spawn-config template to [`OxApp`], and runs the egui window.
-//! The user can spawn additional agents at runtime with `/new`. On
-//! shutdown, prints a resume command per active session so the user can
-//! pick up where they left off.
+//! [`AgentSpawnConfig`] from CLI args + env + defaults, passes the GUI-owned
+//! workspace layout path to [`OxApp`], and runs the egui window. The app
+//! restores prior splits for the workspace unless `--resume <id>` explicitly
+//! requests a single session.
 //!
 //! All session work — LLM streaming, session persistence, tool execution —
 //! happens inside `ox-agent` subprocesses. This binary holds display state
@@ -14,7 +12,7 @@
 
 use std::path::PathBuf;
 
-use adapter_egui::{AgentClient, AgentSpawnConfig, AgentSplit, OxApp};
+use adapter_egui::{AgentSpawnConfig, OxApp};
 use anyhow::{Context, Result};
 use app::SecretStore;
 use clap::Parser;
@@ -47,6 +45,9 @@ fn main() -> Result<()> {
     let sessions_dir = dirs::home_dir()
         .context("could not determine home directory")?
         .join(".ox/sessions");
+    let layout_state_path = dirs::home_dir()
+        .context("could not determine home directory")?
+        .join(".ox/workspaces.json");
 
     let workspace_root =
         std::env::current_dir().context("could not determine working directory")?;
@@ -71,28 +72,8 @@ fn main() -> Result<()> {
     let rt = tokio::runtime::Runtime::new()?;
     let _guard = rt.enter();
 
-    let client = AgentClient::spawn(spawn_config.clone())?;
-    let split = AgentSplit::new(client);
-    // Pass a template config with `resume: None` so `/new` always starts
-    // fresh sessions. The original config (which may have `--resume`) was
-    // consumed by the initial spawn above.
-    let mut template = spawn_config;
-    template.resume = None;
-    let (app, session_id_mirror) = OxApp::new(vec![split], template, env!("CARGO_PKG_VERSION"));
+    let (app, _) = OxApp::restore(spawn_config, layout_state_path, env!("CARGO_PKG_VERSION"))?;
     app.run()?;
-
-    // After the GUI closes, read the session IDs the app mirrored on its
-    // last frame. These are the IDs the user can re-open to pick up where
-    // they left off. For a quick-exit before the agent's `Ready` frame,
-    // the ID will be `None` — which is correct, because the agent never
-    // persisted a session in that case.
-    let ids = session_id_mirror
-        .lock()
-        .map(|guard| guard.clone())
-        .unwrap_or_default();
-    for id in ids.into_iter().flatten() {
-        eprintln!("ox-gui --resume {id}");
-    }
 
     Ok(())
 }

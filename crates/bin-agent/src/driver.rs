@@ -878,16 +878,37 @@ mod tests {
             .await
             .unwrap();
 
-        // Send another event so the runner's stream.next() unblocks and
-        // sees the cancel flag.
-        let _ = tx
-            .send(Ok(StreamEvent::TextDelta {
-                delta: " more".into(),
-            }))
-            .await;
-
-        // Drain remaining events until the terminator.
-        let (events, terminator) = drain_turn(&mut evt_rx).await;
+        // Keep nudging the model stream while draining. The driver observes
+        // Cancel on a separate command channel, and the runner observes that
+        // token only after the model stream yields again. A single post-cancel
+        // delta can race ahead of the Cancel command and leave the test
+        // waiting forever, so this loop keeps the stream moving until the
+        // terminal frame arrives.
+        let (events, terminator) = tokio::time::timeout(Duration::from_secs(1), async {
+            let mut events = Vec::new();
+            loop {
+                tokio::select! {
+                    frame = read_frame::<_, AgentEvent>(&mut evt_rx) => {
+                        match frame.unwrap() {
+                            Some(evt @ AgentEvent::TurnComplete) => break (events, Some(evt)),
+                            Some(evt @ AgentEvent::TurnCancelled) => break (events, Some(evt)),
+                            Some(evt @ AgentEvent::Error { .. }) => break (events, Some(evt)),
+                            Some(other) => events.push(other),
+                            None => break (events, None),
+                        }
+                    }
+                    _ = tokio::time::sleep(Duration::from_millis(10)) => {
+                        let _ = tx
+                            .send(Ok(StreamEvent::TextDelta {
+                                delta: " more".into(),
+                            }))
+                            .await;
+                    }
+                }
+            }
+        })
+        .await
+        .expect("driver should emit a terminal frame after Cancel");
         assert!(
             matches!(terminator, Some(AgentEvent::TurnCancelled)),
             "expected TurnCancelled, got {terminator:?}"

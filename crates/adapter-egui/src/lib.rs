@@ -6,17 +6,19 @@
 //!
 //! Per-session state lives in [`AgentSplit`] so the GUI can host N agents
 //! concurrently. The tiling UI renders all active sessions as equal-width
-//! vertical splits; `/new` adds a split, `/quit` closes one.
+//! vertical splits; `/new` adds a split, `/close` closes one, and `/quit`
+//! closes the app.
 
 mod agent_client;
+mod workspace_layout;
 
 pub use agent_client::{AgentClient, AgentSpawnConfig};
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use domain::{ContentBlock, Message, Role, SessionId};
 use eframe::egui;
 use egui_file_dialog::FileDialog;
@@ -24,13 +26,13 @@ use protocol::{AgentCommand, AgentEvent};
 use tokio::sync::mpsc;
 
 use app::StreamAccumulator;
+use workspace_layout::{RestoreLayout, WorkspaceLayouts, normalize_split_fracs};
 
 /// Shared, thread-safe mirror of the per-split session IDs.
 ///
 /// `eframe::run_native` consumes the `OxApp`, so after the window closes the
-/// app's state is gone. To let the composition root print resume commands on
-/// shutdown, the app writes the latest session IDs into this slot every
-/// frame; the binary reads it after `run` returns.
+/// app's state is gone. This mirror keeps the latest session ID shape
+/// externally observable without exposing split internals.
 ///
 /// A `Mutex<Vec<...>>` is overkill for single-threaded frame updates but it's
 /// the smallest thread-safe shape that keeps the binary decoupled from the
@@ -82,8 +84,7 @@ impl AgentSplit {
     }
 
     /// Session ID reported by the agent via `Ready`. `None` until the
-    /// handshake completes. The GUI reads this on shutdown so it can print
-    /// the user's resume command.
+    /// handshake completes.
     pub fn session_id(&self) -> Option<SessionId> {
         self.session_id
     }
@@ -175,8 +176,11 @@ pub struct OxApp {
     /// Template config for spawning new agents via `/new`. Cloned with
     /// `resume: None` each time a new split is created.
     spawn_config: AgentSpawnConfig,
-    /// Slot the app writes session IDs into each frame so the composition
-    /// root can read them after `run_native` consumes the app.
+    /// GUI-owned workspace layout state. This remembers which session IDs
+    /// belong to each workspace and how their split widths were arranged.
+    layout_state_path: Option<PathBuf>,
+    /// Slot the app writes session IDs into each frame for observers that
+    /// need the latest split/session shape without inspecting split state.
     session_id_mirror: SessionIdMirror,
     /// When set, the next frame will request egui focus on this split's
     /// input TextEdit, then clear the flag.
@@ -185,6 +189,7 @@ pub struct OxApp {
     pending_workspace: Option<PathBuf>,
     confirm_replace_workspace: bool,
     confirm_quit: bool,
+    quit_confirmed: bool,
     about_open: bool,
     app_version: String,
 }
@@ -195,27 +200,96 @@ impl OxApp {
         spawn_config: AgentSpawnConfig,
         app_version: impl Into<String>,
     ) -> (Self, SessionIdMirror) {
+        Self::with_layout(splits, spawn_config, app_version, None, None, 0)
+    }
+
+    fn with_layout(
+        splits: Vec<AgentSplit>,
+        spawn_config: AgentSpawnConfig,
+        app_version: impl Into<String>,
+        layout_state_path: Option<PathBuf>,
+        split_fracs: Option<Vec<f32>>,
+        focused: usize,
+    ) -> (Self, SessionIdMirror) {
         assert!(!splits.is_empty(), "OxApp requires at least one split");
         let n = splits.len();
         let mirror: SessionIdMirror = Arc::new(Mutex::new(vec![None; n]));
         let inputs = vec![String::new(); n];
-        let split_fracs = vec![1.0 / n as f32; n];
+        let split_fracs = split_fracs
+            .map(|fracs| normalize_split_fracs(&fracs, n))
+            .unwrap_or_else(|| vec![1.0 / n as f32; n]);
+        let focused = focused.min(n - 1);
         let app = Self {
             splits,
-            focused: 0,
+            focused,
             inputs,
             split_fracs,
             spawn_config,
+            layout_state_path,
             session_id_mirror: mirror.clone(),
-            pending_focus: Some(0),
+            pending_focus: Some(focused),
             file_dialog: FileDialog::new(),
             pending_workspace: None,
             confirm_replace_workspace: false,
             confirm_quit: false,
+            quit_confirmed: false,
             about_open: false,
             app_version: app_version.into(),
         };
         (app, mirror)
+    }
+
+    pub fn restore(
+        mut spawn_config: AgentSpawnConfig,
+        layout_state_path: PathBuf,
+        app_version: impl Into<String>,
+    ) -> Result<(Self, SessionIdMirror)> {
+        let layout = if spawn_config.resume.is_some() {
+            None
+        } else {
+            load_workspace_layout(&layout_state_path)
+                .restore_existing_for(&spawn_config.workspace_root, &spawn_config.sessions_dir)
+        };
+        let explicit_resume = spawn_config.resume;
+        let restore = layout.as_ref();
+        let spawn_configs = startup_spawn_configs(&spawn_config, restore);
+
+        let mut splits = Vec::with_capacity(spawn_configs.len());
+        let mut restored_spawn_failed = false;
+        for config in &spawn_configs {
+            match AgentClient::spawn(config.clone()) {
+                Ok(client) => splits.push(AgentSplit::new(client)),
+                Err(_err) if restore.is_some() && explicit_resume.is_none() => {
+                    restored_spawn_failed = true;
+                    break;
+                }
+                Err(err) => return Err(err).context("spawning initial agent"),
+            }
+        }
+
+        let (split_fracs, focused) = if restored_spawn_failed {
+            let mut fresh = spawn_config.clone();
+            fresh.resume = None;
+            let client = AgentClient::spawn(fresh)
+                .context("spawning fresh agent after restored workspace layout failed")?;
+            splits = vec![AgentSplit::new(client)];
+            (None, 0)
+        } else {
+            (
+                restore.map(|layout| layout.split_fracs.clone()),
+                restore.map(|layout| layout.focused).unwrap_or(0),
+            )
+        };
+
+        spawn_config.resume = None;
+        Ok(Self::with_layout(
+            splits,
+            spawn_config,
+            app_version,
+            Some(layout_state_path),
+            split_fracs,
+            focused,
+        ))
     }
 
     pub fn run(self) -> Result<()> {
@@ -232,10 +306,44 @@ impl OxApp {
         }
     }
 
+    fn save_current_workspace_layout(&self) -> Result<bool> {
+        let Some(path) = &self.layout_state_path else {
+            return Ok(false);
+        };
+        let mut layouts = load_workspace_layout(path);
+        let saved = layouts.save_current(
+            &self.spawn_config.workspace_root,
+            self.splits.iter().map(|split| split.session_id()),
+            &self.split_fracs,
+            self.focused,
+        );
+        if saved {
+            layouts.save(path)?;
+        }
+        Ok(saved)
+    }
+
     fn any_turn_in_progress(&self) -> bool {
         self.splits
             .iter()
             .any(|split| split.waiting || split.streaming.is_some())
+    }
+
+    fn request_quit(&mut self, ctx: &egui::Context) {
+        if self.any_turn_in_progress() {
+            self.confirm_quit = true;
+        } else {
+            self.quit_confirmed = true;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
+    }
+
+    fn should_cancel_viewport_close_request(&mut self) -> bool {
+        if self.quit_confirmed || !self.any_turn_in_progress() {
+            return false;
+        }
+        self.confirm_quit = true;
+        true
     }
 
     /// Spawn a new agent and append a split to the right. On failure,
@@ -260,27 +368,14 @@ impl OxApp {
         }
     }
 
-    /// Close the split at `split_idx`. If it's the last split, close the
-    /// app. Otherwise remove the split and adjust focus so it stays on the
-    /// same logical split (or its left neighbor if the focused split was
-    /// removed).
-    fn handle_quit(&mut self, split_idx: usize, ctx: &egui::Context) {
+    /// Close the split at `split_idx`. If it's the last split, follow the
+    /// same app-quit path as File > Quit and `/quit`.
+    fn handle_close_split(&mut self, split_idx: usize, ctx: &egui::Context) {
         if self.splits.len() == 1 {
-            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            self.request_quit(ctx);
             return;
         }
-        // Give the removed split's width to its neighbor.
-        let reclaimed = self.split_fracs.remove(split_idx);
-        let neighbor = if split_idx < self.split_fracs.len() {
-            split_idx
-        } else {
-            split_idx - 1
-        };
-        self.split_fracs[neighbor] += reclaimed;
-
-        self.splits.remove(split_idx);
-        self.inputs.remove(split_idx);
-        adjust_focus_after_remove(&mut self.focused, split_idx, self.splits.len());
+        self.remove_split_state(split_idx);
         self.pending_focus = Some(self.focused);
     }
 
@@ -299,6 +394,10 @@ impl OxApp {
     /// tests that don't have an egui context.
     #[cfg(test)]
     fn remove_split(&mut self, split_idx: usize) {
+        self.remove_split_state(split_idx);
+    }
+
+    fn remove_split_state(&mut self, split_idx: usize) {
         let reclaimed = self.split_fracs.remove(split_idx);
         let neighbor = if split_idx < self.split_fracs.len() {
             split_idx
@@ -350,14 +449,26 @@ impl OxApp {
         new_root: PathBuf,
         mut factory: impl FnMut(usize, &AgentSpawnConfig) -> Result<AgentSplit>,
     ) {
-        let n = 1;
+        if let Err(e) = self.save_current_workspace_layout() {
+            self.splits[self.focused].error =
+                Some(format!("failed to save workspace layout: {e:#}"));
+        }
+
         let mut next_config = self.spawn_config.clone();
-        next_config.workspace_root = new_root;
+        next_config.workspace_root = new_root.clone();
         next_config.resume = None;
+        let layouts = self
+            .layout_state_path
+            .as_deref()
+            .map(load_workspace_layout)
+            .unwrap_or_default();
+        let restore = layouts.restore_existing_for(&new_root, &next_config.sessions_dir);
+        let spawn_configs = restore_spawn_configs(&next_config, restore.as_ref());
+        let n = spawn_configs.len();
 
         let mut next_splits = Vec::with_capacity(n);
-        for idx in 0..n {
-            match factory(idx, &next_config) {
+        for (idx, config) in spawn_configs.iter().enumerate() {
+            match factory(idx, config) {
                 Ok(split) => next_splits.push(split),
                 Err(e) => {
                     self.splits[self.focused].error = Some(format!("failed to spawn agent: {e:#}"));
@@ -371,9 +482,15 @@ impl OxApp {
         self.spawn_config = next_config;
         self.splits = next_splits;
         self.inputs = vec![String::new(); n];
-        self.split_fracs = vec![1.0 / n as f32; n];
-        self.focused = 0;
-        self.pending_focus = Some(0);
+        self.split_fracs = restore
+            .as_ref()
+            .map(|layout| normalize_split_fracs(&layout.split_fracs, n))
+            .unwrap_or_else(|| vec![1.0 / n as f32; n]);
+        self.focused = restore
+            .as_ref()
+            .map(|layout| layout.focused.min(n - 1))
+            .unwrap_or(0);
+        self.pending_focus = Some(self.focused);
         if let Ok(mut slot) = self.session_id_mirror.lock() {
             *slot = vec![None; n];
         }
@@ -388,9 +505,14 @@ impl eframe::App for OxApp {
             split.poll_events();
         }
 
-        // Publish the latest session IDs so the composition root sees them
-        // on shutdown — `eframe::run_native` consumes the app and returns
-        // no post-exit state.
+        if ctx.input(|input| input.viewport().close_requested())
+            && self.should_cancel_viewport_close_request()
+        {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+        }
+
+        // Publish the latest session IDs for observers that need the
+        // current split/session shape without borrowing the splits.
         self.publish_session_ids();
 
         let mut menu_actions: Vec<MenuAction> = Vec::new();
@@ -424,9 +546,7 @@ impl eframe::App for OxApp {
             egui::Modal::new(egui::Id::new("confirm_replace_workspace")).show(ctx, |ui| {
                 ui.vertical(|ui| {
                     ui.heading("Open Workspace");
-                    ui.label(
-                        "A turn is in progress.",
-                    );
+                    ui.label("A turn is in progress.");
                     ui.add_space(8.0);
                     ui.horizontal(|ui| {
                         if ui.button("Cancel").clicked() {
@@ -569,13 +689,7 @@ impl eframe::App for OxApp {
         for action in menu_actions {
             match action {
                 MenuAction::OpenWorkspacePicker => self.file_dialog.pick_directory(),
-                MenuAction::QuitRequested => {
-                    if self.any_turn_in_progress() {
-                        self.confirm_quit = true;
-                    } else {
-                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                    }
-                }
+                MenuAction::QuitRequested => self.request_quit(ctx),
                 MenuAction::OpenAbout => self.about_open = true,
                 MenuAction::ConfirmReplaceWorkspace(path) => {
                     if self.any_turn_in_progress() {
@@ -596,7 +710,10 @@ impl eframe::App for OxApp {
                         self.confirm_replace_workspace = false;
                     }
                 }
-                MenuAction::ConfirmQuit => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+                MenuAction::ConfirmQuit => {
+                    self.quit_confirmed = true;
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
                 MenuAction::CancelQuit => self.confirm_quit = false,
                 MenuAction::CloseAbout => self.about_open = false,
             }
@@ -608,7 +725,8 @@ impl eframe::App for OxApp {
             match action {
                 SplitAction::Send(idx) => self.send_message(idx),
                 SplitAction::New => self.handle_new(ctx),
-                SplitAction::Quit(idx) => self.handle_quit(idx, ctx),
+                SplitAction::QuitApp => self.request_quit(ctx),
+                SplitAction::CloseSplit(idx) => self.handle_close_split(idx, ctx),
                 SplitAction::Cancel(idx) => {
                     let _ = self.splits[idx].client.send(AgentCommand::Cancel);
                 }
@@ -620,6 +738,54 @@ impl eframe::App for OxApp {
         if any_waiting {
             ctx.request_repaint();
         }
+    }
+}
+
+impl Drop for OxApp {
+    fn drop(&mut self) {
+        if let Err(e) = self.save_current_workspace_layout() {
+            eprintln!("failed to save workspace layout: {e:#}");
+        }
+    }
+}
+
+fn load_workspace_layout(path: &Path) -> WorkspaceLayouts {
+    WorkspaceLayouts::load(path).unwrap_or_else(|e| {
+        eprintln!("ignoring workspace layout file {}: {e:#}", path.display());
+        WorkspaceLayouts::default()
+    })
+}
+
+fn restore_spawn_configs(
+    base_config: &AgentSpawnConfig,
+    restore: Option<&RestoreLayout>,
+) -> Vec<AgentSpawnConfig> {
+    match restore {
+        Some(layout) => layout
+            .sessions
+            .iter()
+            .map(|id| {
+                let mut config = base_config.clone();
+                config.resume = Some(*id);
+                config
+            })
+            .collect(),
+        None => {
+            let mut config = base_config.clone();
+            config.resume = None;
+            vec![config]
+        }
+    }
+}
+
+fn startup_spawn_configs(
+    base_config: &AgentSpawnConfig,
+    restore: Option<&RestoreLayout>,
+) -> Vec<AgentSpawnConfig> {
+    if base_config.resume.is_some() {
+        vec![base_config.clone()]
+    } else {
+        restore_spawn_configs(base_config, restore)
     }
 }
 
@@ -636,7 +802,8 @@ fn adjust_focus_after_remove(focused: &mut usize, removed_idx: usize, new_len: u
     }
 }
 
-/// Classify user input as a command (`/new`, `/quit`) or a regular message.
+/// Classify user input as a command (`/new`, `/quit`, `/close`) or a regular
+/// message.
 ///
 /// Extracted from the render closure so it can be unit-tested without an
 /// egui context.
@@ -645,7 +812,9 @@ fn classify_input(text: &str, split_idx: usize) -> SplitAction {
     if trimmed.eq_ignore_ascii_case("/new") {
         SplitAction::New
     } else if trimmed.eq_ignore_ascii_case("/quit") {
-        SplitAction::Quit(split_idx)
+        SplitAction::QuitApp
+    } else if trimmed.eq_ignore_ascii_case("/close") {
+        SplitAction::CloseSplit(split_idx)
     } else {
         SplitAction::Send(split_idx)
     }
@@ -664,9 +833,10 @@ enum SplitAction {
     Send(usize),
     /// Spawn a new agent and append a split to the right.
     New,
-    /// Close the split at this index. Drops the agent (SIGKILL via
-    /// `kill_on_drop`).
-    Quit(usize),
+    /// Quit the whole app.
+    QuitApp,
+    /// Close the split at this index. Drops the agent (`kill_on_drop`).
+    CloseSplit(usize),
     /// Cancel the in-progress turn on this split's agent.
     Cancel(usize),
 }
@@ -687,8 +857,8 @@ enum MenuAction {
 /// Render one vertical split: scroll area with message history, streaming
 /// view, error display, and an input bar pinned at the bottom.
 ///
-/// Any actions the user triggers (send, `/new`, `/quit`) are pushed into
-/// `actions` for deferred execution. Focus changes are recorded in
+/// Any actions the user triggers (send, `/new`, `/quit`, `/close`) are pushed
+/// into `actions` for deferred execution. Focus changes are recorded in
 /// `new_focus`.
 fn render_split(
     ui: &mut egui::Ui,
@@ -796,7 +966,10 @@ fn render_split(
         let action = classify_input(input, split_idx);
         // Commands are consumed here; regular messages are consumed
         // by `send_message` after the closure returns.
-        if matches!(action, SplitAction::New | SplitAction::Quit(_)) {
+        if matches!(
+            action,
+            SplitAction::New | SplitAction::QuitApp | SplitAction::CloseSplit(_)
+        ) {
             input.clear();
         }
         actions.push(action);
@@ -1224,6 +1397,18 @@ mod tests {
         }
     }
 
+    fn temp_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "ox-egui-{name}-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
     /// Helper to build an `OxApp` with N splits over duplex pipes. Returns
     /// the app, its session-id mirror, and a vec of the agent-side writer
     /// streams (one per split, for feeding events).
@@ -1448,6 +1633,143 @@ mod tests {
         );
     }
 
+    #[test]
+    fn replace_workspace_restores_saved_sessions_fractions_and_focus() {
+        use tokio::runtime::Builder;
+        let rt = Builder::new_current_thread().enable_all().build().unwrap();
+        let _guard = rt.enter();
+
+        let dir = temp_dir("replace-restore");
+        let layout_path = dir.join("workspaces.json");
+        let target_root = dir.join("target");
+        std::fs::create_dir_all(&target_root).unwrap();
+        let id1 = SessionId::new_v4();
+        let id2 = SessionId::new_v4();
+        let mut layouts = WorkspaceLayouts::default();
+        layouts.save_current(&target_root, [Some(id1), Some(id2)], &[0.3, 0.7], 1);
+        layouts.save(&layout_path).unwrap();
+
+        let (mut app, _, _writers) = make_app(1);
+        app.spawn_config.sessions_dir = dir.join("sessions");
+        std::fs::create_dir_all(&app.spawn_config.sessions_dir).unwrap();
+        std::fs::write(
+            app.spawn_config.sessions_dir.join(format!("{id1}.json")),
+            "{}",
+        )
+        .unwrap();
+        std::fs::write(
+            app.spawn_config.sessions_dir.join(format!("{id2}.json")),
+            "{}",
+        )
+        .unwrap();
+        app.layout_state_path = Some(layout_path);
+        let mut seen = Vec::new();
+
+        app.replace_workspace_with(target_root.clone(), |idx, config| {
+            seen.push((idx, config.workspace_root.clone(), config.resume));
+            Ok(make_split().0)
+        });
+
+        assert_eq!(
+            seen,
+            vec![
+                (0, target_root.clone(), Some(id1)),
+                (1, target_root.clone(), Some(id2))
+            ]
+        );
+        assert_eq!(app.splits.len(), 2);
+        assert_eq!(app.split_fracs, vec![0.3, 0.7]);
+        assert_eq!(app.focused, 1);
+        assert_eq!(app.spawn_config.workspace_root, target_root);
+        assert_eq!(app.spawn_config.resume, None);
+    }
+
+    #[test]
+    fn replace_workspace_saves_current_layout_before_switching() {
+        use tokio::runtime::Builder;
+        let rt = Builder::new_current_thread().enable_all().build().unwrap();
+        let _guard = rt.enter();
+
+        let dir = temp_dir("replace-save-current");
+        let layout_path = dir.join("workspaces.json");
+        let old_root = dir.join("old");
+        let new_root = dir.join("new");
+        std::fs::create_dir_all(&old_root).unwrap();
+        std::fs::create_dir_all(&new_root).unwrap();
+
+        let (mut app, _, _writers) = make_app(2);
+        app.layout_state_path = Some(layout_path.clone());
+        app.spawn_config.workspace_root = old_root.clone();
+        app.splits[0].session_id = Some(SessionId::new_v4());
+        app.splits[1].session_id = Some(SessionId::new_v4());
+        app.split_fracs = vec![0.4, 0.6];
+        app.focused = 1;
+
+        let old_ids: Vec<_> = app.splits.iter().map(|split| split.session_id()).collect();
+        app.replace_workspace_with(new_root, |_, _| Ok(make_split().0));
+
+        let layouts = WorkspaceLayouts::load(&layout_path).unwrap();
+        let restored = layouts.restore_for(&old_root).unwrap();
+        assert_eq!(
+            restored.sessions,
+            old_ids.into_iter().flatten().collect::<Vec<_>>()
+        );
+        assert_eq!(restored.split_fracs, vec![0.4, 0.6]);
+        assert_eq!(restored.focused, 1);
+    }
+
+    #[test]
+    fn restore_spawn_configs_use_saved_sessions_in_order() {
+        let base = dummy_spawn_config();
+        let id1 = SessionId::new_v4();
+        let id2 = SessionId::new_v4();
+        let layout = RestoreLayout {
+            sessions: vec![id1, id2],
+            split_fracs: vec![0.25, 0.75],
+            focused: 1,
+        };
+
+        let configs = restore_spawn_configs(&base, Some(&layout));
+
+        assert_eq!(configs.len(), 2);
+        assert_eq!(configs[0].resume, Some(id1));
+        assert_eq!(configs[1].resume, Some(id2));
+        assert!(
+            configs
+                .iter()
+                .all(|config| config.workspace_root == base.workspace_root)
+        );
+    }
+
+    #[test]
+    fn restore_spawn_configs_falls_back_to_fresh_without_layout() {
+        let mut base = dummy_spawn_config();
+        base.resume = Some(SessionId::new_v4());
+
+        let configs = restore_spawn_configs(&base, None);
+
+        assert_eq!(configs.len(), 1);
+        assert_eq!(configs[0].resume, None);
+    }
+
+    #[test]
+    fn startup_spawn_configs_preserve_explicit_resume_override() {
+        let mut base = dummy_spawn_config();
+        let explicit = SessionId::new_v4();
+        let saved = SessionId::new_v4();
+        base.resume = Some(explicit);
+        let layout = RestoreLayout {
+            sessions: vec![saved],
+            split_fracs: vec![1.0],
+            focused: 0,
+        };
+
+        let configs = startup_spawn_configs(&base, Some(&layout));
+
+        assert_eq!(configs.len(), 1);
+        assert_eq!(configs[0].resume, Some(explicit));
+    }
+
     // -- Command interception tests --
 
     #[tokio::test]
@@ -1552,6 +1874,49 @@ mod tests {
         assert_eq!(app.splits.len(), 4);
     }
 
+    #[test]
+    fn close_split_on_last_split_uses_quit_confirmation_when_busy() {
+        use tokio::runtime::Builder;
+        let rt = Builder::new_current_thread().enable_all().build().unwrap();
+        let _guard = rt.enter();
+
+        let (mut app, _, _writers) = make_app(1);
+        app.splits[0].waiting = true;
+        let ctx = egui::Context::default();
+
+        app.handle_close_split(0, &ctx);
+
+        assert_eq!(app.splits.len(), 1);
+        assert!(app.confirm_quit);
+    }
+
+    #[test]
+    fn native_close_request_is_cancelled_when_turn_is_running() {
+        use tokio::runtime::Builder;
+        let rt = Builder::new_current_thread().enable_all().build().unwrap();
+        let _guard = rt.enter();
+
+        let (mut app, _, _writers) = make_app(1);
+        app.splits[0].waiting = true;
+
+        assert!(app.should_cancel_viewport_close_request());
+        assert!(app.confirm_quit);
+    }
+
+    #[test]
+    fn native_close_request_is_not_cancelled_after_quit_confirmed() {
+        use tokio::runtime::Builder;
+        let rt = Builder::new_current_thread().enable_all().build().unwrap();
+        let _guard = rt.enter();
+
+        let (mut app, _, _writers) = make_app(1);
+        app.splits[0].waiting = true;
+        app.quit_confirmed = true;
+
+        assert!(!app.should_cancel_viewport_close_request());
+        assert!(!app.confirm_quit);
+    }
+
     // -- Command classification tests --
 
     #[test]
@@ -1564,8 +1929,16 @@ mod tests {
     #[test]
     fn classify_input_recognizes_quit() {
         match classify_input("/quit", 2) {
-            SplitAction::Quit(idx) => assert_eq!(idx, 2),
+            SplitAction::QuitApp => {}
             other => panic!("expected Quit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_input_recognizes_close() {
+        match classify_input("/close", 2) {
+            SplitAction::CloseSplit(idx) => assert_eq!(idx, 2),
+            other => panic!("expected CloseSplit, got {other:?}"),
         }
     }
 
@@ -1586,41 +1959,6 @@ mod tests {
     #[test]
     fn about_text_uses_supplied_app_version() {
         assert_eq!(about_text("9.8.7"), "Ox v9.8.7");
-    }
-
-    #[tokio::test]
-    async fn new_command_is_not_sent_to_agent() {
-        // `/new` must be intercepted — the agent should never see it.
-        // We verify by checking that the agent's reader has no frames.
-        let (agent_writer, client_reader) = duplex(4096);
-        let (client_writer, agent_reader) = duplex(4096);
-        let client = AgentClient::new(BufReader::new(client_reader), client_writer);
-
-        let (mut app, _mirror) = OxApp::new(
-            vec![AgentSplit::new(client)],
-            dummy_spawn_config(),
-            "test-version",
-        );
-
-        // Simulate what the render closure does: classify, clear, send.
-        app.inputs[0] = "/new".into();
-        let action = classify_input(&app.inputs[0], 0);
-        assert!(matches!(action, SplitAction::New));
-        app.inputs[0].clear();
-        // We don't call handle_new (it would fail — no real binary), but
-        // the key assertion is that no command reached the agent.
-
-        // Drop the writer so the agent reader sees EOF, not a hang.
-        drop(app);
-        drop(agent_writer);
-
-        // Confirm no command was sent.
-        let mut reader = BufReader::new(agent_reader);
-        let frame: Option<AgentCommand> = protocol::read_frame(&mut reader).await.unwrap();
-        assert!(
-            frame.is_none(),
-            "agent should not receive /new as a message"
-        );
     }
 
     #[tokio::test]

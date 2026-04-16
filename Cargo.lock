@@ -120,6 +120,8 @@ dependencies = [
  "eframe",
  "egui-file-dialog",
  "protocol",
+ "serde",
+ "serde_json",
  "tokio",
 ]
 
