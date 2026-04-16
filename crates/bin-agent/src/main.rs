@@ -11,13 +11,14 @@
 //! the agent is in its main loop, per-turn errors surface as
 //! `AgentEvent::Error` frames and the loop keeps running.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use app::tools::{BashTool, EditFileTool, ReadFileTool, WriteFileTool};
 use app::{GlobTool, GrepTool, SecretStore, SessionRunner, Tool, ToolRegistry};
+use chrono::Local;
 use clap::Parser;
 use domain::SessionId;
 use protocol::{AgentEvent, write_frame};
@@ -25,9 +26,21 @@ use tokio::io::{AsyncWriteExt, BufReader};
 
 mod driver;
 
-const SYSTEM_PROMPT: &str = "\
+fn build_system_prompt(workspace_root: &Path, model: &str) -> String {
+    format!(
+        "\
 You are an AI coding assistant. You help users understand, write, and modify \
 code within their projects.
+
+Environment:
+- Workspace root: {workspace_root}
+- Platform: {os}
+- Model: {model}
+- Today's date: {date}
+
+Paths you report to the user must match the workspace root above. Do not \
+invent or assume paths — if you don't know something about the environment, \
+use a tool to check.
 
 Be concise and direct. Do not narrate what you are about to do or summarize \
 what you just did — just do the work and show the result.
@@ -40,7 +53,13 @@ automatically spilled to a file and a preview is shown — you never need to \
 work around output length yourself.
 
 Prefer answering from context when possible. Only call a tool when you \
-genuinely need information you don't already have or need to perform an action.";
+genuinely need information you don't already have or need to perform an action.",
+        workspace_root = workspace_root.display(),
+        os = std::env::consts::OS,
+        model = model,
+        date = Local::now().format("%Y-%m-%d"),
+    )
+}
 
 #[derive(Parser, Debug)]
 #[command(name = "ox-agent", about = "Headless session runner driven over stdio")]
@@ -134,7 +153,8 @@ async fn run(cli: AgentCli) -> Result<()> {
 
     let store = adapter_storage::DiskSessionStore::new(cli.sessions_dir.clone())?;
     let history_store = adapter_storage::DiskSessionStore::new(cli.sessions_dir)?;
-    let runner = SessionRunner::new(llm, store, tools, SYSTEM_PROMPT.to_owned());
+    let system_prompt = build_system_prompt(&cli.workspace_root, &cli.model);
+    let runner = SessionRunner::new(llm, store, tools, system_prompt);
 
     let stdin = tokio::io::stdin();
     let stdout = tokio::io::stdout();

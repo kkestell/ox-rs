@@ -14,6 +14,7 @@ adapter-secrets = { version = "0.1.0", path = "../adapter-secrets" }
 adapter-storage = { version = "0.1.0", path = "../adapter-storage" }
 anyhow = "1.0.102"
 app = { version = "0.1.0", path = "../app" }
+chrono = "0.4.44"
 clap = { version = "4.6.0", features = ["derive"] }
 domain = { version = "0.1.0", path = "../domain" }
 futures = "0.3.32"
