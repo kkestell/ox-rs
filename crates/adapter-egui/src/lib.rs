@@ -646,7 +646,7 @@ fn render_blocks(
                 let arrow = if open { "▼" } else { "▶" };
                 let header_text = format!("{arrow} {name}({arguments})");
                 let response = ui.add(
-                    egui::Label::new(egui::RichText::new(&header_text).color(egui::Color32::GRAY))
+                    egui::Label::new(egui::RichText::new(&header_text).color(egui::Color32::GREEN))
                         .sense(egui::Sense::click()),
                 );
                 if response.clicked() {
@@ -660,7 +660,7 @@ fn render_blocks(
                     let color = if is_error {
                         egui::Color32::RED
                     } else {
-                        egui::Color32::GRAY
+                        egui::Color32::GREEN
                     };
                     ui.label(egui::RichText::new(content).color(color));
                 }
