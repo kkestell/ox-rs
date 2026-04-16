@@ -396,6 +396,7 @@ fn render_split(
     // -- Scroll area with messages --
     let mut scroll_ui = ui.new_child(egui::UiBuilder::new().max_rect(scroll_rect));
     egui::ScrollArea::vertical()
+        .id_salt(egui::Id::new("split_scroll").with(split_idx))
         .auto_shrink(false)
         .stick_to_bottom(true)
         .show(&mut scroll_ui, |ui| {
