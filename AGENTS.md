@@ -19,7 +19,7 @@ Ox is a desktop AI coding assistant built in Rust. It uses a hexagonal (ports-an
 - `crates/adapter-egui/` — GUI library: `OxApp` (egui root), `AgentTab` (per-agent state), `AgentClient` (IPC client over stdio with reader/writer tasks), `AgentSpawnConfig`.
 - `crates/adapter-fs/` — Filesystem and shell: `LocalFileSystem` (implemented), `BashShell` (stub).
 - `crates/adapter-secrets/` — Secret retrieval: `EnvSecretStore` (implemented).
-- `crates/bin-gui/` — `ox-gui` binary: composition root for the GUI process. Parses CLI, locates the `ox-agent` binary, spawns exactly one `AgentClient`, wraps it in an `AgentTab`, runs `OxApp`. Prints `ox-gui --resume <id>` per active agent on shutdown.
+- `crates/bin-gui/` — `ox-gui` binary: composition root for the GUI process. Parses CLI, locates the `ox-agent` binary, spawns the initial agent, passes a cloneable `AgentSpawnConfig` template to `OxApp` for `/new`, runs the egui window. Prints `ox-gui --resume <id>` per active session on shutdown.
 - `crates/bin-agent/` — `ox-agent` binary: composition root for the agent process. Parses CLI, wires adapters, builds a `SessionRunner`, and hands control to `driver::agent_driver` which drives NDJSON I/O over stdin/stdout.
 - `experiments/` — Throwaway scripts for testing provider APIs.
 - `docs/` — Research and design notes.
@@ -146,10 +146,10 @@ sequenceDiagram
 ```
 
 Current status:
-- `bin-gui`: composition root for the GUI process. CLI (`--resume <id>`, `--model`), API key from env, locates `ox-agent` next to `current_exe()`, spawns one agent, runs `OxApp`, prints resume command on shutdown.
+- `bin-gui`: composition root for the GUI process. CLI (`--resume <id>`, `--model`), API key from env, locates `ox-agent` next to `current_exe()`, spawns the initial agent, passes a cloneable spawn config to `OxApp` for `/new`, runs the egui window, prints one resume command per active session on shutdown.
 - `bin-agent`: composition root for the agent process. CLI (`--workspace-root`, `--model`, `--sessions-dir`, `--resume`), wires adapters, runs `driver::agent_driver` over stdin/stdout. On fatal error, emits an `AgentEvent::Error` frame and exits non-zero.
 - `protocol`: `AgentCommand` (`SendMessage`), `AgentEvent` (`Ready`, `StreamDelta`, `MessageAppended`, `TurnComplete`, `Error`), `read_frame`/`write_frame` helpers. All enums `#[non_exhaustive]` for forward compatibility.
-- `adapter-egui`: `OxApp` renders `tabs[current]`; per-tab state (messages, streaming accumulator, waiting flag, error, session_id) lives on `AgentTab`. `AgentClient` owns the tokio::process `Child` with `kill_on_drop(true)`, runs reader/writer tasks, exposes a channel API. Single tab for this iteration; multi-tab plumbing is ready for a future tiling UI.
+- `adapter-egui`: `OxApp` renders all sessions as equal-width vertical splits via `ui.columns(N)`. `/new` spawns a new agent and appends a split; `/quit` closes the focused split (or exits the app on the last one). Focus is mouse-driven — clicking a split's input bar makes it active. Per-split state (messages, streaming accumulator, waiting flag, error, session_id) lives on `AgentTab`; per-split input strings live as a parallel `Vec<String>` on `OxApp` to avoid borrow conflicts. `AgentClient` owns the tokio::process `Child` with `kill_on_drop(true)`, runs reader/writer tasks, exposes a channel API.
 - `app::tools`: file-editing tool suite — `read_file` (hashlined output with offset/limit), `write_file` (creates parent dirs), `edit_file` (replace/insert_after operations anchored by hashlines with mismatch detection).
 - `adapter-llm/OpenRouterProvider`: implemented streaming path.
 - `adapter-llm/OllamaProvider`: stub.
@@ -163,6 +163,6 @@ Not yet implemented:
 - Session management UI (sessions can be resumed via CLI, but no in-app session browser/switcher).
 - Error recovery UI (errors displayed but no retry/dismiss).
 - Graceful cancel of an in-progress turn. Today the model is "kill the agent subprocess" — dropping the `AgentClient` / `AgentTab` SIGKILLs the agent. A future `AgentCommand::Cancel` that preserves partial state is not yet wired.
-- Multi-tab UI. `OxApp` holds `Vec<AgentTab>` and renders `tabs[current]`, but no UI exists yet to add, remove, or switch tabs.
+- Keyboard focus switching between splits (Ctrl+Left/Right or similar). Focus is mouse-driven only.
 - Tool-approval flow (tools auto-execute; destructive tools have no permission gate). Would require an `AgentEvent::ToolCallPending` + `AgentCommand::ApproveToolCall` protocol extension.
 - Bash tool (trait and registry are ready; `BashShell` is still a stub).

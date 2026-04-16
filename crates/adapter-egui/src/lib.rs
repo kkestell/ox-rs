@@ -5,8 +5,8 @@
 //! spawned by `bin-gui` and talked to through an [`AgentClient`].
 //!
 //! Per-session state lives in [`AgentTab`] so the GUI can host N agents
-//! concurrently. The current iteration always uses `tabs[0]`; tiling UI and
-//! tab switching land in a follow-up without another restructure.
+//! concurrently. The tiling UI renders all active sessions as equal-width
+//! vertical splits; `/new` adds a split, `/quit` closes one.
 
 mod agent_client;
 
@@ -131,27 +131,36 @@ impl AgentTab {
     }
 }
 
-/// Top-level GUI state. Owns a vector of agent tabs; `current` indexes the
-/// tab whose messages are rendered. For this iteration `current` is always
-/// 0 and no UI exists to switch tabs — the plumbing sits here so a future
-/// tiling UI can grow into it without another restructure.
+/// Top-level GUI state. Owns a vector of agent tabs displayed as equal-width
+/// vertical splits. `focused` indexes the split whose input bar receives
+/// keystrokes. Each split has its own input string in `inputs` (parallel to
+/// `tabs`) so rendering can borrow `&mut inputs[i]` and `&tabs[i]`
+/// simultaneously — Rust can split-borrow distinct struct fields but not
+/// `&mut tab.input` and `&tab.messages` on the same struct.
 pub struct OxApp {
     tabs: Vec<AgentTab>,
-    current: usize,
-    input: String,
+    /// Index of the focused split. Keystrokes go to `inputs[focused]`.
+    focused: usize,
+    /// Per-split input strings, parallel to `tabs`.
+    inputs: Vec<String>,
+    /// Template config for spawning new agents via `/new`. Cloned with
+    /// `resume: None` each time a new split is created.
+    spawn_config: AgentSpawnConfig,
     /// Slot the app writes session IDs into each frame so the composition
     /// root can read them after `run_native` consumes the app.
     session_id_mirror: SessionIdMirror,
 }
 
 impl OxApp {
-    pub fn new(tabs: Vec<AgentTab>) -> (Self, SessionIdMirror) {
+    pub fn new(tabs: Vec<AgentTab>, spawn_config: AgentSpawnConfig) -> (Self, SessionIdMirror) {
         assert!(!tabs.is_empty(), "OxApp requires at least one tab");
         let mirror: SessionIdMirror = Arc::new(Mutex::new(vec![None; tabs.len()]));
+        let inputs = vec![String::new(); tabs.len()];
         let app = Self {
             tabs,
-            current: 0,
-            input: String::new(),
+            focused: 0,
+            inputs,
+            spawn_config,
             session_id_mirror: mirror.clone(),
         };
         (app, mirror)
@@ -171,20 +180,71 @@ impl OxApp {
         }
     }
 
-    /// Send the current input as a user message to the current tab's agent.
+    /// Spawn a new agent and append a split to the right. On failure,
+    /// the error is shown on the currently focused split.
+    fn handle_new(&mut self, _ctx: &egui::Context) {
+        let mut config = self.spawn_config.clone();
+        config.resume = None;
+        match AgentClient::spawn(config) {
+            Ok(client) => {
+                let tab = AgentTab::new(client);
+                self.tabs.push(tab);
+                self.inputs.push(String::new());
+                self.focused = self.tabs.len() - 1;
+            }
+            Err(e) => {
+                self.tabs[self.focused].error = Some(format!("failed to spawn agent: {e:#}"));
+            }
+        }
+    }
+
+    /// Close the split at `split_idx`. If it's the last split, close the
+    /// app. Otherwise remove the tab and adjust focus so it stays on the
+    /// same logical split (or its left neighbor if the focused split was
+    /// removed).
+    fn handle_quit(&mut self, split_idx: usize, ctx: &egui::Context) {
+        if self.tabs.len() == 1 {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            return;
+        }
+        self.tabs.remove(split_idx);
+        self.inputs.remove(split_idx);
+        adjust_focus_after_remove(&mut self.focused, split_idx, self.tabs.len());
+    }
+
+    /// Add a pre-built tab. Used by tests that can't spawn a real agent
+    /// but need to exercise split add/remove logic.
+    #[cfg(test)]
+    fn add_tab(&mut self, tab: AgentTab) {
+        self.tabs.push(tab);
+        self.inputs.push(String::new());
+        self.focused = self.tabs.len() - 1;
+    }
+
+    /// Remove the tab at `split_idx` without viewport commands. Used by
+    /// tests that don't have an egui context.
+    #[cfg(test)]
+    fn remove_tab(&mut self, split_idx: usize) {
+        self.tabs.remove(split_idx);
+        self.inputs.remove(split_idx);
+        adjust_focus_after_remove(&mut self.focused, split_idx, self.tabs.len());
+    }
+
+    /// Send the input for the given split as a user message to that split's
+    /// agent.
     ///
     /// We DON'T optimistically push the user message into `messages`: the
     /// agent round-trips it back as a `MessageAppended` event, and having a
     /// single render path for every message (user input, tool results,
     /// assistant replies) keeps the code paths small.
-    fn send_message(&mut self) {
-        let text = self.input.trim().to_owned();
+    fn send_message(&mut self, split_idx: usize) {
+        let text = self.inputs[split_idx].trim().to_owned();
         if text.is_empty() {
             return;
         }
-        self.input.clear();
+        self.inputs[split_idx].clear();
 
-        let tab = &mut self.tabs[self.current];
+        let tab = &mut self.tabs[split_idx];
         if tab.waiting {
             return;
         }
@@ -208,81 +268,194 @@ impl eframe::App for OxApp {
         // no post-exit state.
         self.publish_session_ids();
 
-        let tab = &self.tabs[self.current];
-        let waiting = tab.waiting;
+        // Tiling layout: N equal-width vertical columns, one per agent
+        // session. Each column is a self-contained split with its own
+        // scroll area, message history, streaming view, error display,
+        // and input bar.
+        //
+        // Borrow-checker constraint: inside the `columns()` closure we
+        // can't call `&mut self` methods, so we collect "actions to
+        // perform" into a local vec and execute them after the closure.
+        let mut actions: Vec<SplitAction> = Vec::new();
+        let mut new_focus: Option<usize> = None;
+        let any_waiting = self.tabs.iter().any(|t| t.waiting);
 
-        // Input bar at the bottom. Must be registered BEFORE the central
-        // panel — egui allocates panels in declaration order, and the
-        // central panel consumes whatever space remains. If the bottom
-        // panel is added after the central panel, the central panel has
-        // already claimed the full viewport and message content ends up
-        // hidden behind the input bar.
-        egui::TopBottomPanel::bottom("input_panel").show(ctx, |ui| {
-            ui.add_space(4.0);
-            ui.horizontal(|ui| {
-                let input_response = ui.add_sized(
-                    [ui.available_width() - 60.0, 24.0],
-                    egui::TextEdit::singleline(&mut self.input).hint_text("Type a message..."),
-                );
+        egui::CentralPanel::default().show(ctx, |ui| {
+            let n = self.tabs.len();
+            ui.columns(n, |cols| {
+                for (i, col) in cols.iter_mut().enumerate() {
+                    let tab = &self.tabs[i];
+                    let input = &mut self.inputs[i];
 
-                let enter_pressed =
-                    input_response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-
-                let send_clicked = ui
-                    .add_enabled(!waiting, egui::Button::new("Send"))
-                    .clicked();
-
-                if enter_pressed || send_clicked {
-                    self.send_message();
-                    input_response.request_focus();
+                    render_split(col, tab, input, i, &mut actions, &mut new_focus);
                 }
             });
-            ui.add_space(4.0);
         });
 
-        // Message history fills whatever space the bottom panel leaves.
-        egui::CentralPanel::default().show(ctx, |ui| {
-            egui::ScrollArea::vertical()
-                .auto_shrink(false)
-                .stick_to_bottom(true)
-                .show(ui, |ui| {
-                    let tab = &self.tabs[self.current];
-                    for msg in &tab.messages {
-                        let label = match msg.role {
-                            Role::User => "You",
-                            Role::Assistant => "Ox",
-                            Role::Tool => "Tool",
-                        };
-                        ui.label(egui::RichText::new(label).strong());
-                        render_blocks(ui, &msg.content);
-                        ui.add_space(8.0);
-                    }
+        // Apply focus changes detected inside the render closure.
+        if let Some(idx) = new_focus {
+            self.focused = idx;
+        }
 
-                    // Live view of the in-flight turn. `streaming` is `None`
-                    // until the first delta arrives, so the "..." placeholder
-                    // shows while the request is in flight but hasn't
-                    // produced anything yet.
-                    if let Some(acc) = &tab.streaming {
-                        let snapshot = acc.snapshot();
-                        ui.label(egui::RichText::new("Ox").strong());
-                        render_blocks(ui, snapshot.content);
-                        ui.add_space(8.0);
-                    } else if tab.waiting {
-                        ui.label("...");
-                    }
+        // Execute deferred actions outside the borrow of `self.tabs` /
+        // `self.inputs`.
+        for action in actions {
+            match action {
+                SplitAction::Send(idx) => self.send_message(idx),
+                SplitAction::New => self.handle_new(ctx),
+                SplitAction::Quit(idx) => self.handle_quit(idx, ctx),
+            }
+        }
 
-                    if let Some(err) = &tab.error {
-                        ui.colored_label(egui::Color32::RED, err);
-                    }
-                });
-        });
-
-        // Keep polling while waiting so we pick up streaming tokens and
-        // the final response promptly.
-        if waiting {
+        // Keep polling while any split is waiting so we pick up streaming
+        // tokens and the final response promptly.
+        if any_waiting {
             ctx.request_repaint();
         }
     }
+}
+
+/// Adjust `focused` after removing the split at `removed_idx`.
+///
+/// If the removed split was before the focused one, decrement to keep
+/// pointing at the same logical split. If the focused split itself was
+/// removed, clamp to the last valid index (left neighbor or 0).
+fn adjust_focus_after_remove(focused: &mut usize, removed_idx: usize, new_len: usize) {
+    if removed_idx < *focused {
+        *focused -= 1;
+    } else if *focused >= new_len {
+        *focused = new_len.saturating_sub(1);
+    }
+}
+
+/// Classify user input as a command (`/new`, `/quit`) or a regular message.
+///
+/// Extracted from the render closure so it can be unit-tested without an
+/// egui context.
+fn classify_input(text: &str, split_idx: usize) -> SplitAction {
+    let trimmed = text.trim();
+    if trimmed.eq_ignore_ascii_case("/new") {
+        SplitAction::New
+    } else if trimmed.eq_ignore_ascii_case("/quit") {
+        SplitAction::Quit(split_idx)
+    } else {
+        SplitAction::Send(split_idx)
+    }
+}
+
+/// Actions that a split's render code can request. Collected inside the
+/// `columns()` closure (where we can't call `&mut self` methods) and
+/// executed afterward.
+#[derive(Debug)]
+enum SplitAction {
+    /// Send the current input as a user message to the agent at this index.
+    Send(usize),
+    /// Spawn a new agent and append a split to the right.
+    New,
+    /// Close the split at this index. Drops the agent (SIGKILL via
+    /// `kill_on_drop`).
+    Quit(usize),
+}
+
+/// Render one vertical split: scroll area with message history, streaming
+/// view, error display, and an input bar pinned at the bottom.
+///
+/// Any actions the user triggers (send, `/new`, `/quit`) are pushed into
+/// `actions` for deferred execution. Focus changes are recorded in
+/// `new_focus`.
+fn render_split(
+    ui: &mut egui::Ui,
+    tab: &AgentTab,
+    input: &mut String,
+    split_idx: usize,
+    actions: &mut Vec<SplitAction>,
+    new_focus: &mut Option<usize>,
+) {
+    // The split fills its column top to bottom. The input bar is pinned at
+    // the bottom using `bottom_up` layout; the scroll area fills the rest.
+    // We use `with_layout` to render the input bar first (so it claims its
+    // space), then render the scroll area in the remaining space above.
+    let waiting = tab.waiting;
+
+    // Reserve a stable area at the bottom for the input bar. We render the
+    // scroll area first (top-down), then the input bar in the remaining
+    // space at the bottom, by using nested allocations.
+    let total_rect = ui.available_rect_before_wrap();
+
+    // Input bar height: text field + padding.
+    let input_height = 32.0;
+    let scroll_rect = egui::Rect::from_min_max(
+        total_rect.min,
+        egui::pos2(total_rect.max.x, total_rect.max.y - input_height),
+    );
+    let input_rect = egui::Rect::from_min_max(
+        egui::pos2(total_rect.min.x, total_rect.max.y - input_height),
+        total_rect.max,
+    );
+
+    // -- Scroll area with messages --
+    let mut scroll_ui = ui.new_child(egui::UiBuilder::new().max_rect(scroll_rect));
+    egui::ScrollArea::vertical()
+        .auto_shrink(false)
+        .stick_to_bottom(true)
+        .show(&mut scroll_ui, |ui| {
+            for msg in &tab.messages {
+                let label = match msg.role {
+                    Role::User => "You",
+                    Role::Assistant => "Ox",
+                    Role::Tool => "Tool",
+                };
+                ui.label(egui::RichText::new(label).strong());
+                render_blocks(ui, &msg.content);
+                ui.add_space(8.0);
+            }
+
+            // Live view of the in-flight turn.
+            if let Some(acc) = &tab.streaming {
+                let snapshot = acc.snapshot();
+                ui.label(egui::RichText::new("Ox").strong());
+                render_blocks(ui, snapshot.content);
+                ui.add_space(8.0);
+            } else if tab.waiting {
+                ui.label("...");
+            }
+
+            if let Some(err) = &tab.error {
+                ui.colored_label(egui::Color32::RED, err);
+            }
+        });
+
+    // -- Input bar --
+    let mut input_ui = ui.new_child(egui::UiBuilder::new().max_rect(input_rect));
+    input_ui.horizontal(|ui| {
+        let input_response = ui.add_sized(
+            [ui.available_width() - 60.0, 24.0],
+            egui::TextEdit::singleline(input).hint_text("Type a message..."),
+        );
+
+        // Track focus: clicking a split's input bar makes it focused.
+        if input_response.gained_focus() {
+            *new_focus = Some(split_idx);
+        }
+
+        let enter_pressed =
+            input_response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+
+        let send_clicked = ui
+            .add_enabled(!waiting, egui::Button::new("Send"))
+            .clicked();
+
+        if enter_pressed || send_clicked {
+            let action = classify_input(input, split_idx);
+            // Commands are consumed here; regular messages are consumed
+            // by `send_message` after the closure returns.
+            if matches!(action, SplitAction::New | SplitAction::Quit(_)) {
+                input.clear();
+            }
+            actions.push(action);
+            input_response.request_focus();
+        }
+    });
 }
 
 /// Render a sequence of `ContentBlock`s as a flat column of labels.
@@ -589,6 +762,298 @@ mod tests {
         }
     }
 
+    /// Build a dummy `AgentSpawnConfig` for tests. The binary path is
+    /// garbage — these tests never actually spawn a process.
+    fn dummy_spawn_config() -> AgentSpawnConfig {
+        AgentSpawnConfig {
+            binary: PathBuf::from("/nonexistent/ox-agent"),
+            workspace_root: PathBuf::from("/tmp"),
+            model: "test-model".into(),
+            sessions_dir: PathBuf::from("/tmp/sessions"),
+            resume: None,
+            env: vec![],
+        }
+    }
+
+    /// Helper to build an `OxApp` with N tabs over duplex pipes. Returns
+    /// the app, its session-id mirror, and a vec of the agent-side writer
+    /// streams (one per tab, for feeding events).
+    fn make_app(n: usize) -> (OxApp, SessionIdMirror, Vec<tokio::io::DuplexStream>) {
+        assert!(n >= 1);
+        let mut tabs = Vec::with_capacity(n);
+        let mut writers = Vec::with_capacity(n);
+        for _ in 0..n {
+            let (tab, writer) = make_tab();
+            tabs.push(tab);
+            writers.push(writer);
+        }
+        let (app, mirror) = OxApp::new(tabs, dummy_spawn_config());
+        (app, mirror, writers)
+    }
+
+    // -- Split lifecycle tests --
+
+    #[test]
+    fn add_tab_grows_tabs_and_inputs() {
+        use tokio::runtime::Builder;
+        let rt = Builder::new_current_thread().enable_all().build().unwrap();
+        let _guard = rt.enter();
+
+        let (mut app, _, _writers) = make_app(1);
+        assert_eq!(app.tabs.len(), 1);
+        assert_eq!(app.inputs.len(), 1);
+        assert_eq!(app.focused, 0);
+
+        let (tab2, _w2) = make_tab();
+        app.add_tab(tab2);
+        assert_eq!(app.tabs.len(), 2);
+        assert_eq!(app.inputs.len(), 2);
+        // Focus moves to the new split.
+        assert_eq!(app.focused, 1);
+    }
+
+    #[test]
+    fn remove_tab_shrinks_tabs_and_inputs() {
+        use tokio::runtime::Builder;
+        let rt = Builder::new_current_thread().enable_all().build().unwrap();
+        let _guard = rt.enter();
+
+        let (mut app, _, _writers) = make_app(3);
+        assert_eq!(app.tabs.len(), 3);
+
+        // Remove the middle split.
+        app.remove_tab(1);
+        assert_eq!(app.tabs.len(), 2);
+        assert_eq!(app.inputs.len(), 2);
+    }
+
+    #[test]
+    fn remove_tab_clamps_focus_when_removing_last_split() {
+        use tokio::runtime::Builder;
+        let rt = Builder::new_current_thread().enable_all().build().unwrap();
+        let _guard = rt.enter();
+
+        let (mut app, _, _writers) = make_app(2);
+        app.focused = 1; // focus on the last split
+        app.remove_tab(1); // remove it
+        assert_eq!(app.focused, 0, "focus must clamp to valid range");
+    }
+
+    #[test]
+    fn remove_tab_preserves_focus_when_removing_before_focused() {
+        use tokio::runtime::Builder;
+        let rt = Builder::new_current_thread().enable_all().build().unwrap();
+        let _guard = rt.enter();
+
+        let (mut app, _, _writers) = make_app(3);
+        app.focused = 2; // focus on the last split
+        app.remove_tab(0); // remove the first split
+        // Focus was at index 2, now there are only 2 tabs (indices 0, 1).
+        // Clamp to 1.
+        assert_eq!(app.focused, 1);
+    }
+
+    #[test]
+    fn session_id_mirror_reflects_dynamic_tab_count() {
+        use tokio::runtime::Builder;
+        let rt = Builder::new_current_thread().enable_all().build().unwrap();
+        let _guard = rt.enter();
+
+        let (mut app, mirror, _writers) = make_app(1);
+        let (tab2, _w2) = make_tab();
+        app.add_tab(tab2);
+        app.publish_session_ids();
+        assert_eq!(mirror.lock().unwrap().len(), 2);
+
+        app.remove_tab(0);
+        app.publish_session_ids();
+        assert_eq!(mirror.lock().unwrap().len(), 1);
+    }
+
+    // -- Command interception tests --
+
+    #[tokio::test]
+    async fn send_message_routes_to_correct_split() {
+        // Build an app with two tabs and verify that sending on split 1
+        // doesn't touch split 0's agent.
+        let (agent_writer0, client_reader0) = duplex(4096);
+        let (client_writer0, agent_reader0) = duplex(4096);
+        let client0 = AgentClient::new(BufReader::new(client_reader0), client_writer0);
+
+        let (agent_writer1, client_reader1) = duplex(4096);
+        let (client_writer1, agent_reader1) = duplex(4096);
+        let client1 = AgentClient::new(BufReader::new(client_reader1), client_writer1);
+
+        let (mut app, _mirror) = OxApp::new(
+            vec![AgentTab::new(client0), AgentTab::new(client1)],
+            dummy_spawn_config(),
+        );
+
+        app.inputs[1] = "hello from split 1".into();
+        app.send_message(1);
+
+        // Split 1's agent should receive the command.
+        let mut reader1 = BufReader::new(agent_reader1);
+        let frame: Option<AgentCommand> = protocol::read_frame(&mut reader1).await.unwrap();
+        match frame.unwrap() {
+            AgentCommand::SendMessage { input } => assert_eq!(input, "hello from split 1"),
+            other => panic!("unexpected {other:?}"),
+        }
+
+        // Split 0's input is untouched and no command was sent.
+        assert!(app.inputs[0].is_empty());
+
+        // Keep pipes alive to avoid spurious disconnect errors.
+        drop(agent_writer0);
+        drop(agent_writer1);
+        drop(agent_reader0);
+    }
+
+    #[test]
+    fn send_message_clears_input_and_sets_waiting() {
+        use tokio::runtime::Builder;
+        let rt = Builder::new_current_thread().enable_all().build().unwrap();
+        let _guard = rt.enter();
+
+        let (mut app, _, _writers) = make_app(1);
+        app.inputs[0] = "test message".into();
+        app.send_message(0);
+        assert!(
+            app.inputs[0].is_empty(),
+            "input should be cleared after send"
+        );
+        assert!(app.tabs[0].waiting, "tab should be in waiting state");
+    }
+
+    #[test]
+    fn send_message_ignores_empty_input() {
+        use tokio::runtime::Builder;
+        let rt = Builder::new_current_thread().enable_all().build().unwrap();
+        let _guard = rt.enter();
+
+        let (mut app, _, _writers) = make_app(1);
+        app.inputs[0] = "   ".into(); // whitespace-only
+        app.send_message(0);
+        assert!(!app.tabs[0].waiting, "empty input should not trigger send");
+    }
+
+    #[test]
+    fn send_message_skips_when_waiting() {
+        use tokio::runtime::Builder;
+        let rt = Builder::new_current_thread().enable_all().build().unwrap();
+        let _guard = rt.enter();
+
+        let (mut app, _, _writers) = make_app(1);
+        app.tabs[0].waiting = true;
+        app.inputs[0] = "should not send".into();
+        app.send_message(0);
+        // Input IS cleared (the text is consumed), but the tab stays in
+        // the same waiting state — no command is sent to the agent.
+        assert!(app.inputs[0].is_empty());
+        assert!(app.tabs[0].waiting);
+    }
+
+    #[test]
+    fn remove_tab_tracks_focus_when_removing_before_non_last_focused() {
+        // Regression: removing a split before the focused one should
+        // decrement focus so it stays on the same logical tab, not just
+        // clamp when it overflows.
+        use tokio::runtime::Builder;
+        let rt = Builder::new_current_thread().enable_all().build().unwrap();
+        let _guard = rt.enter();
+
+        let (mut app, _, _writers) = make_app(5);
+        app.focused = 3;
+        app.remove_tab(1); // remove a tab before focus
+        // Was focused on logical tab at old-index 3; it's now at index 2.
+        assert_eq!(app.focused, 2);
+        assert_eq!(app.tabs.len(), 4);
+    }
+
+    // -- Command classification tests --
+
+    #[test]
+    fn classify_input_recognizes_new() {
+        assert!(matches!(classify_input("/new", 0), SplitAction::New));
+        assert!(matches!(classify_input("  /new  ", 0), SplitAction::New));
+        assert!(matches!(classify_input("/NEW", 0), SplitAction::New));
+    }
+
+    #[test]
+    fn classify_input_recognizes_quit() {
+        match classify_input("/quit", 2) {
+            SplitAction::Quit(idx) => assert_eq!(idx, 2),
+            other => panic!("expected Quit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_input_passes_unknown_commands_as_regular_messages() {
+        // `/help`, `/foo`, etc. are NOT intercepted — they should be sent
+        // to the agent as regular messages.
+        match classify_input("/help", 0) {
+            SplitAction::Send(idx) => assert_eq!(idx, 0),
+            other => panic!("expected Send for /help, got {other:?}"),
+        }
+        match classify_input("hello world", 1) {
+            SplitAction::Send(idx) => assert_eq!(idx, 1),
+            other => panic!("expected Send for plain text, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn new_command_is_not_sent_to_agent() {
+        // `/new` must be intercepted — the agent should never see it.
+        // We verify by checking that the agent's reader has no frames.
+        let (agent_writer, client_reader) = duplex(4096);
+        let (client_writer, agent_reader) = duplex(4096);
+        let client = AgentClient::new(BufReader::new(client_reader), client_writer);
+
+        let (mut app, _mirror) = OxApp::new(vec![AgentTab::new(client)], dummy_spawn_config());
+
+        // Simulate what the render closure does: classify, clear, send.
+        app.inputs[0] = "/new".into();
+        let action = classify_input(&app.inputs[0], 0);
+        assert!(matches!(action, SplitAction::New));
+        app.inputs[0].clear();
+        // We don't call handle_new (it would fail — no real binary), but
+        // the key assertion is that no command reached the agent.
+
+        // Drop the writer so the agent reader sees EOF, not a hang.
+        drop(app);
+        drop(agent_writer);
+
+        // Confirm no command was sent.
+        let mut reader = BufReader::new(agent_reader);
+        let frame: Option<AgentCommand> = protocol::read_frame(&mut reader).await.unwrap();
+        assert!(
+            frame.is_none(),
+            "agent should not receive /new as a message"
+        );
+    }
+
+    #[tokio::test]
+    async fn unknown_slash_command_is_sent_to_agent() {
+        // `/help` is not a known command — it should go to the agent.
+        let (_agent_writer, client_reader) = duplex(4096);
+        let (client_writer, agent_reader) = duplex(4096);
+        let client = AgentClient::new(BufReader::new(client_reader), client_writer);
+
+        let (mut app, _mirror) = OxApp::new(vec![AgentTab::new(client)], dummy_spawn_config());
+
+        app.inputs[0] = "/help".into();
+        let action = classify_input(&app.inputs[0], 0);
+        assert!(matches!(action, SplitAction::Send(0)));
+        app.send_message(0);
+
+        let mut reader = BufReader::new(agent_reader);
+        let frame: Option<AgentCommand> = protocol::read_frame(&mut reader).await.unwrap();
+        match frame.unwrap() {
+            AgentCommand::SendMessage { input } => assert_eq!(input, "/help"),
+            other => panic!("expected SendMessage, got {other:?}"),
+        }
+    }
+
     #[test]
     fn oxapp_publishes_session_ids_after_update() {
         // Independent test of `publish_session_ids` — does not need a tokio
@@ -603,7 +1068,7 @@ mod tests {
         let _guard = rt.enter();
 
         let (tab, _writer) = make_tab();
-        let (app, mirror) = OxApp::new(vec![tab]);
+        let (app, mirror) = OxApp::new(vec![tab], dummy_spawn_config());
         // Before publish, the mirror is initialized to `vec![None]`.
         assert_eq!(mirror.lock().unwrap().clone(), vec![None]);
         app.publish_session_ids();
@@ -613,7 +1078,7 @@ mod tests {
         let (mut tab2, _w2) = make_tab();
         tab2.session_id = Some(SessionId::new_v4());
         let expected = tab2.session_id;
-        let (app2, mirror2) = OxApp::new(vec![tab2]);
+        let (app2, mirror2) = OxApp::new(vec![tab2], dummy_spawn_config());
         app2.publish_session_ids();
         assert_eq!(mirror2.lock().unwrap().clone(), vec![expected]);
     }

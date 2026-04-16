@@ -1,14 +1,16 @@
 //! `ox-gui` — the desktop AI coding assistant GUI.
 //!
 //! A thin composition root: locates the `ox-agent` binary, builds an
-//! [`AgentSpawnConfig`] from CLI args + env + defaults, spawns exactly one
-//! agent, wraps its client in an [`AgentTab`], hands `vec![tab]` to
-//! [`OxApp`], and runs the egui window. On shutdown, prints a resume
-//! command per active tab so the user can pick up where they left off.
+//! [`AgentSpawnConfig`] from CLI args + env + defaults, spawns the initial
+//! agent, wraps its client in an [`AgentTab`], hands `vec![tab]` plus a
+//! cloneable spawn-config template to [`OxApp`], and runs the egui window.
+//! The user can spawn additional agents at runtime with `/new`. On
+//! shutdown, prints a resume command per active session so the user can
+//! pick up where they left off.
 //!
 //! All session work — LLM streaming, session persistence, tool execution —
-//! happens inside the `ox-agent` subprocess. This binary holds display
-//! state and nothing more.
+//! happens inside `ox-agent` subprocesses. This binary holds display state
+//! and nothing more.
 
 use std::path::PathBuf;
 
@@ -69,9 +71,14 @@ fn main() -> Result<()> {
     let rt = tokio::runtime::Runtime::new()?;
     let _guard = rt.enter();
 
-    let client = AgentClient::spawn(spawn_config)?;
+    let client = AgentClient::spawn(spawn_config.clone())?;
     let tab = AgentTab::new(client);
-    let (app, session_id_mirror) = OxApp::new(vec![tab]);
+    // Pass a template config with `resume: None` so `/new` always starts
+    // fresh sessions. The original config (which may have `--resume`) was
+    // consumed by the initial spawn above.
+    let mut template = spawn_config;
+    template.resume = None;
+    let (app, session_id_mirror) = OxApp::new(vec![tab], template);
     app.run()?;
 
     // After the GUI closes, read the session IDs the app mirrored on its
