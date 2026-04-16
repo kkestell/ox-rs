@@ -4,7 +4,7 @@
 //! execution, session persistence — happens in a separate `ox-agent` process
 //! spawned by `bin-gui` and talked to through an [`AgentClient`].
 //!
-//! Per-session state lives in [`AgentTab`] so the GUI can host N agents
+//! Per-session state lives in [`AgentSplit`] so the GUI can host N agents
 //! concurrently. The tiling UI renders all active sessions as equal-width
 //! vertical splits; `/new` adds a split, `/quit` closes one.
 
@@ -13,17 +13,19 @@ mod agent_client;
 pub use agent_client::{AgentClient, AgentSpawnConfig};
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
 use domain::{ContentBlock, Message, Role, SessionId};
 use eframe::egui;
+use egui_file_dialog::FileDialog;
 use protocol::{AgentCommand, AgentEvent};
 use tokio::sync::mpsc;
 
 use app::StreamAccumulator;
 
-/// Shared, thread-safe mirror of the per-tab session IDs.
+/// Shared, thread-safe mirror of the per-split session IDs.
 ///
 /// `eframe::run_native` consumes the `OxApp`, so after the window closes the
 /// app's state is gone. To let the composition root print resume commands on
@@ -36,7 +38,7 @@ use app::StreamAccumulator;
 /// every time we touch this code.
 pub type SessionIdMirror = Arc<Mutex<Vec<Option<SessionId>>>>;
 
-/// Per-agent state. One tab per running agent subprocess.
+/// Per-agent state. One split per running agent subprocess.
 ///
 /// Holds the `AgentClient` handle, the committed-message history, and a
 /// transient `StreamAccumulator` that mirrors the in-flight assistant turn
@@ -50,7 +52,7 @@ pub type SessionIdMirror = Arc<Mutex<Vec<Option<SessionId>>>>;
 /// only dequeues the next command between `run_turn` calls, so the queued
 /// `SendMessage` sits in the pipe until replay finishes. No GUI-side guard
 /// is needed.
-pub struct AgentTab {
+pub struct AgentSplit {
     client: AgentClient,
     messages: Vec<Message>,
     /// A live mirror of the in-flight assistant turn. Lazily created on the
@@ -66,7 +68,7 @@ pub struct AgentTab {
     cancelled: bool,
 }
 
-impl AgentTab {
+impl AgentSplit {
     pub fn new(client: AgentClient) -> Self {
         Self {
             client,
@@ -150,22 +152,22 @@ impl AgentTab {
     }
 }
 
-/// Top-level GUI state. Owns a vector of agent tabs displayed as resizable
+/// Top-level GUI state. Owns a vector of agent splits displayed as resizable
 /// vertical splits. `focused` indexes the split whose input bar receives
 /// keystrokes. Each split has its own input string in `inputs` (parallel to
-/// `tabs`) so rendering can borrow `&mut inputs[i]` and `&tabs[i]`
+/// `splits`) so rendering can borrow `&mut inputs[i]` and `&splits[i]`
 /// simultaneously — Rust can split-borrow distinct struct fields but not
-/// `&mut tab.input` and `&tab.messages` on the same struct.
+/// `&mut split.input` and `&split.messages` on the same struct.
 ///
 /// Split widths are stored as fractions (`split_fracs`) summing to 1.0.
 /// Dragging a separator transfers width between adjacent splits. Using
 /// fractions rather than absolute pixels means splits scale naturally
 /// when the window is resized.
 pub struct OxApp {
-    tabs: Vec<AgentTab>,
+    splits: Vec<AgentSplit>,
     /// Index of the focused split. Keystrokes go to `inputs[focused]`.
     focused: usize,
-    /// Per-split input strings, parallel to `tabs`.
+    /// Per-split input strings, parallel to `splits`.
     inputs: Vec<String>,
     /// Fractional width of each split, summing to 1.0. Updated by
     /// dragging the separator between adjacent splits.
@@ -179,23 +181,39 @@ pub struct OxApp {
     /// When set, the next frame will request egui focus on this split's
     /// input TextEdit, then clear the flag.
     pending_focus: Option<usize>,
+    file_dialog: FileDialog,
+    pending_workspace: Option<PathBuf>,
+    confirm_replace_workspace: bool,
+    confirm_quit: bool,
+    about_open: bool,
+    app_version: String,
 }
 
 impl OxApp {
-    pub fn new(tabs: Vec<AgentTab>, spawn_config: AgentSpawnConfig) -> (Self, SessionIdMirror) {
-        assert!(!tabs.is_empty(), "OxApp requires at least one tab");
-        let n = tabs.len();
+    pub fn new(
+        splits: Vec<AgentSplit>,
+        spawn_config: AgentSpawnConfig,
+        app_version: impl Into<String>,
+    ) -> (Self, SessionIdMirror) {
+        assert!(!splits.is_empty(), "OxApp requires at least one split");
+        let n = splits.len();
         let mirror: SessionIdMirror = Arc::new(Mutex::new(vec![None; n]));
         let inputs = vec![String::new(); n];
         let split_fracs = vec![1.0 / n as f32; n];
         let app = Self {
-            tabs,
+            splits,
             focused: 0,
             inputs,
             split_fracs,
             spawn_config,
             session_id_mirror: mirror.clone(),
             pending_focus: Some(0),
+            file_dialog: FileDialog::new(),
+            pending_workspace: None,
+            confirm_replace_workspace: false,
+            confirm_quit: false,
+            about_open: false,
+            app_version: app_version.into(),
         };
         (app, mirror)
     }
@@ -208,10 +226,16 @@ impl OxApp {
     }
 
     fn publish_session_ids(&self) {
-        let ids: Vec<Option<SessionId>> = self.tabs.iter().map(|t| t.session_id()).collect();
+        let ids: Vec<Option<SessionId>> = self.splits.iter().map(|s| s.session_id()).collect();
         if let Ok(mut slot) = self.session_id_mirror.lock() {
             *slot = ids;
         }
+    }
+
+    fn any_turn_in_progress(&self) -> bool {
+        self.splits
+            .iter()
+            .any(|split| split.waiting || split.streaming.is_some())
     }
 
     /// Spawn a new agent and append a split to the right. On failure,
@@ -221,27 +245,27 @@ impl OxApp {
         config.resume = None;
         match AgentClient::spawn(config) {
             Ok(client) => {
-                let tab = AgentTab::new(client);
-                self.tabs.push(tab);
+                let split = AgentSplit::new(client);
+                self.splits.push(split);
                 self.inputs.push(String::new());
-                self.focused = self.tabs.len() - 1;
+                self.focused = self.splits.len() - 1;
                 self.pending_focus = Some(self.focused);
                 // Redistribute widths equally.
-                let n = self.tabs.len();
+                let n = self.splits.len();
                 self.split_fracs = vec![1.0 / n as f32; n];
             }
             Err(e) => {
-                self.tabs[self.focused].error = Some(format!("failed to spawn agent: {e:#}"));
+                self.splits[self.focused].error = Some(format!("failed to spawn agent: {e:#}"));
             }
         }
     }
 
     /// Close the split at `split_idx`. If it's the last split, close the
-    /// app. Otherwise remove the tab and adjust focus so it stays on the
+    /// app. Otherwise remove the split and adjust focus so it stays on the
     /// same logical split (or its left neighbor if the focused split was
     /// removed).
     fn handle_quit(&mut self, split_idx: usize, ctx: &egui::Context) {
-        if self.tabs.len() == 1 {
+        if self.splits.len() == 1 {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             return;
         }
@@ -254,27 +278,27 @@ impl OxApp {
         };
         self.split_fracs[neighbor] += reclaimed;
 
-        self.tabs.remove(split_idx);
+        self.splits.remove(split_idx);
         self.inputs.remove(split_idx);
-        adjust_focus_after_remove(&mut self.focused, split_idx, self.tabs.len());
+        adjust_focus_after_remove(&mut self.focused, split_idx, self.splits.len());
         self.pending_focus = Some(self.focused);
     }
 
-    /// Add a pre-built tab. Used by tests that can't spawn a real agent
+    /// Add a pre-built split. Used by tests that can't spawn a real agent
     /// but need to exercise split add/remove logic.
     #[cfg(test)]
-    fn add_tab(&mut self, tab: AgentTab) {
-        self.tabs.push(tab);
+    fn add_split(&mut self, split: AgentSplit) {
+        self.splits.push(split);
         self.inputs.push(String::new());
-        self.focused = self.tabs.len() - 1;
-        let n = self.tabs.len();
+        self.focused = self.splits.len() - 1;
+        let n = self.splits.len();
         self.split_fracs = vec![1.0 / n as f32; n];
     }
 
-    /// Remove the tab at `split_idx` without viewport commands. Used by
+    /// Remove the split at `split_idx` without viewport commands. Used by
     /// tests that don't have an egui context.
     #[cfg(test)]
-    fn remove_tab(&mut self, split_idx: usize) {
+    fn remove_split(&mut self, split_idx: usize) {
         let reclaimed = self.split_fracs.remove(split_idx);
         let neighbor = if split_idx < self.split_fracs.len() {
             split_idx
@@ -283,9 +307,9 @@ impl OxApp {
         };
         self.split_fracs[neighbor] += reclaimed;
 
-        self.tabs.remove(split_idx);
+        self.splits.remove(split_idx);
         self.inputs.remove(split_idx);
-        adjust_focus_after_remove(&mut self.focused, split_idx, self.tabs.len());
+        adjust_focus_after_remove(&mut self.focused, split_idx, self.splits.len());
     }
 
     /// Send the input for the given split as a user message to that split's
@@ -302,24 +326,66 @@ impl OxApp {
         }
         self.inputs[split_idx].clear();
 
-        let tab = &mut self.tabs[split_idx];
-        if tab.waiting {
+        let split = &mut self.splits[split_idx];
+        if split.waiting {
             return;
         }
 
         // Best-effort send. If the writer task is gone (agent dead), the
         // next `poll_events` will surface the disconnect as an Error.
-        let _ = tab.client.send(AgentCommand::SendMessage { input: text });
-        tab.waiting = true;
-        tab.error = None;
-        tab.cancelled = false;
+        let _ = split.client.send(AgentCommand::SendMessage { input: text });
+        split.waiting = true;
+        split.error = None;
+        split.cancelled = false;
+    }
+
+    fn replace_workspace(&mut self, new_root: PathBuf) {
+        self.replace_workspace_with(new_root, |_, config| {
+            AgentClient::spawn(config.clone()).map(AgentSplit::new)
+        });
+    }
+
+    fn replace_workspace_with(
+        &mut self,
+        new_root: PathBuf,
+        mut factory: impl FnMut(usize, &AgentSpawnConfig) -> Result<AgentSplit>,
+    ) {
+        let n = self.splits.len();
+        let mut next_config = self.spawn_config.clone();
+        next_config.workspace_root = new_root;
+        next_config.resume = None;
+
+        let mut next_splits = Vec::with_capacity(n);
+        for idx in 0..n {
+            match factory(idx, &next_config) {
+                Ok(split) => next_splits.push(split),
+                Err(e) => {
+                    self.splits[self.focused].error = Some(format!("failed to spawn agent: {e:#}"));
+                    self.confirm_replace_workspace = false;
+                    self.pending_workspace = None;
+                    return;
+                }
+            }
+        }
+
+        self.spawn_config = next_config;
+        self.splits = next_splits;
+        self.inputs = vec![String::new(); n];
+        self.split_fracs = vec![1.0 / n as f32; n];
+        self.focused = 0;
+        self.pending_focus = Some(0);
+        if let Ok(mut slot) = self.session_id_mirror.lock() {
+            *slot = vec![None; n];
+        }
+        self.confirm_replace_workspace = false;
+        self.pending_workspace = None;
     }
 }
 
 impl eframe::App for OxApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        for tab in &mut self.tabs {
-            tab.poll_events();
+        for split in &mut self.splits {
+            split.poll_events();
         }
 
         // Publish the latest session IDs so the composition root sees them
@@ -327,18 +393,97 @@ impl eframe::App for OxApp {
         // no post-exit state.
         self.publish_session_ids();
 
+        let mut menu_actions: Vec<MenuAction> = Vec::new();
+        egui::TopBottomPanel::top("menu_bar").show(ctx, |ui| {
+            egui::menu::bar(ui, |ui| {
+                ui.menu_button("File", |ui| {
+                    if ui.button("Open...").clicked() {
+                        menu_actions.push(MenuAction::OpenWorkspacePicker);
+                        ui.close_menu();
+                    }
+                    if ui.button("Quit").clicked() {
+                        menu_actions.push(MenuAction::QuitRequested);
+                        ui.close_menu();
+                    }
+                });
+                ui.menu_button("Help", |ui| {
+                    if ui.button("About").clicked() {
+                        menu_actions.push(MenuAction::OpenAbout);
+                        ui.close_menu();
+                    }
+                });
+            });
+        });
+
+        self.file_dialog.update(ctx);
+        if let Some(path) = self.file_dialog.take_picked() {
+            menu_actions.push(MenuAction::ConfirmReplaceWorkspace(path));
+        }
+
+        if self.confirm_replace_workspace {
+            egui::Modal::new(egui::Id::new("confirm_replace_workspace")).show(ctx, |ui| {
+                ui.vertical(|ui| {
+                    ui.heading("Open Workspace");
+                    ui.label(
+                        "This will close all current sessions. Resume hints for those sessions \
+                         will not be shown on exit.",
+                    );
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("Cancel").clicked() {
+                            menu_actions.push(MenuAction::CancelReplaceWorkspace);
+                        }
+                        if ui.button("Open").clicked() {
+                            menu_actions.push(MenuAction::ReplaceWorkspaceConfirmed);
+                        }
+                    });
+                });
+            });
+        }
+
+        if self.confirm_quit {
+            egui::Modal::new(egui::Id::new("confirm_quit")).show(ctx, |ui| {
+                ui.vertical(|ui| {
+                    ui.heading("Quit Ox");
+                    ui.label("A turn is in progress. Are you sure you want to quit?");
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("Cancel").clicked() {
+                            menu_actions.push(MenuAction::CancelQuit);
+                        }
+                        if ui.button("Quit").clicked() {
+                            menu_actions.push(MenuAction::ConfirmQuit);
+                        }
+                    });
+                });
+            });
+        }
+
+        if self.about_open {
+            egui::Modal::new(egui::Id::new("about_ox")).show(ctx, |ui| {
+                ui.vertical(|ui| {
+                    ui.heading("About");
+                    ui.label(about_text(&self.app_version));
+                    ui.add_space(8.0);
+                    if ui.button("Close").clicked() {
+                        menu_actions.push(MenuAction::CloseAbout);
+                    }
+                });
+            });
+        }
+
         // Tiling layout: a single CentralPanel divided into N vertical
         // splits with draggable separators between them. Split widths are
         // stored as fractions of the available width (`split_fracs`),
         // updated by dragging a separator.
         //
         // Borrow-checker constraint: we can't call `&mut self` methods
-        // while borrowing tabs/inputs, so we collect deferred "actions"
+        // while borrowing splits/inputs, so we collect deferred "actions"
         // and execute them after all splits are rendered.
         let mut actions: Vec<SplitAction> = Vec::new();
         let mut new_focus: Option<usize> = None;
-        let any_waiting = self.tabs.iter().any(|t| t.waiting);
-        let n = self.tabs.len();
+        let any_waiting = self.splits.iter().any(|t| t.waiting);
+        let n = self.splits.len();
 
         let panel_frame = egui::Frame::central_panel(ctx.style().as_ref()).inner_margin(0.0);
         egui::CentralPanel::default()
@@ -362,12 +507,12 @@ impl eframe::App for OxApp {
                     );
 
                     let mut child = ui.new_child(egui::UiBuilder::new().max_rect(split_rect));
-                    let tab = &self.tabs[i];
+                    let split = &self.splits[i];
                     let input = &mut self.inputs[i];
                     let grab_focus = self.pending_focus == Some(i);
                     render_split(
                         &mut child,
-                        tab,
+                        split,
                         input,
                         i,
                         grab_focus,
@@ -422,7 +567,39 @@ impl eframe::App for OxApp {
             self.focused = idx;
         }
 
-        // Execute deferred actions outside the borrow of `self.tabs` /
+        for action in menu_actions {
+            match action {
+                MenuAction::OpenWorkspacePicker => self.file_dialog.pick_directory(),
+                MenuAction::QuitRequested => {
+                    if self.any_turn_in_progress() {
+                        self.confirm_quit = true;
+                    } else {
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    }
+                }
+                MenuAction::OpenAbout => self.about_open = true,
+                MenuAction::ConfirmReplaceWorkspace(path) => {
+                    self.pending_workspace = Some(path);
+                    self.confirm_replace_workspace = true;
+                }
+                MenuAction::CancelReplaceWorkspace => {
+                    self.pending_workspace = None;
+                    self.confirm_replace_workspace = false;
+                }
+                MenuAction::ReplaceWorkspaceConfirmed => {
+                    if let Some(path) = self.pending_workspace.clone() {
+                        self.replace_workspace(path);
+                    } else {
+                        self.confirm_replace_workspace = false;
+                    }
+                }
+                MenuAction::ConfirmQuit => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+                MenuAction::CancelQuit => self.confirm_quit = false,
+                MenuAction::CloseAbout => self.about_open = false,
+            }
+        }
+
+        // Execute deferred actions outside the borrow of `self.splits` /
         // `self.inputs`.
         for action in actions {
             match action {
@@ -430,7 +607,7 @@ impl eframe::App for OxApp {
                 SplitAction::New => self.handle_new(ctx),
                 SplitAction::Quit(idx) => self.handle_quit(idx, ctx),
                 SplitAction::Cancel(idx) => {
-                    let _ = self.tabs[idx].client.send(AgentCommand::Cancel);
+                    let _ = self.splits[idx].client.send(AgentCommand::Cancel);
                 }
             }
         }
@@ -471,6 +648,10 @@ fn classify_input(text: &str, split_idx: usize) -> SplitAction {
     }
 }
 
+fn about_text(version: &str) -> String {
+    format!("Ox v{version}")
+}
+
 /// Actions that a split's render code can request. Collected inside the
 /// `columns()` closure (where we can't call `&mut self` methods) and
 /// executed afterward.
@@ -487,6 +668,19 @@ enum SplitAction {
     Cancel(usize),
 }
 
+#[derive(Debug)]
+enum MenuAction {
+    OpenWorkspacePicker,
+    QuitRequested,
+    OpenAbout,
+    ConfirmReplaceWorkspace(PathBuf),
+    CancelReplaceWorkspace,
+    ReplaceWorkspaceConfirmed,
+    ConfirmQuit,
+    CancelQuit,
+    CloseAbout,
+}
+
 /// Render one vertical split: scroll area with message history, streaming
 /// view, error display, and an input bar pinned at the bottom.
 ///
@@ -495,7 +689,7 @@ enum SplitAction {
 /// `new_focus`.
 fn render_split(
     ui: &mut egui::Ui,
-    tab: &AgentTab,
+    split: &AgentSplit,
     input: &mut String,
     split_idx: usize,
     grab_focus: bool,
@@ -526,7 +720,7 @@ fn render_split(
     // Tool results arrive as separate Role::Tool messages containing ToolResult
     // blocks. We collect them here and skip those messages in the render loop.
     let mut tool_results: HashMap<&str, (&str, bool)> = HashMap::new();
-    for msg in &tab.messages {
+    for msg in &split.messages {
         if msg.role == Role::Tool {
             for block in &msg.content {
                 if let ContentBlock::ToolResult {
@@ -548,7 +742,7 @@ fn render_split(
         .auto_shrink(false)
         .stick_to_bottom(true)
         .show(&mut scroll_ui, |ui| {
-            for msg in &tab.messages {
+            for msg in &split.messages {
                 // Tool-role messages are consumed via the tool-result index
                 // and rendered inline under their paired tool-call block.
                 if msg.role == Role::Tool {
@@ -560,20 +754,20 @@ fn render_split(
 
             // Live view of the in-flight turn. No tool results exist yet
             // during streaming — they arrive after the turn completes.
-            if let Some(acc) = &tab.streaming {
+            if let Some(acc) = &split.streaming {
                 let snapshot = acc.snapshot();
                 let empty = HashMap::new();
                 render_blocks(ui, snapshot.content, &Role::Assistant, &empty);
                 ui.add_space(8.0);
-            } else if tab.waiting {
+            } else if split.waiting {
                 ui.label("...");
             }
 
-            if tab.cancelled {
+            if split.cancelled {
                 ui.colored_label(egui::Color32::RED, "Cancelled");
             }
 
-            if let Some(err) = &tab.error {
+            if let Some(err) = &split.error {
                 ui.colored_label(egui::Color32::RED, err);
             }
         });
@@ -608,7 +802,7 @@ fn render_split(
 
     // Escape cancels the in-progress turn. Checked globally (not just on
     // the input widget) so it works even if the input doesn't have focus.
-    if tab.waiting && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+    if split.waiting && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
         actions.push(SplitAction::Cancel(split_idx));
     }
 }
@@ -759,11 +953,11 @@ fn render_blocks(
 
 #[cfg(test)]
 mod tests {
-    //! `AgentTab` state-machine tests.
+    //! `AgentSplit` state-machine tests.
     //!
     //! `OxApp::update` is driven by egui and exercised by running the app;
     //! we don't try to simulate egui here. Instead we pin down the invariants
-    //! the plan calls out for `AgentTab`:
+    //! the plan calls out for `AgentSplit`:
     //!
     //! - `Ready` records `session_id` and *only* that — `messages`, `waiting`,
     //!   `streaming`, `error` stay untouched.
@@ -772,7 +966,7 @@ mod tests {
     //! - `TurnComplete` clears `waiting` and `streaming` and `error`.
     //! - `Error` clears `waiting` and `streaming` and records the message.
     //!
-    //! Each test drives a real `AgentTab` through its `poll_events` method
+    //! Each test drives a real `AgentSplit` through its `poll_events` method
     //! by feeding frames into an in-memory duplex pipe.
 
     use std::path::PathBuf;
@@ -784,31 +978,31 @@ mod tests {
 
     use super::*;
 
-    /// Build a tab whose `AgentClient` reads from `agent_writer`'s peer.
+    /// Build a split whose `AgentClient` reads from `agent_writer`'s peer.
     /// The caller writes `AgentEvent` frames into `agent_writer` and then
-    /// awaits `recv_until`, which pumps `tab.poll_events()` until a given
+    /// awaits `recv_until`, which pumps `split.poll_events()` until a given
     /// condition holds.
-    fn make_tab() -> (AgentTab, tokio::io::DuplexStream) {
+    fn make_split() -> (AgentSplit, tokio::io::DuplexStream) {
         let (agent_writer, client_reader) = duplex(4096);
         // Throwaway command pipe — these tests don't inspect commands.
         let (client_writer, _agent_reader) = duplex(4096);
         std::mem::forget(_agent_reader); // keep the pipe's read-end alive
         let client = AgentClient::new(BufReader::new(client_reader), client_writer);
-        (AgentTab::new(client), agent_writer)
+        (AgentSplit::new(client), agent_writer)
     }
 
-    /// Pump `tab.poll_events()` until `check` returns true or the timeout
+    /// Pump `split.poll_events()` until `check` returns true or the timeout
     /// elapses. Returns Ok iff `check` ended true. Uses short sleeps (5ms)
     /// to let the reader task pick up the frames we wrote.
     async fn wait_until(
-        tab: &mut AgentTab,
+        split: &mut AgentSplit,
         timeout: Duration,
-        mut check: impl FnMut(&AgentTab) -> bool,
+        mut check: impl FnMut(&AgentSplit) -> bool,
     ) -> Result<()> {
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
-            tab.poll_events();
-            if check(tab) {
+            split.poll_events();
+            if check(split) {
                 return Ok(());
             }
             if tokio::time::Instant::now() >= deadline {
@@ -822,7 +1016,7 @@ mod tests {
     async fn ready_records_session_id_and_leaves_other_fields_untouched() {
         // Pin down the documented invariant: after `Ready`, `waiting == false`
         // and `streaming == None`, and `messages` is unaffected.
-        let (mut tab, mut writer) = make_tab();
+        let (mut split, mut writer) = make_split();
         let id = SessionId::new_v4();
         write_frame(
             &mut writer,
@@ -834,21 +1028,21 @@ mod tests {
         .await
         .unwrap();
 
-        wait_until(&mut tab, Duration::from_secs(1), |t| {
+        wait_until(&mut split, Duration::from_secs(1), |t| {
             t.session_id() == Some(id)
         })
         .await
         .unwrap();
 
-        assert!(tab.messages.is_empty(), "Ready must not touch messages");
-        assert!(!tab.waiting, "Ready must not flip waiting");
-        assert!(tab.streaming.is_none(), "Ready must not touch streaming");
-        assert!(tab.error.is_none(), "Ready must not set an error");
+        assert!(split.messages.is_empty(), "Ready must not touch messages");
+        assert!(!split.waiting, "Ready must not flip waiting");
+        assert!(split.streaming.is_none(), "Ready must not touch streaming");
+        assert!(split.error.is_none(), "Ready must not set an error");
     }
 
     #[tokio::test]
     async fn message_appended_extends_history_without_touching_streaming() {
-        let (mut tab, mut writer) = make_tab();
+        let (mut split, mut writer) = make_split();
         write_frame(
             &mut writer,
             &AgentEvent::MessageAppended {
@@ -858,21 +1052,23 @@ mod tests {
         .await
         .unwrap();
 
-        wait_until(&mut tab, Duration::from_secs(1), |t| t.messages.len() == 1)
-            .await
-            .unwrap();
-        assert_eq!(tab.messages[0].text(), "hi");
-        assert!(!tab.waiting, "history replay should not set waiting");
-        assert!(tab.streaming.is_none());
+        wait_until(&mut split, Duration::from_secs(1), |t| {
+            t.messages.len() == 1
+        })
+        .await
+        .unwrap();
+        assert_eq!(split.messages[0].text(), "hi");
+        assert!(!split.waiting, "history replay should not set waiting");
+        assert!(split.streaming.is_none());
     }
 
     #[tokio::test]
     async fn message_appended_drops_any_inflight_stream_accumulator() {
-        // If a StreamDelta has already arrived, the tab is building an
+        // If a StreamDelta has already arrived, the split is building an
         // accumulator mirror. When the committed message lands, the
         // accumulator must be dropped so the renderer doesn't render the
         // same tokens twice.
-        let (mut tab, mut writer) = make_tab();
+        let (mut split, mut writer) = make_split();
         write_frame(
             &mut writer,
             &AgentEvent::StreamDelta {
@@ -883,9 +1079,11 @@ mod tests {
         )
         .await
         .unwrap();
-        wait_until(&mut tab, Duration::from_secs(1), |t| t.streaming.is_some())
-            .await
-            .unwrap();
+        wait_until(&mut split, Duration::from_secs(1), |t| {
+            t.streaming.is_some()
+        })
+        .await
+        .unwrap();
 
         write_frame(
             &mut writer,
@@ -895,38 +1093,40 @@ mod tests {
         )
         .await
         .unwrap();
-        wait_until(&mut tab, Duration::from_secs(1), |t| t.messages.len() == 1)
-            .await
-            .unwrap();
+        wait_until(&mut split, Duration::from_secs(1), |t| {
+            t.messages.len() == 1
+        })
+        .await
+        .unwrap();
         assert!(
-            tab.streaming.is_none(),
+            split.streaming.is_none(),
             "streaming mirror must be dropped on commit"
         );
     }
 
     #[tokio::test]
     async fn turn_complete_clears_waiting_and_streaming_and_error() {
-        let (mut tab, mut writer) = make_tab();
+        let (mut split, mut writer) = make_split();
         // Seed state the terminator has to clear.
-        tab.waiting = true;
-        tab.error = Some("old".into());
-        tab.streaming = Some(app::StreamAccumulator::new());
+        split.waiting = true;
+        split.error = Some("old".into());
+        split.streaming = Some(app::StreamAccumulator::new());
 
         write_frame(&mut writer, &AgentEvent::TurnComplete)
             .await
             .unwrap();
-        wait_until(&mut tab, Duration::from_secs(1), |t| !t.waiting)
+        wait_until(&mut split, Duration::from_secs(1), |t| !t.waiting)
             .await
             .unwrap();
-        assert!(tab.streaming.is_none());
-        assert!(tab.error.is_none());
+        assert!(split.streaming.is_none());
+        assert!(split.error.is_none());
     }
 
     #[tokio::test]
     async fn error_frame_records_message_and_clears_streaming() {
-        let (mut tab, mut writer) = make_tab();
-        tab.waiting = true;
-        tab.streaming = Some(app::StreamAccumulator::new());
+        let (mut split, mut writer) = make_split();
+        split.waiting = true;
+        split.streaming = Some(app::StreamAccumulator::new());
 
         write_frame(
             &mut writer,
@@ -936,17 +1136,17 @@ mod tests {
         )
         .await
         .unwrap();
-        wait_until(&mut tab, Duration::from_secs(1), |t| t.error.is_some())
+        wait_until(&mut split, Duration::from_secs(1), |t| t.error.is_some())
             .await
             .unwrap();
-        assert_eq!(tab.error.as_deref(), Some("model overloaded"));
-        assert!(!tab.waiting);
-        assert!(tab.streaming.is_none());
+        assert_eq!(split.error.as_deref(), Some("model overloaded"));
+        assert!(!split.waiting);
+        assert!(split.streaming.is_none());
     }
 
     #[tokio::test]
     async fn stream_delta_seeds_accumulator_on_first_event() {
-        let (mut tab, mut writer) = make_tab();
+        let (mut split, mut writer) = make_split();
         write_frame(
             &mut writer,
             &AgentEvent::StreamDelta {
@@ -957,9 +1157,11 @@ mod tests {
         )
         .await
         .unwrap();
-        wait_until(&mut tab, Duration::from_secs(1), |t| t.streaming.is_some())
-            .await
-            .unwrap();
+        wait_until(&mut split, Duration::from_secs(1), |t| {
+            t.streaming.is_some()
+        })
+        .await
+        .unwrap();
 
         // A subsequent delta should accumulate into the same snapshot, and
         // a `Finished` event with usage should produce a full snapshot with
@@ -991,7 +1193,7 @@ mod tests {
         .await
         .unwrap();
 
-        wait_until(&mut tab, Duration::from_secs(1), |t| {
+        wait_until(&mut split, Duration::from_secs(1), |t| {
             t.streaming
                 .as_ref()
                 .map(|a| a.snapshot().token_count == 2)
@@ -999,7 +1201,7 @@ mod tests {
         })
         .await
         .unwrap();
-        let snap = tab.streaming.as_ref().unwrap().snapshot();
+        let snap = split.streaming.as_ref().unwrap().snapshot();
         match &snap.content[0] {
             ContentBlock::Text { text } => assert_eq!(text, "hello world"),
             _ => panic!("expected Text block"),
@@ -1019,106 +1221,238 @@ mod tests {
         }
     }
 
-    /// Helper to build an `OxApp` with N tabs over duplex pipes. Returns
+    /// Helper to build an `OxApp` with N splits over duplex pipes. Returns
     /// the app, its session-id mirror, and a vec of the agent-side writer
-    /// streams (one per tab, for feeding events).
+    /// streams (one per split, for feeding events).
     fn make_app(n: usize) -> (OxApp, SessionIdMirror, Vec<tokio::io::DuplexStream>) {
         assert!(n >= 1);
-        let mut tabs = Vec::with_capacity(n);
+        let mut splits = Vec::with_capacity(n);
         let mut writers = Vec::with_capacity(n);
         for _ in 0..n {
-            let (tab, writer) = make_tab();
-            tabs.push(tab);
+            let (split, writer) = make_split();
+            splits.push(split);
             writers.push(writer);
         }
-        let (app, mirror) = OxApp::new(tabs, dummy_spawn_config());
+        let (app, mirror) = OxApp::new(splits, dummy_spawn_config(), "test-version");
         (app, mirror, writers)
     }
 
     // -- Split lifecycle tests --
 
     #[test]
-    fn add_tab_grows_tabs_and_inputs() {
+    fn add_split_grows_splits_and_inputs() {
         use tokio::runtime::Builder;
         let rt = Builder::new_current_thread().enable_all().build().unwrap();
         let _guard = rt.enter();
 
         let (mut app, _, _writers) = make_app(1);
-        assert_eq!(app.tabs.len(), 1);
+        assert_eq!(app.splits.len(), 1);
         assert_eq!(app.inputs.len(), 1);
         assert_eq!(app.focused, 0);
 
-        let (tab2, _w2) = make_tab();
-        app.add_tab(tab2);
-        assert_eq!(app.tabs.len(), 2);
+        let (split2, _writer2) = make_split();
+        app.add_split(split2);
+        assert_eq!(app.splits.len(), 2);
         assert_eq!(app.inputs.len(), 2);
         // Focus moves to the new split.
         assert_eq!(app.focused, 1);
     }
 
     #[test]
-    fn remove_tab_shrinks_tabs_and_inputs() {
+    fn remove_split_shrinks_splits_and_inputs() {
         use tokio::runtime::Builder;
         let rt = Builder::new_current_thread().enable_all().build().unwrap();
         let _guard = rt.enter();
 
         let (mut app, _, _writers) = make_app(3);
-        assert_eq!(app.tabs.len(), 3);
+        assert_eq!(app.splits.len(), 3);
 
         // Remove the middle split.
-        app.remove_tab(1);
-        assert_eq!(app.tabs.len(), 2);
+        app.remove_split(1);
+        assert_eq!(app.splits.len(), 2);
         assert_eq!(app.inputs.len(), 2);
     }
 
     #[test]
-    fn remove_tab_clamps_focus_when_removing_last_split() {
+    fn remove_split_clamps_focus_when_removing_last_split() {
         use tokio::runtime::Builder;
         let rt = Builder::new_current_thread().enable_all().build().unwrap();
         let _guard = rt.enter();
 
         let (mut app, _, _writers) = make_app(2);
         app.focused = 1; // focus on the last split
-        app.remove_tab(1); // remove it
+        app.remove_split(1); // remove it
         assert_eq!(app.focused, 0, "focus must clamp to valid range");
     }
 
     #[test]
-    fn remove_tab_preserves_focus_when_removing_before_focused() {
+    fn remove_split_preserves_focus_when_removing_before_focused() {
         use tokio::runtime::Builder;
         let rt = Builder::new_current_thread().enable_all().build().unwrap();
         let _guard = rt.enter();
 
         let (mut app, _, _writers) = make_app(3);
         app.focused = 2; // focus on the last split
-        app.remove_tab(0); // remove the first split
-        // Focus was at index 2, now there are only 2 tabs (indices 0, 1).
+        app.remove_split(0); // remove the first split
+        // Focus was at index 2, now there are only 2 splits (indices 0, 1).
         // Clamp to 1.
         assert_eq!(app.focused, 1);
     }
 
     #[test]
-    fn session_id_mirror_reflects_dynamic_tab_count() {
+    fn session_id_mirror_reflects_dynamic_split_count() {
         use tokio::runtime::Builder;
         let rt = Builder::new_current_thread().enable_all().build().unwrap();
         let _guard = rt.enter();
 
         let (mut app, mirror, _writers) = make_app(1);
-        let (tab2, _w2) = make_tab();
-        app.add_tab(tab2);
+        let (split2, _writer2) = make_split();
+        app.add_split(split2);
         app.publish_session_ids();
         assert_eq!(mirror.lock().unwrap().len(), 2);
 
-        app.remove_tab(0);
+        app.remove_split(0);
         app.publish_session_ids();
         assert_eq!(mirror.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn any_turn_in_progress_is_true_when_a_split_is_waiting() {
+        use tokio::runtime::Builder;
+        let rt = Builder::new_current_thread().enable_all().build().unwrap();
+        let _guard = rt.enter();
+
+        let (mut app, _, _writers) = make_app(2);
+        app.splits[1].waiting = true;
+
+        assert!(app.any_turn_in_progress());
+    }
+
+    #[test]
+    fn any_turn_in_progress_is_true_when_a_split_is_streaming_only() {
+        use tokio::runtime::Builder;
+        let rt = Builder::new_current_thread().enable_all().build().unwrap();
+        let _guard = rt.enter();
+
+        let (mut app, _, _writers) = make_app(2);
+        app.splits[0].streaming = Some(app::StreamAccumulator::new());
+
+        assert!(app.any_turn_in_progress());
+    }
+
+    #[test]
+    fn any_turn_in_progress_is_false_when_all_splits_idle() {
+        use tokio::runtime::Builder;
+        let rt = Builder::new_current_thread().enable_all().build().unwrap();
+        let _guard = rt.enter();
+
+        let (app, _, _writers) = make_app(2);
+
+        assert!(!app.any_turn_in_progress());
+    }
+
+    #[test]
+    fn replace_workspace_updates_template_and_rebuilds_split_count() {
+        use tokio::runtime::Builder;
+        let rt = Builder::new_current_thread().enable_all().build().unwrap();
+        let _guard = rt.enter();
+
+        let (mut app, _, _writers) = make_app(3);
+        let new_root = PathBuf::from("/new/workspace");
+        let mut seen = Vec::new();
+
+        app.replace_workspace_with(new_root.clone(), |idx, config| {
+            seen.push((idx, config.workspace_root.clone(), config.resume));
+            Ok(make_split().0)
+        });
+
+        assert_eq!(app.spawn_config.workspace_root, new_root);
+        assert_eq!(app.spawn_config.resume, None);
+        assert_eq!(app.splits.len(), 3);
+        assert_eq!(seen.len(), 3);
+        assert!(seen.iter().all(|(_, root, resume)| {
+            root == &PathBuf::from("/new/workspace") && resume.is_none()
+        }));
+    }
+
+    #[test]
+    fn replace_workspace_resets_inputs_focus_and_split_fracs() {
+        use tokio::runtime::Builder;
+        let rt = Builder::new_current_thread().enable_all().build().unwrap();
+        let _guard = rt.enter();
+
+        let (mut app, _, _writers) = make_app(2);
+        app.inputs[0] = "left".into();
+        app.inputs[1] = "right".into();
+        app.focused = 1;
+        app.pending_focus = None;
+        app.split_fracs = vec![0.25, 0.75];
+
+        app.replace_workspace_with(PathBuf::from("/new/workspace"), |_, _| Ok(make_split().0));
+
+        assert_eq!(app.inputs, vec![String::new(), String::new()]);
+        assert_eq!(app.focused, 0);
+        assert_eq!(app.pending_focus, Some(0));
+        assert_eq!(app.split_fracs, vec![0.5, 0.5]);
+    }
+
+    #[test]
+    fn replace_workspace_rebuilt_splits_are_published_to_session_id_mirror() {
+        use tokio::runtime::Builder;
+        let rt = Builder::new_current_thread().enable_all().build().unwrap();
+        let _guard = rt.enter();
+
+        let (mut app, mirror, _writers) = make_app(1);
+        let (split2, _writer2) = make_split();
+        app.add_split(split2);
+        app.publish_session_ids();
+        assert_eq!(mirror.lock().unwrap().len(), 2);
+
+        app.replace_workspace_with(PathBuf::from("/new/workspace"), |_, _| Ok(make_split().0));
+
+        assert_eq!(mirror.lock().unwrap().clone(), vec![None, None]);
+    }
+
+    #[test]
+    fn replace_workspace_spawn_failure_preserves_existing_splits_and_template() {
+        use tokio::runtime::Builder;
+        let rt = Builder::new_current_thread().enable_all().build().unwrap();
+        let _guard = rt.enter();
+
+        let (mut app, mirror, _writers) = make_app(2);
+        let old_root = app.spawn_config.workspace_root.clone();
+        app.inputs[0] = "keep me".into();
+        app.focused = 1;
+        app.split_fracs = vec![0.4, 0.6];
+        app.publish_session_ids();
+        let old_mirror = mirror.lock().unwrap().clone();
+
+        app.replace_workspace_with(PathBuf::from("/bad/workspace"), |idx, _| {
+            if idx == 1 {
+                anyhow::bail!("boom");
+            }
+            Ok(make_split().0)
+        });
+
+        assert_eq!(app.spawn_config.workspace_root, old_root);
+        assert_eq!(app.splits.len(), 2);
+        assert_eq!(app.inputs, vec!["keep me".to_owned(), String::new()]);
+        assert_eq!(app.focused, 1);
+        assert_eq!(app.split_fracs, vec![0.4, 0.6]);
+        assert_eq!(mirror.lock().unwrap().clone(), old_mirror);
+        assert!(
+            app.splits[1]
+                .error
+                .as_deref()
+                .is_some_and(|err| err.contains("failed to spawn agent") && err.contains("boom"))
+        );
     }
 
     // -- Command interception tests --
 
     #[tokio::test]
     async fn send_message_routes_to_correct_split() {
-        // Build an app with two tabs and verify that sending on split 1
+        // Build an app with two splits and verify that sending on split 1
         // doesn't touch split 0's agent.
         let (agent_writer0, client_reader0) = duplex(4096);
         let (client_writer0, agent_reader0) = duplex(4096);
@@ -1129,8 +1463,9 @@ mod tests {
         let client1 = AgentClient::new(BufReader::new(client_reader1), client_writer1);
 
         let (mut app, _mirror) = OxApp::new(
-            vec![AgentTab::new(client0), AgentTab::new(client1)],
+            vec![AgentSplit::new(client0), AgentSplit::new(client1)],
             dummy_spawn_config(),
+            "test-version",
         );
 
         app.inputs[1] = "hello from split 1".into();
@@ -1166,7 +1501,7 @@ mod tests {
             app.inputs[0].is_empty(),
             "input should be cleared after send"
         );
-        assert!(app.tabs[0].waiting, "tab should be in waiting state");
+        assert!(app.splits[0].waiting, "split should be in waiting state");
     }
 
     #[test]
@@ -1178,7 +1513,10 @@ mod tests {
         let (mut app, _, _writers) = make_app(1);
         app.inputs[0] = "   ".into(); // whitespace-only
         app.send_message(0);
-        assert!(!app.tabs[0].waiting, "empty input should not trigger send");
+        assert!(
+            !app.splits[0].waiting,
+            "empty input should not trigger send"
+        );
     }
 
     #[test]
@@ -1188,19 +1526,19 @@ mod tests {
         let _guard = rt.enter();
 
         let (mut app, _, _writers) = make_app(1);
-        app.tabs[0].waiting = true;
+        app.splits[0].waiting = true;
         app.inputs[0] = "should not send".into();
         app.send_message(0);
-        // Input IS cleared (the text is consumed), but the tab stays in
+        // Input IS cleared (the text is consumed), but the split stays in
         // the same waiting state — no command is sent to the agent.
         assert!(app.inputs[0].is_empty());
-        assert!(app.tabs[0].waiting);
+        assert!(app.splits[0].waiting);
     }
 
     #[test]
-    fn remove_tab_tracks_focus_when_removing_before_non_last_focused() {
+    fn remove_split_tracks_focus_when_removing_before_non_last_focused() {
         // Regression: removing a split before the focused one should
-        // decrement focus so it stays on the same logical tab, not just
+        // decrement focus so it stays on the same logical split, not just
         // clamp when it overflows.
         use tokio::runtime::Builder;
         let rt = Builder::new_current_thread().enable_all().build().unwrap();
@@ -1208,10 +1546,10 @@ mod tests {
 
         let (mut app, _, _writers) = make_app(5);
         app.focused = 3;
-        app.remove_tab(1); // remove a tab before focus
-        // Was focused on logical tab at old-index 3; it's now at index 2.
+        app.remove_split(1); // remove a split before focus
+        // Was focused on logical split at old-index 3; it's now at index 2.
         assert_eq!(app.focused, 2);
-        assert_eq!(app.tabs.len(), 4);
+        assert_eq!(app.splits.len(), 4);
     }
 
     // -- Command classification tests --
@@ -1245,6 +1583,11 @@ mod tests {
         }
     }
 
+    #[test]
+    fn about_text_uses_supplied_app_version() {
+        assert_eq!(about_text("9.8.7"), "Ox v9.8.7");
+    }
+
     #[tokio::test]
     async fn new_command_is_not_sent_to_agent() {
         // `/new` must be intercepted — the agent should never see it.
@@ -1253,7 +1596,11 @@ mod tests {
         let (client_writer, agent_reader) = duplex(4096);
         let client = AgentClient::new(BufReader::new(client_reader), client_writer);
 
-        let (mut app, _mirror) = OxApp::new(vec![AgentTab::new(client)], dummy_spawn_config());
+        let (mut app, _mirror) = OxApp::new(
+            vec![AgentSplit::new(client)],
+            dummy_spawn_config(),
+            "test-version",
+        );
 
         // Simulate what the render closure does: classify, clear, send.
         app.inputs[0] = "/new".into();
@@ -1283,7 +1630,11 @@ mod tests {
         let (client_writer, agent_reader) = duplex(4096);
         let client = AgentClient::new(BufReader::new(client_reader), client_writer);
 
-        let (mut app, _mirror) = OxApp::new(vec![AgentTab::new(client)], dummy_spawn_config());
+        let (mut app, _mirror) = OxApp::new(
+            vec![AgentSplit::new(client)],
+            dummy_spawn_config(),
+            "test-version",
+        );
 
         app.inputs[0] = "/help".into();
         let action = classify_input(&app.inputs[0], 0);
@@ -1302,7 +1653,7 @@ mod tests {
     fn oxapp_publishes_session_ids_after_update() {
         // Independent test of `publish_session_ids` — does not need a tokio
         // runtime because it doesn't touch the reader/writer tasks. We check
-        // that calling it reflects whatever `session_id` the tabs have set.
+        // that calling it reflects whatever `session_id` the splits have set.
         //
         // We have to pair construction with a client that won't panic in a
         // non-async context, so we create one with stub pipes and never
@@ -1311,18 +1662,18 @@ mod tests {
         let rt = Builder::new_current_thread().enable_all().build().unwrap();
         let _guard = rt.enter();
 
-        let (tab, _writer) = make_tab();
-        let (app, mirror) = OxApp::new(vec![tab], dummy_spawn_config());
+        let (split, _writer) = make_split();
+        let (app, mirror) = OxApp::new(vec![split], dummy_spawn_config(), "test-version");
         // Before publish, the mirror is initialized to `vec![None]`.
         assert_eq!(mirror.lock().unwrap().clone(), vec![None]);
         app.publish_session_ids();
         assert_eq!(mirror.lock().unwrap().clone(), vec![None]);
 
-        // The field-level assertion — publishing the ID a tab stores.
-        let (mut tab2, _w2) = make_tab();
-        tab2.session_id = Some(SessionId::new_v4());
-        let expected = tab2.session_id;
-        let (app2, mirror2) = OxApp::new(vec![tab2], dummy_spawn_config());
+        // The field-level assertion — publishing the ID a split stores.
+        let (mut split2, _writer2) = make_split();
+        split2.session_id = Some(SessionId::new_v4());
+        let expected = split2.session_id;
+        let (app2, mirror2) = OxApp::new(vec![split2], dummy_spawn_config(), "test-version");
         app2.publish_session_ids();
         assert_eq!(mirror2.lock().unwrap().clone(), vec![expected]);
     }
@@ -1331,27 +1682,27 @@ mod tests {
 
     #[tokio::test]
     async fn turn_cancelled_sets_cancelled_and_clears_waiting_and_streaming() {
-        let (mut tab, mut writer) = make_tab();
-        tab.waiting = true;
-        tab.streaming = Some(app::StreamAccumulator::new());
+        let (mut split, mut writer) = make_split();
+        split.waiting = true;
+        split.streaming = Some(app::StreamAccumulator::new());
 
         write_frame(&mut writer, &AgentEvent::TurnCancelled)
             .await
             .unwrap();
-        wait_until(&mut tab, Duration::from_secs(1), |t| t.cancelled)
+        wait_until(&mut split, Duration::from_secs(1), |t| t.cancelled)
             .await
             .unwrap();
 
-        assert!(!tab.waiting, "waiting must be cleared");
-        assert!(tab.streaming.is_none(), "streaming must be cleared");
-        assert!(tab.error.is_none(), "error must be cleared");
-        assert!(tab.cancelled, "cancelled must be set");
+        assert!(!split.waiting, "waiting must be cleared");
+        assert!(split.streaming.is_none(), "streaming must be cleared");
+        assert!(split.error.is_none(), "error must be cleared");
+        assert!(split.cancelled, "cancelled must be set");
     }
 
     #[tokio::test]
     async fn turn_cancelled_commits_streaming_content_as_message() {
-        let (mut tab, mut writer) = make_tab();
-        tab.waiting = true;
+        let (mut split, mut writer) = make_split();
+        split.waiting = true;
 
         // Seed the streaming accumulator with content.
         write_frame(
@@ -1364,39 +1715,41 @@ mod tests {
         )
         .await
         .unwrap();
-        wait_until(&mut tab, Duration::from_secs(1), |t| t.streaming.is_some())
-            .await
-            .unwrap();
+        wait_until(&mut split, Duration::from_secs(1), |t| {
+            t.streaming.is_some()
+        })
+        .await
+        .unwrap();
 
         write_frame(&mut writer, &AgentEvent::TurnCancelled)
             .await
             .unwrap();
-        wait_until(&mut tab, Duration::from_secs(1), |t| t.cancelled)
+        wait_until(&mut split, Duration::from_secs(1), |t| t.cancelled)
             .await
             .unwrap();
 
         // The streaming content should be committed as a message.
-        assert_eq!(tab.messages.len(), 1);
-        assert_eq!(tab.messages[0].role, Role::Assistant);
-        assert_eq!(tab.messages[0].text(), "partial output");
-        assert!(tab.streaming.is_none());
+        assert_eq!(split.messages.len(), 1);
+        assert_eq!(split.messages[0].role, Role::Assistant);
+        assert_eq!(split.messages[0].text(), "partial output");
+        assert!(split.streaming.is_none());
     }
 
     #[tokio::test]
     async fn turn_cancelled_with_no_streaming_appends_no_message() {
-        let (mut tab, mut writer) = make_tab();
-        tab.waiting = true;
+        let (mut split, mut writer) = make_split();
+        split.waiting = true;
         // No streaming accumulator — cancel arrived before any deltas.
 
         write_frame(&mut writer, &AgentEvent::TurnCancelled)
             .await
             .unwrap();
-        wait_until(&mut tab, Duration::from_secs(1), |t| t.cancelled)
+        wait_until(&mut split, Duration::from_secs(1), |t| t.cancelled)
             .await
             .unwrap();
 
-        assert!(tab.messages.is_empty(), "no message should be appended");
-        assert!(tab.cancelled);
+        assert!(split.messages.is_empty(), "no message should be appended");
+        assert!(split.cancelled);
     }
 
     #[tokio::test]
@@ -1406,8 +1759,8 @@ mod tests {
         // The GUI's MessageAppended handler clears the streaming accumulator,
         // so the TurnCancelled handler should find no accumulator and not
         // append a duplicate message.
-        let (mut tab, mut writer) = make_tab();
-        tab.waiting = true;
+        let (mut split, mut writer) = make_split();
+        split.waiting = true;
 
         // 1. StreamDelta seeds the accumulator.
         write_frame(
@@ -1420,9 +1773,11 @@ mod tests {
         )
         .await
         .unwrap();
-        wait_until(&mut tab, Duration::from_secs(1), |t| t.streaming.is_some())
-            .await
-            .unwrap();
+        wait_until(&mut split, Duration::from_secs(1), |t| {
+            t.streaming.is_some()
+        })
+        .await
+        .unwrap();
 
         // 2. Agent commits the partial message.
         write_frame(
@@ -1435,11 +1790,13 @@ mod tests {
         )
         .await
         .unwrap();
-        wait_until(&mut tab, Duration::from_secs(1), |t| t.messages.len() == 1)
-            .await
-            .unwrap();
+        wait_until(&mut split, Duration::from_secs(1), |t| {
+            t.messages.len() == 1
+        })
+        .await
+        .unwrap();
         assert!(
-            tab.streaming.is_none(),
+            split.streaming.is_none(),
             "MessageAppended should clear the accumulator"
         );
 
@@ -1447,19 +1804,19 @@ mod tests {
         write_frame(&mut writer, &AgentEvent::TurnCancelled)
             .await
             .unwrap();
-        wait_until(&mut tab, Duration::from_secs(1), |t| t.cancelled)
+        wait_until(&mut split, Duration::from_secs(1), |t| t.cancelled)
             .await
             .unwrap();
 
         // Only one message — no double-commit.
         assert_eq!(
-            tab.messages.len(),
+            split.messages.len(),
             1,
             "message must not be double-committed"
         );
-        assert_eq!(tab.messages[0].text(), "partial");
-        assert!(tab.cancelled);
-        assert!(!tab.waiting);
+        assert_eq!(split.messages[0].text(), "partial");
+        assert!(split.cancelled);
+        assert!(!split.waiting);
     }
 
     #[test]
@@ -1469,11 +1826,14 @@ mod tests {
         let _guard = rt.enter();
 
         let (mut app, _, _writers) = make_app(1);
-        app.tabs[0].cancelled = true;
+        app.splits[0].cancelled = true;
         app.inputs[0] = "next message".into();
         app.send_message(0);
 
-        assert!(!app.tabs[0].cancelled, "cancelled must be cleared on send");
-        assert!(app.tabs[0].waiting, "tab should be in waiting state");
+        assert!(
+            !app.splits[0].cancelled,
+            "cancelled must be cleared on send"
+        );
+        assert!(app.splits[0].waiting, "split should be in waiting state");
     }
 }

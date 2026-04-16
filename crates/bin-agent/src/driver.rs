@@ -12,15 +12,16 @@
 //!   `MessageAppended` frame in order, then waits for commands. Historical
 //!   and live messages travel the same channel so the GUI has a single
 //!   code path.
-//! - Dequeues `AgentCommand` frames one at a time from the reader. The next
-//!   command is not read until the previous turn fully terminates
-//!   (`TurnComplete` or `Error`). A `SendMessage` that arrives mid-turn sits
-//!   in the pipe until the driver is ready — this serializes the turn loop
-//!   without any explicit mutex.
+//! - Processes `AgentCommand` frames one at a time. A dedicated reader task
+//!   keeps NDJSON reads cancellation-safe while a turn is running. Mid-turn
+//!   `Cancel` commands set the turn's cancellation token; other commands are
+//!   buffered until the current turn fully terminates (`TurnComplete`,
+//!   `TurnCancelled`, or `Error`).
 //! - A malformed frame on the wire emits an `AgentEvent::Error` and the loop
-//!   keeps reading, so one bad line cannot kill a tab.
+//!   keeps reading, so one bad line cannot kill a split.
 //! - Clean EOF on the reader (the GUI hung up) returns `Ok(())`.
 
+use std::collections::VecDeque;
 use std::path::PathBuf;
 
 use anyhow::Result;
@@ -53,7 +54,7 @@ where
     L: LlmProvider + Send + Sync + 'static,
     S: SessionStore + Send + Sync + 'static,
     H: SessionStore,
-    R: AsyncBufRead + Unpin,
+    R: AsyncBufRead + Unpin + Send + 'static,
     W: AsyncWrite + Unpin,
 {
     // --- Step 1: Resolve the session ID and replay any history. -----------
@@ -93,26 +94,58 @@ where
     // the on-disk file, so we track `initialized` separately to flip between
     // `start(...)` and `resume(...)`.
     let mut initialized = resume.is_some();
-    // A command consumed by the mid-turn select! that isn't Cancel. Buffered
-    // here so the outer loop processes it on the next iteration instead of
-    // losing it.
-    let mut pending_command: Option<AgentCommand> = None;
+    enum ReaderEvent {
+        Command(AgentCommand),
+        Malformed(String),
+        Eof,
+    }
+
+    let (command_tx, mut command_rx) = mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        loop {
+            match read_frame::<_, AgentCommand>(&mut reader).await {
+                Ok(Some(cmd)) => {
+                    if command_tx.send(ReaderEvent::Command(cmd)).is_err() {
+                        break;
+                    }
+                }
+                Ok(None) => {
+                    let _ = command_tx.send(ReaderEvent::Eof);
+                    break;
+                }
+                Err(e) => {
+                    if command_tx
+                        .send(ReaderEvent::Malformed(format!("{e:#}")))
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            }
+        }
+    });
+
+    // Commands consumed by the mid-turn select! that aren't Cancel. Buffered
+    // here so the outer loop processes them on later iterations instead of
+    // losing them.
+    let mut pending_commands: VecDeque<AgentCommand> = VecDeque::new();
+    let mut command_input_closed = false;
 
     loop {
         // Check the pending buffer before reading from the wire.
-        let cmd = if let Some(buffered) = pending_command.take() {
+        let cmd = if let Some(buffered) = pending_commands.pop_front() {
             buffered
         } else {
-            match read_frame::<_, AgentCommand>(&mut reader).await {
-                Ok(Some(cmd)) => cmd,
-                Ok(None) => return Ok(()), // clean EOF — GUI shut down
-                Err(e) => {
+            match command_rx.recv().await {
+                Some(ReaderEvent::Command(cmd)) => cmd,
+                Some(ReaderEvent::Eof) | None => return Ok(()), // clean EOF — GUI shut down
+                Some(ReaderEvent::Malformed(message)) => {
                     // Malformed frame. Emit an Error and keep reading; one bad
                     // line should not kill the agent.
                     write_frame(
                         &mut writer,
                         &AgentEvent::Error {
-                            message: format!("malformed frame: {e:#}"),
+                            message: format!("malformed frame: {message}"),
                         },
                     )
                     .await?;
@@ -137,33 +170,37 @@ where
                         cancel_clone,
                         &mut writer,
                     ));
-
                     // Race the turn against incoming commands so we can detect
                     // a `Cancel` while the turn is running. Non-cancel commands
-                    // are buffered for the next iteration. EOF mid-turn sets the
+                    // are buffered for later iterations. EOF mid-turn sets the
                     // cancel flag so the turn finishes gracefully.
+                    //
+                    // Commands are read by a dedicated task. That keeps
+                    // framed reads out of this select! so we never cancel a
+                    // partially-read NDJSON frame.
                     loop {
                         tokio::select! {
                             result = &mut turn_fut => break result,
-                            frame = read_frame::<_, AgentCommand>(&mut reader) => {
+                            frame = command_rx.recv(), if !command_input_closed => {
                                 match frame {
-                                    Ok(Some(AgentCommand::Cancel)) => {
+                                    Some(ReaderEvent::Command(AgentCommand::Cancel)) => {
                                         cancel.cancel();
                                         // Don't break — let the turn future
                                         // finish so it flushes remaining events.
                                     }
-                                    Ok(None) => {
+                                    Some(ReaderEvent::Eof) | None => {
                                         // GUI hung up mid-turn. Cancel so the
                                         // turn stops promptly, then let it drain.
+                                        command_input_closed = true;
                                         cancel.cancel();
                                     }
-                                    Ok(Some(other)) => {
+                                    Some(ReaderEvent::Command(other)) => {
                                         // Non-cancel command mid-turn — buffer
                                         // it so the outer loop processes it on
                                         // the next iteration.
-                                        pending_command = Some(other);
+                                        pending_commands.push_back(other);
                                     }
-                                    Err(_) => {
+                                    Some(ReaderEvent::Malformed(_)) => {
                                         // Malformed frame mid-turn — discard.
                                     }
                                 }

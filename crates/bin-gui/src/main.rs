@@ -2,7 +2,7 @@
 //!
 //! A thin composition root: locates the `ox-agent` binary, builds an
 //! [`AgentSpawnConfig`] from CLI args + env + defaults, spawns the initial
-//! agent, wraps its client in an [`AgentTab`], hands `vec![tab]` plus a
+//! agent, wraps its client in an [`AgentSplit`], hands `vec![split]` plus a
 //! cloneable spawn-config template to [`OxApp`], and runs the egui window.
 //! The user can spawn additional agents at runtime with `/new`. On
 //! shutdown, prints a resume command per active session so the user can
@@ -14,7 +14,7 @@
 
 use std::path::PathBuf;
 
-use adapter_egui::{AgentClient, AgentSpawnConfig, AgentTab, OxApp};
+use adapter_egui::{AgentClient, AgentSpawnConfig, AgentSplit, OxApp};
 use anyhow::{Context, Result};
 use app::SecretStore;
 use clap::Parser;
@@ -72,13 +72,13 @@ fn main() -> Result<()> {
     let _guard = rt.enter();
 
     let client = AgentClient::spawn(spawn_config.clone())?;
-    let tab = AgentTab::new(client);
+    let split = AgentSplit::new(client);
     // Pass a template config with `resume: None` so `/new` always starts
     // fresh sessions. The original config (which may have `--resume`) was
     // consumed by the initial spawn above.
     let mut template = spawn_config;
     template.resume = None;
-    let (app, session_id_mirror) = OxApp::new(vec![tab], template);
+    let (app, session_id_mirror) = OxApp::new(vec![split], template, env!("CARGO_PKG_VERSION"));
     app.run()?;
 
     // After the GUI closes, read the session IDs the app mirrored on its
