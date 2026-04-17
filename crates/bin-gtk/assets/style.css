@@ -1,0 +1,80 @@
+/* Ox desktop GUI — base styling.
+ *
+ * Loaded once at adw::Application::startup. Class roles:
+ *   .split / .split-focused — per-split root styling and focus highlight
+ *   .split-header — header strip with workspace root + session id
+ *   .split-status — bottom status row
+ *   .split-input — per-split input strip container
+ *   .draft-input — the TextView the user types into
+ *   .status-waiting / .status-error / .status-cancelled — bottom status row
+ *
+ * The transcript surface itself is a webkit6::WebView; its visual styling
+ * lives in `assets/transcript.html`, not here.
+ */
+
+window {
+    background-color: #1d1d20;
+}
+
+.split {
+    border-left: 1px solid #2a2a30;
+}
+
+.split-focused {
+    border-left: 1px solid #2a2a30;
+}
+
+.split-focused .split-header {
+    opacity: 1;
+}
+
+.split-header {
+    border-bottom: 1px solid #2a2a30;
+    font-size: 0.85em;
+    opacity: 0.75;
+}
+
+.split-workspace-label {
+    font-weight: 500;
+}
+
+.split-session-label {
+    opacity: 0.55;
+    font-family: monospace;
+    font-size: 0.85em;
+}
+
+.split-status {
+    font-size: 0.85em;
+    padding: 2px 0;
+}
+
+.split-input {
+    border-top: 1px solid #2a2a30;
+}
+
+.draft-input {
+    background-color: #15151a;
+    border: 1px solid #2a2a30;
+    border-radius: 4px;
+    padding: 2px;
+}
+
+.draft-input text {
+    background-color: transparent;
+    color: #e0e0e5;
+}
+
+.status-waiting {
+    color: #f0b545;
+}
+
+.status-error {
+    color: #ff8080;
+    font-family: monospace;
+    font-size: 0.85em;
+}
+
+.status-cancelled {
+    color: #888;
+}

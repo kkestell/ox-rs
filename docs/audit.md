@@ -30,7 +30,7 @@
 
 ## Hardcoded / Config Gaps
 
-17. **Model is a CLI default, not configurable at runtime** — `crates/bin-gpui/src/main.rs` — `default_value = "qwen/qwen3-235b-a22b-2507"`. No in-app model picker.
+17. **Model is a CLI default, not configurable at runtime** — `crates/bin-gtk/src/main.rs` — `default_value = "qwen/qwen3-235b-a22b-2507"`. No in-app model picker.
 18. **SSE endpoint URL hardcoded** — `crates/adapter-llm/src/openrouter/mod.rs:40` — `"https://openrouter.ai/api/v1/chat/completions"` baked in. No way to point at a proxy or different base URL.
 19. **Channel buffer size 64 is arbitrary** — `crates/adapter-llm/src/openrouter/mod.rs:49` — `tokio::sync::mpsc::channel(64)`. No justification; if the producer outruns the consumer, events silently backpressure.
 20. **Reasoning flags always sent** — `wire.rs:145-146` — `reasoning: Some(serde_json::json!({}))` and `include_reasoning: Some(true)` are always included regardless of model. Some models may reject or be confused by these.
@@ -41,6 +41,6 @@
 
 ## Minor / Style
 
-~~22. **`eframe::NativeOptions::default()`**~~ — _Superseded: the egui frontend was retired and the GUI now opens through GPUI window options in `crates/bin-gpui/src/main.rs`._
+~~22. **`eframe::NativeOptions::default()`**~~ — _Superseded: the egui frontend was retired and the GUI now opens through `adw::Application` in `crates/bin-gtk/src/app.rs`._
 23. **`Message` doesn't derive `PartialEq`** — noted in `stream.rs:489` comment as a reason for a hand-rolled comparison function. Adding the derive would simplify tests.
 24. **`Usage` uses `u32` for token counts** — `crates/domain/src/stream.rs:35` — fine for single turns but `session.is_over_budget` sums them as `usize`, creating a silent widening on 64-bit platforms.

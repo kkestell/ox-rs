@@ -10,5 +10,5 @@ members = [
     "crates/adapter-secrets",
     "crates/agent-host",
     "crates/bin-agent",
-    "crates/bin-gpui",
+    "crates/bin-gtk",
 ]
