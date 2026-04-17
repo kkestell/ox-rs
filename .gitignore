@@ -2,3 +2,5 @@
 .env
 .ox/
 .codex
+/crates/bin-tauri/ui/node_modules/
+/crates/bin-tauri/ui/dist/

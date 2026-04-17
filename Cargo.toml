@@ -7,8 +7,8 @@ members = [
     "crates/adapter-llm",
     "crates/adapter-storage",
     "crates/adapter-fs",
-    "crates/adapter-egui",
     "crates/adapter-secrets",
-    "crates/bin-gui",
+    "crates/agent-host",
     "crates/bin-agent",
+    "crates/bin-tauri",
 ]

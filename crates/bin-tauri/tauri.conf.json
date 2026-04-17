@@ -1,0 +1,33 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Ox",
+  "version": "0.1.0",
+  "identifier": "io.ox.desktop",
+  "build": {
+    "frontendDist": "./ui/dist",
+    "devUrl": "http://localhost:1420",
+    "beforeDevCommand": "npm --prefix ui run dev",
+    "beforeBuildCommand": "npm --prefix ui run build"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "Ox",
+        "width": 1280,
+        "height": 800,
+        "decorations": true,
+        "resizable": true
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "category": "DeveloperTool",
+    "shortDescription": "Ox — desktop AI coding assistant",
+    "longDescription": "Ox is a desktop AI coding assistant."
+  }
+}

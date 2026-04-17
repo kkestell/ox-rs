@@ -1,4 +1,4 @@
-//! Wire protocol between the `ox-gui` process and the `ox-agent` process.
+//! Wire protocol between the GUI process (`ox-tauri`) and the `ox-agent` process.
 //!
 //! The two processes exchange newline-delimited JSON frames over stdin/stdout.
 //! The GUI sends `AgentCommand`s into the agent's stdin; the agent sends

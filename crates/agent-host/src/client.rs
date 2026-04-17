@@ -1,27 +1,57 @@
-//! `AgentClient` — the GUI's handle on a single `ox-agent` subprocess.
+//! `AgentClient` — the GUI-side handle on a single `ox-agent` subprocess.
 //!
-//! Replaces the in-process `run_backend` controller with an IPC client that:
-//! - spawns `ox-agent` as a tokio `Child` with `kill_on_drop(true)`, so the
-//!   agent dies if the GUI exits for any reason;
-//! - runs two background tasks per client — a reader that parses stdout into
-//!   `AgentEvent`s and forwards them to a GUI-bound mpsc channel, and a
-//!   writer that serializes `AgentCommand`s from the GUI onto stdin;
-//! - exposes the same "channels as the public API" shape today's code uses,
-//!   so the `OxApp` event loop stays structurally identical.
+//! A client owns the command-send side of the IPC channel; its paired
+//! [`AgentEventStream`] owns the event-receive side. The halves are split
+//! so a drain task can `await` on the stream without contending with the
+//! shared `WorkspaceState` mutex the command sender lives behind.
 //!
-//! The split between [`AgentClient::new`] and [`AgentClient::spawn`] matters
-//! for testing: `new` takes any `AsyncBufRead` / `AsyncWrite` pair, so unit
-//! tests can drive a real client over `tokio::io::duplex` without launching
-//! a process. `spawn` is the thin `tokio::process::Command` wrapper around it.
+//! The split between [`AgentClient::new`] and [`AgentClient::spawn`] exists
+//! for testing: `new` takes any `AsyncBufRead` / `AsyncWrite` pair so unit
+//! tests drive a real client over `tokio::io::duplex`. `spawn` is the thin
+//! `tokio::process::Command` wrapper around `new`.
+//!
+//! The agent is killed on drop (`kill_on_drop(true)`) so dropping the
+//! `AgentClient` is the cancellation path: the subprocess always dies with
+//! the GUI, not the other way around.
 
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use domain::SessionId;
 use protocol::{AgentCommand, AgentEvent, read_frame, write_frame};
+use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufRead, AsyncWrite, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::mpsc;
+use uuid::Uuid;
+
+/// Stable, UI-local identity for a split.
+///
+/// Generated GUI-side when an `AgentClient` is created. Never crosses the
+/// IPC boundary to `ox-agent` — splits are a GUI concept. Lives here rather
+/// than in `domain` because it is not persisted and does not round-trip
+/// through the wire protocol: domain identities are reserved for values
+/// that cross processes or storage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct SplitId(pub Uuid);
+
+impl SplitId {
+    pub fn new() -> Self {
+        Self(Uuid::new_v4())
+    }
+}
+
+impl Default for SplitId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl std::fmt::Display for SplitId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
 
 /// Config passed to [`AgentClient::spawn`]. Deliberately small — extra agent
 /// knobs belong in the agent's env, not in a twelve-field "options" struct.
@@ -40,21 +70,33 @@ pub struct AgentSpawnConfig {
     /// Extra environment variables. Inherited-by-default env vars (like PATH)
     /// are not cleared; these are merged on top. Used primarily to pass
     /// `OPENROUTER_API_KEY` into the child process without inheriting the
-    /// GUI's entire environment.
+    /// host's entire environment.
     pub env: Vec<(String, String)>,
 }
 
-/// The GUI-side handle on one running agent.
-///
-/// Public surface is the two channel endpoints and the [`Drop`] impl; the
-/// reader and writer tasks run in the background until either the channels
-/// close or the underlying I/O hangs up.
+/// Send-side handle. Thread-safe by construction — `mpsc::UnboundedSender`
+/// is `Sync`, so the state guard can hand out `&AgentClient` references
+/// across tasks without cloning the client.
 pub struct AgentClient {
+    id: SplitId,
     cmd_tx: mpsc::UnboundedSender<AgentCommand>,
-    evt_rx: mpsc::UnboundedReceiver<AgentEvent>,
     /// Handle to the child process, if this client was created by `spawn`.
     /// Dropped along with the client, which triggers `kill_on_drop`.
     _child: Option<Child>,
+}
+
+/// Receive-side handle. Owned by a drain task in the desktop binary — kept
+/// off the shared state mutex so `recv().await` never blocks a lock.
+pub struct AgentEventStream {
+    rx: mpsc::UnboundedReceiver<AgentEvent>,
+}
+
+impl AgentEventStream {
+    /// Await the next event from the agent. Returns `None` when the reader
+    /// and writer tasks have both shut down (agent dead or torn down).
+    pub async fn recv(&mut self) -> Option<AgentEvent> {
+        self.rx.recv().await
+    }
 }
 
 impl AgentClient {
@@ -66,7 +108,7 @@ impl AgentClient {
     /// `spawn_reader` / `spawn_writer` helpers. `spawn` calls this function
     /// too, so both code paths share a single implementation — no risk of
     /// drift between test and production.
-    pub fn new<R, W>(reader: R, writer: W) -> Self
+    pub fn new<R, W>(reader: R, writer: W) -> (Self, AgentEventStream)
     where
         R: AsyncBufRead + Send + Unpin + 'static,
         W: AsyncWrite + Send + Unpin + 'static,
@@ -75,21 +117,22 @@ impl AgentClient {
         let (evt_tx, evt_rx) = mpsc::unbounded_channel::<AgentEvent>();
         spawn_reader(reader, evt_tx.clone());
         spawn_writer(writer, cmd_rx, evt_tx);
-        Self {
+        let client = Self {
+            id: SplitId::new(),
             cmd_tx,
-            evt_rx,
             _child: None,
-        }
+        };
+        let stream = AgentEventStream { rx: evt_rx };
+        (client, stream)
     }
 
     /// Spawn `ox-agent` as a subprocess and return a client wired to its
-    /// stdio. The child's stderr is inherited (flows to the GUI terminal).
+    /// stdio along with the event stream.
     ///
     /// `kill_on_drop(true)` ties the agent's lifetime to the client — the
-    /// moment the `AgentClient` is dropped (GUI shuts down, tab closed,
-    /// etc.), the child is SIGKILL'd. That's the "cancel = kill" contract
-    /// the plan commits to.
-    pub fn spawn(config: AgentSpawnConfig) -> Result<Self> {
+    /// moment the `AgentClient` is dropped (window closed, split removed,
+    /// etc.), the child is SIGKILL'd.
+    pub fn spawn(config: AgentSpawnConfig) -> Result<(Self, AgentEventStream)> {
         let mut cmd = Command::new(&config.binary);
         cmd.arg("--workspace-root")
             .arg(&config.workspace_root)
@@ -118,9 +161,14 @@ impl AgentClient {
 
         // Route through `new` so the reader/writer tasks come from the
         // same code as the duplex-backed unit tests.
-        let mut client = Self::new(reader, stdin);
+        let (mut client, stream) = Self::new(reader, stdin);
         client._child = Some(child);
-        Ok(client)
+        Ok((client, stream))
+    }
+
+    /// Stable identifier assigned when the client was built.
+    pub fn id(&self) -> SplitId {
+        self.id
     }
 
     /// Send a command to the agent. Returns `Err` only if the writer task
@@ -131,16 +179,6 @@ impl AgentClient {
         cmd: AgentCommand,
     ) -> std::result::Result<(), mpsc::error::SendError<AgentCommand>> {
         self.cmd_tx.send(cmd)
-    }
-
-    /// Non-blocking poll for the next event.
-    ///
-    /// Returns:
-    /// - `Ok(evt)` on a delivered event,
-    /// - `Err(TryRecvError::Empty)` when no event is queued yet,
-    /// - `Err(TryRecvError::Disconnected)` when the reader task has exited.
-    pub fn try_recv(&mut self) -> std::result::Result<AgentEvent, mpsc::error::TryRecvError> {
-        self.evt_rx.try_recv()
     }
 }
 
@@ -210,38 +248,29 @@ mod tests {
     /// is where the test reads `AgentCommand` frames the client emitted.
     fn make_client() -> (
         AgentClient,
+        AgentEventStream,
         tokio::io::DuplexStream,
         tokio::io::DuplexStream,
     ) {
         let (agent_writer, client_reader) = tokio::io::duplex(4096);
         let (client_writer, agent_reader) = tokio::io::duplex(4096);
-        let client = AgentClient::new(BufReader::new(client_reader), client_writer);
-        (client, agent_writer, agent_reader)
+        let (client, stream) = AgentClient::new(BufReader::new(client_reader), client_writer);
+        (client, stream, agent_writer, agent_reader)
     }
 
-    /// Pump `try_recv` with a short sleep between calls until a matching
-    /// event arrives, the channel disconnects, or `timeout` elapses.
-    async fn recv_event(client: &mut AgentClient, timeout: Duration) -> Option<AgentEvent> {
-        let deadline = tokio::time::Instant::now() + timeout;
-        loop {
-            match client.try_recv() {
-                Ok(evt) => return Some(evt),
-                Err(mpsc::error::TryRecvError::Empty) => {
-                    if tokio::time::Instant::now() >= deadline {
-                        return None;
-                    }
-                    tokio::time::sleep(Duration::from_millis(5)).await;
-                }
-                Err(mpsc::error::TryRecvError::Disconnected) => return None,
-            }
-        }
+    /// Await the next event with a timeout. Replaces the old `try_recv`
+    /// polling loop now that the receiver is an async `AgentEventStream`.
+    async fn recv_event(stream: &mut AgentEventStream, timeout: Duration) -> Option<AgentEvent> {
+        tokio::time::timeout(timeout, stream.recv())
+            .await
+            .ok()
+            .flatten()
     }
 
     #[tokio::test]
     async fn events_forwarded_from_reader_to_channel() {
-        let (mut client, mut agent_writer, _agent_reader) = make_client();
+        let (_client, mut stream, mut agent_writer, _agent_reader) = make_client();
 
-        // Agent sends a Ready frame; client should surface it on its channel.
         let id = SessionId::new_v4();
         write_frame(
             &mut agent_writer,
@@ -253,7 +282,7 @@ mod tests {
         .await
         .unwrap();
 
-        let evt = recv_event(&mut client, Duration::from_secs(1)).await;
+        let evt = recv_event(&mut stream, Duration::from_secs(1)).await;
         let Some(AgentEvent::Ready {
             session_id,
             workspace_root,
@@ -267,7 +296,7 @@ mod tests {
 
     #[tokio::test]
     async fn commands_written_to_writer_in_send_order() {
-        let (client, _agent_writer, agent_reader) = make_client();
+        let (client, _stream, _agent_writer, agent_reader) = make_client();
 
         client
             .send(AgentCommand::SendMessage {
@@ -296,36 +325,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn clean_eof_emits_no_error_and_reader_task_exits() {
-        // A well-behaved agent shutdown closes *both* pipes; on the GUI side
-        // the reader task observes EOF and the writer task observes a
-        // broken pipe. This test pins down the contract for the reader's
-        // half of that: on EOF alone, no spurious `Error` event appears,
-        // and the reader task exits cleanly. (The writer task keeps the
-        // event channel open by design — it still has a sender clone —
-        // until a command actually fails; that's tested elsewhere.)
-        let (mut client, agent_writer, _agent_reader) = make_client();
+    async fn clean_eof_emits_no_error_and_stream_closes() {
+        // A well-behaved agent shutdown closes *both* pipes; on EOF the
+        // reader task exits without emitting an error and, once the writer
+        // task's sender also drops, `recv()` returns `None`.
+        let (client, mut stream, agent_writer, _agent_reader) = make_client();
         drop(agent_writer);
+        drop(client); // drops the writer-side sender along with the command channel
 
-        // Give the reader task time to observe EOF.
-        tokio::time::sleep(Duration::from_millis(50)).await;
-
-        // No event should have been produced by the reader on EOF — only
-        // real events or parse errors do. A buffered event from the reader
-        // task would surface here as `Ok(...)`.
-        for _ in 0..10 {
-            match client.try_recv() {
-                Err(mpsc::error::TryRecvError::Empty) => {}
-                Err(mpsc::error::TryRecvError::Disconnected) => return,
-                Ok(evt) => panic!("reader should not emit events after EOF, got {evt:?}"),
-            }
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
+        // `recv()` must eventually return `None` (stream closed) rather than
+        // a spurious `Error` frame.
+        let evt = tokio::time::timeout(Duration::from_secs(1), stream.recv())
+            .await
+            .expect("recv should resolve once stream closes");
+        assert!(evt.is_none(), "expected None on EOF, got {evt:?}");
     }
 
     #[tokio::test]
     async fn malformed_line_produces_error_and_reader_keeps_running() {
-        let (mut client, mut agent_writer, _agent_reader) = make_client();
+        let (_client, mut stream, mut agent_writer, _agent_reader) = make_client();
 
         agent_writer.write_all(b"this is not json\n").await.unwrap();
         write_frame(&mut agent_writer, &AgentEvent::TurnComplete)
@@ -334,13 +352,13 @@ mod tests {
         drop(agent_writer);
 
         // First event must be an Error — the reader tolerated the bad line.
-        let first = recv_event(&mut client, Duration::from_secs(1))
+        let first = recv_event(&mut stream, Duration::from_secs(1))
             .await
             .expect("first event");
         assert!(matches!(first, AgentEvent::Error { .. }), "{first:?}");
 
         // Second event is the valid TurnComplete that came after.
-        let second = recv_event(&mut client, Duration::from_secs(1))
+        let second = recv_event(&mut stream, Duration::from_secs(1))
             .await
             .expect("second event");
         assert!(matches!(second, AgentEvent::TurnComplete), "{second:?}");
@@ -350,34 +368,32 @@ mod tests {
     async fn broken_pipe_on_send_surfaces_as_error_event() {
         // Dropping the agent reader kills the pipe the writer task uses.
         // After the next command, the writer task emits an Error and exits.
-        let (mut client, _agent_writer, agent_reader) = make_client();
+        let (client, mut stream, _agent_writer, agent_reader) = make_client();
         drop(agent_reader);
 
         // Give the OS a moment to register the broken-pipe state before the
         // first write hits the pipe.
         tokio::time::sleep(Duration::from_millis(20)).await;
 
-        // This command may succeed (buffered) the first time, but subsequent
-        // sends will break the pipe. Send a handful to force the failure.
+        // Subsequent sends will break the pipe. Send a handful to force the
+        // failure.
         for _ in 0..10 {
             let _ = client.send(AgentCommand::SendMessage { input: "hi".into() });
         }
 
-        // Eventually an Error frame arrives on the event channel.
+        // Eventually an Error frame arrives on the event stream.
         let mut got_error = false;
         let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
         while tokio::time::Instant::now() < deadline {
-            match client.try_recv() {
-                Ok(AgentEvent::Error { message }) => {
+            match tokio::time::timeout(Duration::from_millis(50), stream.recv()).await {
+                Ok(Some(AgentEvent::Error { message })) => {
                     assert!(message.contains("agent write failed"), "{message}");
                     got_error = true;
                     break;
                 }
-                Ok(_) => {}
-                Err(mpsc::error::TryRecvError::Empty) => {
-                    tokio::time::sleep(Duration::from_millis(10)).await;
-                }
-                Err(mpsc::error::TryRecvError::Disconnected) => break,
+                Ok(Some(_)) => {}
+                Ok(None) => break,
+                Err(_) => {}
             }
         }
         assert!(got_error, "expected an Error event after pipe closed");
@@ -386,7 +402,7 @@ mod tests {
     #[tokio::test]
     async fn stream_delta_preserves_wire_payload() {
         // StreamEvent round-trips across the wire without field drift.
-        let (mut client, mut agent_writer, _agent_reader) = make_client();
+        let (_client, mut stream, mut agent_writer, _agent_reader) = make_client();
         write_frame(
             &mut agent_writer,
             &AgentEvent::StreamDelta {
@@ -399,7 +415,7 @@ mod tests {
         .await
         .unwrap();
 
-        let evt = recv_event(&mut client, Duration::from_secs(1))
+        let evt = recv_event(&mut stream, Duration::from_secs(1))
             .await
             .expect("event");
         match evt {
@@ -411,5 +427,19 @@ mod tests {
             }
             other => panic!("unexpected {other:?}"),
         }
+    }
+
+    #[test]
+    fn split_ids_are_unique_per_client() {
+        // Minimal sanity check that the `SplitId` assigned by `new` is
+        // fresh per client — we rely on this for routing in WorkspaceState.
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let _guard = rt.enter();
+        let (c1, _s1, _aw1, _ar1) = make_client();
+        let (c2, _s2, _aw2, _ar2) = make_client();
+        assert_ne!(c1.id(), c2.id());
     }
 }

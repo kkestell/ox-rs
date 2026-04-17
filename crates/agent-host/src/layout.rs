@@ -1,3 +1,11 @@
+//! Workspace layout persistence.
+//!
+//! `WorkspaceLayouts` is a flat `workspace-root → saved layout` map,
+//! serialized as JSON at `~/.ox/workspaces.json` by the desktop binary.
+//! Saved layouts remember the session IDs that made up a workspace's
+//! splits, their fractional widths, and which one was focused, so a
+//! later launch can rebuild the same tiled GUI.
+
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -9,26 +17,26 @@ use serde::{Deserialize, Serialize};
 const FRACTION_SUM_EPSILON: f32 = 0.01;
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-pub(super) struct WorkspaceLayouts {
-    pub(super) workspaces: BTreeMap<String, SavedWorkspaceLayout>,
+pub struct WorkspaceLayouts {
+    pub workspaces: BTreeMap<String, SavedWorkspaceLayout>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub(super) struct SavedWorkspaceLayout {
-    pub(super) sessions: Vec<SessionId>,
-    pub(super) split_fracs: Vec<f32>,
-    pub(super) focused: usize,
+pub struct SavedWorkspaceLayout {
+    pub sessions: Vec<SessionId>,
+    pub split_fracs: Vec<f32>,
+    pub focused: usize,
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub(super) struct RestoreLayout {
-    pub(super) sessions: Vec<SessionId>,
-    pub(super) split_fracs: Vec<f32>,
-    pub(super) focused: usize,
+pub struct RestoreLayout {
+    pub sessions: Vec<SessionId>,
+    pub split_fracs: Vec<f32>,
+    pub focused: usize,
 }
 
 impl WorkspaceLayouts {
-    pub(super) fn load(path: &Path) -> Result<Self> {
+    pub fn load(path: &Path) -> Result<Self> {
         if !path.exists() {
             return Ok(Self::default());
         }
@@ -38,7 +46,7 @@ impl WorkspaceLayouts {
             .with_context(|| format!("parsing workspace layout file {}", path.display()))
     }
 
-    pub(super) fn save(&self, path: &Path) -> Result<()> {
+    pub fn save(&self, path: &Path) -> Result<()> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).with_context(|| {
                 format!("creating workspace layout directory {}", parent.display())
@@ -58,13 +66,13 @@ impl WorkspaceLayouts {
         Ok(())
     }
 
-    pub(super) fn restore_for(&self, workspace_root: &Path) -> Option<RestoreLayout> {
+    pub fn restore_for(&self, workspace_root: &Path) -> Option<RestoreLayout> {
         self.workspaces
             .get(&workspace_key(workspace_root))
             .and_then(SavedWorkspaceLayout::normalized_for_restore)
     }
 
-    pub(super) fn restore_existing_for(
+    pub fn restore_existing_for(
         &self,
         workspace_root: &Path,
         sessions_dir: &Path,
@@ -85,7 +93,7 @@ impl WorkspaceLayouts {
         })
     }
 
-    pub(super) fn save_current(
+    pub fn save_current(
         &mut self,
         workspace_root: &Path,
         session_ids: impl IntoIterator<Item = Option<SessionId>>,
@@ -123,7 +131,7 @@ impl SavedWorkspaceLayout {
     }
 }
 
-pub(super) fn normalize_split_fracs(fracs: &[f32], len: usize) -> Vec<f32> {
+pub fn normalize_split_fracs(fracs: &[f32], len: usize) -> Vec<f32> {
     if len == 0 {
         return Vec::new();
     }

@@ -1,5 +1,5 @@
 [package]
-name = "adapter-egui"
+name = "agent-host"
 version = "0.1.0"
 edition = "2024"
 
@@ -7,13 +7,12 @@ edition = "2024"
 anyhow = "1.0.102"
 app = { version = "0.1.0", path = "../app" }
 domain = { version = "0.1.0", path = "../domain" }
-eframe = "0.31"
-egui-file-dialog = "~0.10"
 protocol = { version = "0.1.0", path = "../protocol" }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
-tokio = { version = "1.52.0", features = ["sync", "io-util", "process", "rt", "rt-multi-thread", "macros"] }
+tokio = { version = "1.52.1", features = ["rt", "macros", "io-util", "sync", "process", "time"] }
+uuid = { version = "1.23.1", features = ["v4", "serde"] }
 
 [dev-dependencies]
 app = { path = "../app", features = ["test-support"] }
-tokio = { version = "1.52.0", features = ["rt", "rt-multi-thread", "macros", "io-util", "process", "time"] }
+tokio = { version = "1.52.1", features = ["rt", "rt-multi-thread", "macros", "io-util", "process", "time"] }
