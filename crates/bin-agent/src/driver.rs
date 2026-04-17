@@ -31,20 +31,19 @@ use protocol::{AgentCommand, AgentEvent, read_frame, write_frame};
 use tokio::io::{AsyncBufRead, AsyncWrite};
 use tokio::sync::mpsc;
 
+enum ReaderEvent {
+    Command(AgentCommand),
+    Malformed(String),
+    Eof,
+}
+
 /// Drive the agent's lifecycle over a framed NDJSON channel.
 ///
 /// `reader` yields `AgentCommand` frames; `writer` receives `AgentEvent`
 /// frames. The function returns when the reader hits EOF or a non-recoverable
 /// error occurs.
-///
-/// `history_store` is a `SessionStore` handle the driver uses *only* to
-/// preload messages for `--resume`. It's passed separately from the
-/// `runner`'s internal store because `SessionRunner` doesn't expose its store
-/// — the cost of an extra handle is negligible (`DiskSessionStore` is a
-/// cheap wrapper around a directory path) and keeps the runner's API small.
-pub async fn agent_driver<L, S, H, R, W>(
+pub async fn agent_driver<L, S, R, W>(
     runner: &SessionRunner<L, S>,
-    history_store: &H,
     workspace_root: PathBuf,
     resume: Option<SessionId>,
     mut reader: R,
@@ -53,7 +52,6 @@ pub async fn agent_driver<L, S, H, R, W>(
 where
     L: LlmProvider + Send + Sync + 'static,
     S: SessionStore + Send + Sync + 'static,
-    H: SessionStore,
     R: AsyncBufRead + Unpin + Send + 'static,
     W: AsyncWrite + Unpin,
 {
@@ -64,10 +62,7 @@ where
     // can render the conversation through the same handler it uses for
     // live turn messages.
     let (session_id, historical_messages) = match resume {
-        Some(id) => {
-            let session = history_store.load(id).await?;
-            (id, session.messages)
-        }
+        Some(id) => (id, runner.load_history(id).await?),
         None => (SessionId::new_v4(), Vec::new()),
     };
 
@@ -94,11 +89,6 @@ where
     // the on-disk file, so we track `initialized` separately to flip between
     // `start(...)` and `resume(...)`.
     let mut initialized = resume.is_some();
-    enum ReaderEvent {
-        Command(AgentCommand),
-        Malformed(String),
-        Eof,
-    }
 
     let (command_tx, mut command_rx) = mpsc::unbounded_channel();
     tokio::spawn(async move {
@@ -352,7 +342,6 @@ mod tests {
     fn spawn_driver(
         llm: FakeLlmProvider,
         store: FakeSessionStore,
-        history: FakeSessionStore,
         tools: ToolRegistry,
         resume: Option<SessionId>,
     ) -> (
@@ -368,7 +357,6 @@ mod tests {
             let runner = SessionRunner::new(llm, store, tools, String::new());
             agent_driver(
                 &runner,
-                &history,
                 PathBuf::from("/test/workspace"),
                 resume,
                 BufReader::new(cmd_drv),
@@ -413,9 +401,7 @@ mod tests {
     async fn fresh_start_emits_ready_with_no_history() {
         let llm = FakeLlmProvider::new();
         let store = FakeSessionStore::new();
-        let history = FakeSessionStore::new();
-        let (cmd_tx, mut evt_rx, handle) =
-            spawn_driver(llm, store, history, ToolRegistry::new(), None);
+        let (cmd_tx, mut evt_rx, handle) = spawn_driver(llm, store, ToolRegistry::new(), None);
 
         let (_id, workspace) = expect_ready(&mut evt_rx).await;
         assert_eq!(workspace, PathBuf::from("/test/workspace"));
@@ -429,10 +415,8 @@ mod tests {
         let llm = FakeLlmProvider::new();
         llm.push_text("hello back");
         let store = FakeSessionStore::new();
-        let history = FakeSessionStore::new();
 
-        let (mut cmd_tx, mut evt_rx, handle) =
-            spawn_driver(llm, store, history, ToolRegistry::new(), None);
+        let (mut cmd_tx, mut evt_rx, handle) = spawn_driver(llm, store, ToolRegistry::new(), None);
         let _ = expect_ready(&mut evt_rx).await;
 
         write_frame(
@@ -476,12 +460,9 @@ mod tests {
 
         let llm = FakeLlmProvider::new();
         let store = FakeSessionStore::new();
-        store.insert(seeded.clone());
-        let history = FakeSessionStore::new();
-        history.insert(seeded);
+        store.insert(seeded);
 
-        let (cmd_tx, mut evt_rx, handle) =
-            spawn_driver(llm, store, history, ToolRegistry::new(), Some(id));
+        let (cmd_tx, mut evt_rx, handle) = spawn_driver(llm, store, ToolRegistry::new(), Some(id));
 
         let (got_id, _) = expect_ready(&mut evt_rx).await;
         assert_eq!(got_id, id);
@@ -509,10 +490,8 @@ mod tests {
         let id = SessionId::new_v4();
         let llm = FakeLlmProvider::new();
         let store = FakeSessionStore::new();
-        let history = FakeSessionStore::new();
 
-        let (_cmd_tx, _evt_rx, handle) =
-            spawn_driver(llm, store, history, ToolRegistry::new(), Some(id));
+        let (_cmd_tx, _evt_rx, handle) = spawn_driver(llm, store, ToolRegistry::new(), Some(id));
 
         // Driver should error out in startup (before emitting Ready).
         let result = tokio::time::timeout(Duration::from_secs(1), handle).await;
@@ -539,9 +518,8 @@ mod tests {
         let tools = tool_registry_with(vec![echo as Arc<dyn Tool>]);
 
         let store = FakeSessionStore::new();
-        let history = FakeSessionStore::new();
 
-        let (mut cmd_tx, mut evt_rx, handle) = spawn_driver(llm, store, history, tools, None);
+        let (mut cmd_tx, mut evt_rx, handle) = spawn_driver(llm, store, tools, None);
         let _ = expect_ready(&mut evt_rx).await;
         write_frame(
             &mut cmd_tx,
@@ -576,10 +554,8 @@ mod tests {
         let llm = FakeLlmProvider::new();
         llm.push_error("model overloaded");
         let store = FakeSessionStore::new();
-        let history = FakeSessionStore::new();
 
-        let (mut cmd_tx, mut evt_rx, handle) =
-            spawn_driver(llm, store, history, ToolRegistry::new(), None);
+        let (mut cmd_tx, mut evt_rx, handle) = spawn_driver(llm, store, ToolRegistry::new(), None);
         let _ = expect_ready(&mut evt_rx).await;
         write_frame(
             &mut cmd_tx,
@@ -615,10 +591,8 @@ mod tests {
         let llm = FakeLlmProvider::new();
         llm.push_text("recovered");
         let store = FakeSessionStore::new();
-        let history = FakeSessionStore::new();
 
-        let (mut cmd_tx, mut evt_rx, handle) =
-            spawn_driver(llm, store, history, ToolRegistry::new(), None);
+        let (mut cmd_tx, mut evt_rx, handle) = spawn_driver(llm, store, ToolRegistry::new(), None);
         let _ = expect_ready(&mut evt_rx).await;
 
         // Send a malformed JSON line.
@@ -668,9 +642,7 @@ mod tests {
             },
         ]);
         let store = FakeSessionStore::new();
-        let history = FakeSessionStore::new();
-        let (mut cmd_tx, mut evt_rx, handle) =
-            spawn_driver(llm, store, history, ToolRegistry::new(), None);
+        let (mut cmd_tx, mut evt_rx, handle) = spawn_driver(llm, store, ToolRegistry::new(), None);
         let _ = expect_ready(&mut evt_rx).await;
         write_frame(
             &mut cmd_tx,
@@ -726,9 +698,7 @@ mod tests {
         llm.push_text("reply-one");
         llm.push_text("reply-two");
         let store = FakeSessionStore::new();
-        let history = FakeSessionStore::new();
-        let (mut cmd_tx, mut evt_rx, handle) =
-            spawn_driver(llm, store, history, ToolRegistry::new(), None);
+        let (mut cmd_tx, mut evt_rx, handle) = spawn_driver(llm, store, ToolRegistry::new(), None);
         let _ = expect_ready(&mut evt_rx).await;
 
         // Write both commands before draining any event — the second sits
@@ -798,9 +768,7 @@ mod tests {
             },
         ]);
         let store = FakeSessionStore::new();
-        let history = FakeSessionStore::new();
-        let (mut cmd_tx, mut evt_rx, handle) =
-            spawn_driver(llm, store, history, ToolRegistry::new(), None);
+        let (mut cmd_tx, mut evt_rx, handle) = spawn_driver(llm, store, ToolRegistry::new(), None);
         let _ = expect_ready(&mut evt_rx).await;
         write_frame(
             &mut cmd_tx,
@@ -838,10 +806,8 @@ mod tests {
         let llm = FakeLlmProvider::new();
         let mut tx = llm.push_channel();
         let store = FakeSessionStore::new();
-        let history = FakeSessionStore::new();
 
-        let (mut cmd_tx, mut evt_rx, handle) =
-            spawn_driver(llm, store, history, ToolRegistry::new(), None);
+        let (mut cmd_tx, mut evt_rx, handle) = spawn_driver(llm, store, ToolRegistry::new(), None);
         let _ = expect_ready(&mut evt_rx).await;
 
         // Start a turn.
@@ -936,10 +902,8 @@ mod tests {
     async fn cancel_when_no_turn_running_is_ignored() {
         let llm = FakeLlmProvider::new();
         let store = FakeSessionStore::new();
-        let history = FakeSessionStore::new();
 
-        let (mut cmd_tx, mut evt_rx, handle) =
-            spawn_driver(llm, store, history, ToolRegistry::new(), None);
+        let (mut cmd_tx, mut evt_rx, handle) = spawn_driver(llm, store, ToolRegistry::new(), None);
         let _ = expect_ready(&mut evt_rx).await;
 
         // Send Cancel with no turn in progress.
@@ -959,10 +923,8 @@ mod tests {
         let llm = FakeLlmProvider::new();
         llm.push_text("done");
         let store = FakeSessionStore::new();
-        let history = FakeSessionStore::new();
 
-        let (mut cmd_tx, mut evt_rx, handle) =
-            spawn_driver(llm, store, history, ToolRegistry::new(), None);
+        let (mut cmd_tx, mut evt_rx, handle) = spawn_driver(llm, store, ToolRegistry::new(), None);
         let _ = expect_ready(&mut evt_rx).await;
 
         // Send both at once — the turn will complete before the driver reads Cancel.

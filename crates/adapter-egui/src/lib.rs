@@ -190,23 +190,16 @@ pub struct OxApp {
     confirm_replace_workspace: bool,
     confirm_quit: bool,
     quit_confirmed: bool,
-    about_open: bool,
-    app_version: String,
 }
 
 impl OxApp {
-    pub fn new(
-        splits: Vec<AgentSplit>,
-        spawn_config: AgentSpawnConfig,
-        app_version: impl Into<String>,
-    ) -> (Self, SessionIdMirror) {
-        Self::with_layout(splits, spawn_config, app_version, None, None, 0)
+    pub fn new(splits: Vec<AgentSplit>, spawn_config: AgentSpawnConfig) -> (Self, SessionIdMirror) {
+        Self::with_layout(splits, spawn_config, None, None, 0)
     }
 
     fn with_layout(
         splits: Vec<AgentSplit>,
         spawn_config: AgentSpawnConfig,
-        app_version: impl Into<String>,
         layout_state_path: Option<PathBuf>,
         split_fracs: Option<Vec<f32>>,
         focused: usize,
@@ -233,8 +226,6 @@ impl OxApp {
             confirm_replace_workspace: false,
             confirm_quit: false,
             quit_confirmed: false,
-            about_open: false,
-            app_version: app_version.into(),
         };
         (app, mirror)
     }
@@ -242,7 +233,6 @@ impl OxApp {
     pub fn restore(
         mut spawn_config: AgentSpawnConfig,
         layout_state_path: PathBuf,
-        app_version: impl Into<String>,
     ) -> Result<(Self, SessionIdMirror)> {
         let layout = if spawn_config.resume.is_some() {
             None
@@ -285,7 +275,6 @@ impl OxApp {
         Ok(Self::with_layout(
             splits,
             spawn_config,
-            app_version,
             Some(layout_state_path),
             split_fracs,
             focused,
@@ -294,8 +283,15 @@ impl OxApp {
 
     pub fn run(self) -> Result<()> {
         let options = eframe::NativeOptions::default();
-        eframe::run_native("Ox", options, Box::new(|_cc| Ok(Box::new(self))))
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        eframe::run_native(
+            "Ox",
+            options,
+            Box::new(|cc| {
+                configure_app_style(&cc.egui_ctx);
+                Ok(Box::new(self))
+            }),
+        )
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
         Ok(())
     }
 
@@ -528,12 +524,6 @@ impl eframe::App for OxApp {
                         ui.close_menu();
                     }
                 });
-                ui.menu_button("Help", |ui| {
-                    if ui.button("About").clicked() {
-                        menu_actions.push(MenuAction::OpenAbout);
-                        ui.close_menu();
-                    }
-                });
             });
         });
 
@@ -574,19 +564,6 @@ impl eframe::App for OxApp {
                             menu_actions.push(MenuAction::ConfirmQuit);
                         }
                     });
-                });
-            });
-        }
-
-        if self.about_open {
-            egui::Modal::new(egui::Id::new("about_ox")).show(ctx, |ui| {
-                ui.vertical(|ui| {
-                    ui.heading("About");
-                    ui.label(about_text(&self.app_version));
-                    ui.add_space(8.0);
-                    if ui.button("Close").clicked() {
-                        menu_actions.push(MenuAction::CloseAbout);
-                    }
                 });
             });
         }
@@ -690,7 +667,6 @@ impl eframe::App for OxApp {
             match action {
                 MenuAction::OpenWorkspacePicker => self.file_dialog.pick_directory(),
                 MenuAction::QuitRequested => self.request_quit(ctx),
-                MenuAction::OpenAbout => self.about_open = true,
                 MenuAction::ConfirmReplaceWorkspace(path) => {
                     if self.any_turn_in_progress() {
                         self.pending_workspace = Some(path);
@@ -715,7 +691,6 @@ impl eframe::App for OxApp {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                 }
                 MenuAction::CancelQuit => self.confirm_quit = false,
-                MenuAction::CloseAbout => self.about_open = false,
             }
         }
 
@@ -754,6 +729,15 @@ fn load_workspace_layout(path: &Path) -> WorkspaceLayouts {
         eprintln!("ignoring workspace layout file {}: {e:#}", path.display());
         WorkspaceLayouts::default()
     })
+}
+
+fn configure_app_style(ctx: &egui::Context) {
+    let mut style = (*ctx.style()).clone();
+    for font_id in style.text_styles.values_mut() {
+        font_id.size += 2.0;
+    }
+    style.spacing.interact_size.y += 2.0;
+    ctx.set_style(style);
 }
 
 fn restore_spawn_configs(
@@ -820,10 +804,6 @@ fn classify_input(text: &str, split_idx: usize) -> SplitAction {
     }
 }
 
-fn about_text(version: &str) -> String {
-    format!("Ox v{version}")
-}
-
 /// Actions that a split's render code can request. Collected inside the
 /// `columns()` closure (where we can't call `&mut self` methods) and
 /// executed afterward.
@@ -845,13 +825,11 @@ enum SplitAction {
 enum MenuAction {
     OpenWorkspacePicker,
     QuitRequested,
-    OpenAbout,
     ConfirmReplaceWorkspace(PathBuf),
     CancelReplaceWorkspace,
     ReplaceWorkspaceConfirmed,
     ConfirmQuit,
     CancelQuit,
-    CloseAbout,
 }
 
 /// Render one vertical split: scroll area with message history, streaming
@@ -1044,13 +1022,12 @@ fn render_blocks(
                 arguments,
             } => {
                 // Manual toggle: clickable header with a triangle prefix.
-                // State stored in egui's temp data keyed by the tool call ID,
-                // defaulting to open when a result exists, closed otherwise.
+                // State stored in egui's temp data keyed by the tool call ID.
+                // Default to closed — a restored workspace has every historical
+                // result present in the map, so defaulting to open would expand
+                // every node on load.
                 let toggle_id = egui::Id::new("tool_toggle").with(id);
-                let default_open = tool_results.contains_key(id.as_str());
-                let mut open = ui
-                    .ctx()
-                    .data_mut(|d| *d.get_temp_mut_or(toggle_id, default_open));
+                let mut open = ui.ctx().data_mut(|d| *d.get_temp_mut_or(toggle_id, false));
 
                 let tool_color = egui::Color32::from_rgb(160, 160, 160);
                 let header_text = format!("{name}({arguments})");
@@ -1421,7 +1398,7 @@ mod tests {
             splits.push(split);
             writers.push(writer);
         }
-        let (app, mirror) = OxApp::new(splits, dummy_spawn_config(), "test-version");
+        let (app, mirror) = OxApp::new(splits, dummy_spawn_config());
         (app, mirror, writers)
     }
 
@@ -1787,7 +1764,6 @@ mod tests {
         let (mut app, _mirror) = OxApp::new(
             vec![AgentSplit::new(client0), AgentSplit::new(client1)],
             dummy_spawn_config(),
-            "test-version",
         );
 
         app.inputs[1] = "hello from split 1".into();
@@ -1956,11 +1932,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn about_text_uses_supplied_app_version() {
-        assert_eq!(about_text("9.8.7"), "Ox v9.8.7");
-    }
-
     #[tokio::test]
     async fn unknown_slash_command_is_sent_to_agent() {
         // `/help` is not a known command — it should go to the agent.
@@ -1968,11 +1939,7 @@ mod tests {
         let (client_writer, agent_reader) = duplex(4096);
         let client = AgentClient::new(BufReader::new(client_reader), client_writer);
 
-        let (mut app, _mirror) = OxApp::new(
-            vec![AgentSplit::new(client)],
-            dummy_spawn_config(),
-            "test-version",
-        );
+        let (mut app, _mirror) = OxApp::new(vec![AgentSplit::new(client)], dummy_spawn_config());
 
         app.inputs[0] = "/help".into();
         let action = classify_input(&app.inputs[0], 0);
@@ -2001,7 +1968,7 @@ mod tests {
         let _guard = rt.enter();
 
         let (split, _writer) = make_split();
-        let (app, mirror) = OxApp::new(vec![split], dummy_spawn_config(), "test-version");
+        let (app, mirror) = OxApp::new(vec![split], dummy_spawn_config());
         // Before publish, the mirror is initialized to `vec![None]`.
         assert_eq!(mirror.lock().unwrap().clone(), vec![None]);
         app.publish_session_ids();
@@ -2011,7 +1978,7 @@ mod tests {
         let (mut split2, _writer2) = make_split();
         split2.session_id = Some(SessionId::new_v4());
         let expected = split2.session_id;
-        let (app2, mirror2) = OxApp::new(vec![split2], dummy_spawn_config(), "test-version");
+        let (app2, mirror2) = OxApp::new(vec![split2], dummy_spawn_config());
         app2.publish_session_ids();
         assert_eq!(mirror2.lock().unwrap().clone(), vec![expected]);
     }

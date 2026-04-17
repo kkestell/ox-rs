@@ -70,6 +70,12 @@ impl<L: LlmProvider, S: SessionStore> SessionRunner<L, S> {
         }
     }
 
+    /// Load a session's messages by id. Used by the agent driver to replay
+    /// history on `--resume` without holding a second `SessionStore` handle.
+    pub async fn load_history(&self, id: SessionId) -> Result<Vec<Message>> {
+        Ok(self.store.load(id).await?.messages)
+    }
+
     /// Create a new session and run the first turn. The caller is responsible
     /// for generating the `SessionId` — this keeps the app layer pure and
     /// deterministic.
@@ -132,6 +138,8 @@ impl<L: LlmProvider, S: SessionStore> SessionRunner<L, S> {
         ));
         self.store.save(session).await?;
 
+        let defs = self.tools.defs();
+
         for _ in 0..MAX_LOOP_ITERATIONS {
             // Check cancellation before starting a new LLM stream. This
             // catches cancels that arrived during tool execution or between
@@ -140,13 +148,9 @@ impl<L: LlmProvider, S: SessionStore> SessionRunner<L, S> {
                 return Ok(TurnOutcome::Cancelled);
             }
 
-            // Expose tool schemas only if we actually have tools registered
-            // — keeps the wire payload minimal for tool-free compositions.
-            let defs = self.tools.defs();
-
             let mut event_stream = self
                 .llm
-                .stream(&session.messages, &self.system_prompt, &defs)
+                .stream(&session.messages, &self.system_prompt, defs)
                 .await?;
             let mut acc = StreamAccumulator::new();
             while let Some(event) = event_stream.next().await {
@@ -170,14 +174,12 @@ impl<L: LlmProvider, S: SessionStore> SessionRunner<L, S> {
                     return Ok(TurnOutcome::Cancelled);
                 }
             }
-            let response = acc.into_message();
-            session.push_message(response.clone());
-            on_event(TurnEvent::MessageAppended(
-                session.messages.last().expect("just pushed"),
-            ));
+            session.push_message(acc.into_message());
+            let response = session.messages.last().expect("just pushed");
+            on_event(TurnEvent::MessageAppended(response));
+            let tool_calls = extract_tool_calls(response);
             self.store.save(session).await?;
 
-            let tool_calls = extract_tool_calls(&response);
             if tool_calls.is_empty() {
                 return Ok(TurnOutcome::Completed);
             }

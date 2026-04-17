@@ -122,10 +122,6 @@ async fn run(cli: AgentCli) -> Result<()> {
         .get("OPENROUTER_API_KEY")?
         .context("OPENROUTER_API_KEY is not set — export it before launching ox-agent")?;
 
-    // Build the runner that processes turns. The driver holds a *second*
-    // `DiskSessionStore` handle so it can independently preload history for
-    // `--resume`; both handles point at the same directory, and
-    // `DiskSessionStore` is stateless beyond its root path.
     let llm = adapter_llm::OpenRouterProvider::new(api_key, cli.model.clone());
 
     // File tools share a single `LocalFileSystem` so concurrent tool calls in
@@ -151,8 +147,7 @@ async fn run(cli: AgentCli) -> Result<()> {
         Arc::new(BashTool::new(shell, fs.clone(), cli.workspace_root.clone())) as Arc<dyn Tool>,
     );
 
-    let store = adapter_storage::DiskSessionStore::new(cli.sessions_dir.clone())?;
-    let history_store = adapter_storage::DiskSessionStore::new(cli.sessions_dir)?;
+    let store = adapter_storage::DiskSessionStore::new(cli.sessions_dir)?;
     let system_prompt = build_system_prompt(&cli.workspace_root, &cli.model);
     let runner = SessionRunner::new(llm, store, tools, system_prompt);
 
@@ -160,13 +155,5 @@ async fn run(cli: AgentCli) -> Result<()> {
     let stdout = tokio::io::stdout();
     let reader = BufReader::new(stdin);
 
-    driver::agent_driver(
-        &runner,
-        &history_store,
-        cli.workspace_root,
-        cli.resume,
-        reader,
-        stdout,
-    )
-    .await
+    driver::agent_driver(&runner, cli.workspace_root, cli.resume, reader, stdout).await
 }

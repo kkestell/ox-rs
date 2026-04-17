@@ -11,6 +11,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
 
+use super::display_path;
 use crate::ports::FileSystem;
 
 /// Maximum lines before spilling to file.
@@ -27,7 +28,7 @@ pub(crate) fn needs_spill(s: &str) -> bool {
     if s.is_empty() {
         return false;
     }
-    s.len() > INLINE_MAX_BYTES || line_count(s) > INLINE_MAX_LINES
+    s.len() > INLINE_MAX_BYTES || s.lines().count() > INLINE_MAX_LINES
 }
 
 /// Byte-offset slice of the first `max_lines` lines. No allocation — returns
@@ -86,27 +87,12 @@ pub(crate) async fn spill<F: FileSystem>(
     let path = spill_path(workspace_root, label);
     fs.write(&path, content).await?;
 
-    // Build the display path relative to workspace root.
-    let display_path = path
-        .strip_prefix(workspace_root)
-        .map(|p| p.to_string_lossy().into_owned())
-        .unwrap_or_else(|_| path.to_string_lossy().into_owned());
-
     Ok(SpillInfo {
+        display_path: display_path(workspace_root, &path),
         path,
-        display_path,
-        total_lines: line_count(content),
+        total_lines: content.lines().count(),
         total_bytes: content.len(),
     })
-}
-
-/// Count lines in a string. Matches `str::lines()` semantics: a trailing
-/// newline does not add an extra empty line.
-fn line_count(s: &str) -> usize {
-    if s.is_empty() {
-        return 0;
-    }
-    s.lines().count()
 }
 
 #[cfg(test)]
@@ -227,27 +213,5 @@ mod tests {
             .await
             .unwrap();
         assert!(info.path.starts_with("/ws/.ox/tmp/"));
-    }
-
-    // -- line_count --
-
-    #[test]
-    fn line_count_empty() {
-        assert_eq!(line_count(""), 0);
-    }
-
-    #[test]
-    fn line_count_with_trailing_newline() {
-        assert_eq!(line_count("a\nb\n"), 2);
-    }
-
-    #[test]
-    fn line_count_without_trailing_newline() {
-        assert_eq!(line_count("a\nb"), 2);
-    }
-
-    #[test]
-    fn line_count_single_line() {
-        assert_eq!(line_count("hello"), 1);
     }
 }

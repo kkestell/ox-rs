@@ -72,7 +72,7 @@ fn main() -> Result<()> {
     let rt = tokio::runtime::Runtime::new()?;
     let _guard = rt.enter();
 
-    let (app, _) = OxApp::restore(spawn_config, layout_state_path, env!("CARGO_PKG_VERSION"))?;
+    let (app, _) = OxApp::restore(spawn_config, layout_state_path)?;
     app.run()?;
 
     Ok(())

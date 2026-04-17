@@ -17,6 +17,7 @@
 //! This is a deliberately scoped deviation from the rest of the codebase's
 //! "no `dyn`, no `async-trait`" style, not a new convention.
 
+use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -71,32 +72,42 @@ pub trait Tool: Send + Sync {
 /// parameters don't multiply. It owns `Arc<dyn Tool>` entries — cheap to
 /// clone for dispatch, and consistent with how most hexagonal systems hand
 /// around trait objects that don't participate in a lifetime dance.
+///
+/// `defs` is computed once at registration time rather than on each call.
+/// `Tool::def` allocates (two `String`s plus a `serde_json::Value`), so
+/// rebuilding it per dispatch or per loop iteration is wasteful.
 pub struct ToolRegistry {
-    tools: Vec<Arc<dyn Tool>>,
+    defs: Vec<ToolDef>,
+    by_name: HashMap<String, Arc<dyn Tool>>,
 }
 
 impl ToolRegistry {
     pub fn new() -> Self {
-        Self { tools: Vec::new() }
+        Self {
+            defs: Vec::new(),
+            by_name: HashMap::new(),
+        }
     }
 
     /// Append a tool. Registration order is preserved by `defs()`, which
     /// matters because providers often surface tools to the model in the
     /// order the schema lists them.
     pub fn register(&mut self, tool: Arc<dyn Tool>) {
-        self.tools.push(tool);
+        let def = tool.def();
+        self.by_name.insert(def.name.clone(), tool);
+        self.defs.push(def);
     }
 
     /// Snapshot of every registered tool's schema, in registration order.
-    pub fn defs(&self) -> Vec<ToolDef> {
-        self.tools.iter().map(|t| t.def()).collect()
+    pub fn defs(&self) -> &[ToolDef] {
+        &self.defs
     }
 
     /// `true` if no tools are registered — used by `SessionRunner` to skip
     /// the tool-call loop entirely when no tools are wired up, preserving
     /// the current single-turn behavior for the no-tools composition case.
     pub fn is_empty(&self) -> bool {
-        self.tools.is_empty()
+        self.defs.is_empty()
     }
 
     /// Dispatch to the tool named `name`, passing `args` verbatim.
@@ -104,9 +115,8 @@ impl ToolRegistry {
     /// them into a tool-result message and let the loop keep going.
     pub async fn execute(&self, name: &str, args: &str) -> Result<String> {
         let tool = self
-            .tools
-            .iter()
-            .find(|t| t.def().name == name)
+            .by_name
+            .get(name)
             .ok_or_else(|| anyhow::anyhow!("unknown tool: {name}"))?;
         tool.execute(args).await
     }
@@ -204,7 +214,7 @@ mod tests {
         reg.register(Arc::new(FakeTool::new("second")) as Arc<dyn Tool>);
         reg.register(Arc::new(FakeTool::new("third")) as Arc<dyn Tool>);
 
-        let names: Vec<_> = reg.defs().into_iter().map(|d| d.name).collect();
+        let names: Vec<_> = reg.defs().iter().map(|d| d.name.as_str()).collect();
         assert_eq!(names, vec!["first", "second", "third"]);
     }
 
