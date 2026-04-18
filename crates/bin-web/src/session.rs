@@ -44,8 +44,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use agent_host::{
-    AgentClient, AgentEventStream, CloseRequestSink, FirstTurnSink, SessionRuntime, ShouldSend,
-    apply_event, begin_send,
+    AgentClient, AgentEventStream, BeginClose, CloseRequestSink, FirstTurnSink, SessionRuntime,
+    ShouldSend, apply_event, begin_close, begin_send, clear_closing,
 };
 use domain::{ContentBlock, Role, SessionId};
 use protocol::{AgentCommand, AgentEvent};
@@ -65,6 +65,14 @@ pub enum SendOutcome {
     Ok,
     Dead,
     AlreadyTurning,
+    Closing,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CloseStart {
+    Closing,
+    TurnInProgress,
+    AlreadyClosing,
 }
 
 pub struct ActiveSession {
@@ -168,6 +176,7 @@ impl ActiveSession {
                 ready_notify.clone(),
                 first_turn_sink.clone(),
                 close_sink.clone(),
+                false,
             );
             Self {
                 session_id,
@@ -274,6 +283,7 @@ impl ActiveSession {
             let mut rt = self.runtime.lock().expect("session runtime mutex poisoned");
             match begin_send(&mut rt) {
                 ShouldSend::Skip => return SendOutcome::AlreadyTurning,
+                ShouldSend::Closing => return SendOutcome::Closing,
                 ShouldSend::Send => {}
             }
         }
@@ -309,9 +319,27 @@ impl ActiveSession {
     /// call would surface as "no such file" on the next filesystem op
     /// and leave the transcript in a confusing half-state. Cheap read —
     /// takes the runtime mutex briefly and never across an await.
+    #[allow(dead_code)]
     pub fn is_turn_in_progress(&self) -> bool {
         let rt = self.runtime.lock().expect("session runtime mutex poisoned");
         rt.is_turn_in_progress()
+    }
+
+    /// Mark the session as closing only if it is idle. Once set, later
+    /// `send_message` calls are rejected before they can enqueue a command.
+    pub fn begin_close(&self) -> CloseStart {
+        let mut rt = self.runtime.lock().expect("session runtime mutex poisoned");
+        match begin_close(&mut rt) {
+            BeginClose::Closing => CloseStart::Closing,
+            BeginClose::TurnInProgress => CloseStart::TurnInProgress,
+            BeginClose::AlreadyClosing => CloseStart::AlreadyClosing,
+        }
+    }
+
+    /// Release the closing marker after a rejected close preflight.
+    pub fn clear_closing(&self) {
+        let mut rt = self.runtime.lock().expect("session runtime mutex poisoned");
+        clear_closing(&mut rt);
     }
 
     /// Swap the agent subprocess without tearing down the session.
@@ -371,6 +399,7 @@ impl ActiveSession {
             self.ready_notify.clone(),
             self.first_turn_sink.clone(),
             self.close_sink.clone(),
+            true,
         );
         *self.pump.lock().expect("session pump mutex poisoned") = new_pump;
     }
@@ -395,8 +424,11 @@ fn spawn_pump(
     ready_notify: Arc<tokio::sync::Notify>,
     first_turn_sink: Arc<dyn FirstTurnSink>,
     close_sink: Arc<dyn CloseRequestSink>,
+    suppress_startup_replay: bool,
 ) -> tokio::task::AbortHandle {
     let join = tokio::spawn(async move {
+        let mut filtering_startup_replay = suppress_startup_replay;
+        let mut replay_message_index = 0usize;
         loop {
             let evt = match stream.recv().await {
                 Some(e) => e,
@@ -411,6 +443,32 @@ fn spawn_pump(
             {
                 let _ = session.session_id.set(*session_id);
                 ready_notify.notify_waiters();
+            }
+
+            // Replacement agents are launched with `--resume`, so their
+            // startup sequence replays persisted history. This session has
+            // already published those frames; suppress the matching prefix so
+            // live subscribers don't see duplicate transcript messages.
+            if filtering_startup_replay {
+                match &evt {
+                    AgentEvent::Ready { .. } => continue,
+                    AgentEvent::MessageAppended { message } => {
+                        let is_replayed = {
+                            let rt = runtime.lock().expect("session runtime mutex poisoned");
+                            rt.messages
+                                .get(replay_message_index)
+                                .is_some_and(|known| messages_match(known, message))
+                        };
+                        if is_replayed {
+                            replay_message_index += 1;
+                            continue;
+                        }
+                        filtering_startup_replay = false;
+                    }
+                    _ => {
+                        filtering_startup_replay = false;
+                    }
+                }
             }
 
             // `RequestClose` is a control frame from the agent asking
@@ -530,6 +588,12 @@ fn spawn_pump(
     join.abort_handle()
 }
 
+fn messages_match(left: &domain::Message, right: &domain::Message) -> bool {
+    left.role == right.role
+        && left.content == right.content
+        && left.token_count == right.token_count
+}
+
 /// Walk `history` front-to-back and return the concatenated text of
 /// the first `MessageAppended` whose role is `User`. Non-text content
 /// blocks are skipped; text blocks are joined with newlines so a
@@ -638,6 +702,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn begin_close_blocks_later_send_without_writing_frame() {
+        let (session, _agent_w, mut agent_r) = session_pair(true);
+
+        assert_eq!(session.begin_close(), CloseStart::Closing);
+        assert_eq!(
+            session.send_message("after close".into()),
+            SendOutcome::Closing
+        );
+
+        let frame = timeout(
+            Duration::from_millis(100),
+            read_frame::<_, AgentCommand>(&mut agent_r),
+        )
+        .await;
+        assert!(frame.is_err(), "closing send unexpectedly wrote a frame");
+
+        session.clear_closing();
+        assert_eq!(session.send_message("after clear".into()), SendOutcome::Ok);
+        let cmd = timeout(
+            Duration::from_secs(2),
+            read_frame::<_, AgentCommand>(&mut agent_r),
+        )
+        .await
+        .expect("send after clear timed out")
+        .expect("read_frame error")
+        .expect("agent pipe closed");
+        match cmd {
+            AgentCommand::SendMessage { input } => assert_eq!(input, "after clear"),
+            other => panic!("expected SendMessage after clear, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
     async fn replace_agent_preserves_history_and_keeps_subscribers_alive() {
         // Plan R8's acceptance test: a subscriber attached before
         // `replace_agent` must keep receiving events published by the
@@ -727,6 +824,105 @@ mod tests {
         match cmd {
             AgentCommand::SendMessage { input } => assert_eq!(input, "hello"),
             other => panic!("expected SendMessage on new pipe, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn replace_agent_suppresses_resumed_history_replay() {
+        let (session, mut agent_w, _agent_r) = session_pair(true);
+
+        let id = SessionId::new_v4();
+        let user = Message::user("Hello!!!");
+        let assistant = Message::assistant(vec![ContentBlock::Text {
+            text: "Hello! I'm ready to help you with your code.".into(),
+        }]);
+
+        ship(
+            &mut agent_w,
+            &AgentEvent::Ready {
+                session_id: id,
+                workspace_root: "/w".into(),
+            },
+        )
+        .await;
+        ship(
+            &mut agent_w,
+            &AgentEvent::MessageAppended {
+                message: user.clone(),
+            },
+        )
+        .await;
+        ship(
+            &mut agent_w,
+            &AgentEvent::MessageAppended {
+                message: assistant.clone(),
+            },
+        )
+        .await;
+        ship(&mut agent_w, &AgentEvent::TurnComplete).await;
+
+        for _ in 0..50 {
+            let (snapshot, _) = session.subscribe();
+            if snapshot.len() >= 4 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        let (_snapshot, mut rx) = session.subscribe();
+        let (new_agent_writer, new_client_reader) = duplex(64 * 1024);
+        let (new_client_writer, _new_agent_reader) = duplex(64 * 1024);
+        let (new_client, new_stream) =
+            AgentClient::new(BufReader::new(new_client_reader), new_client_writer);
+        session.replace_agent(new_client, new_stream);
+        drop(agent_w);
+
+        let mut w = new_agent_writer;
+        ship(
+            &mut w,
+            &AgentEvent::Ready {
+                session_id: id,
+                workspace_root: "/w/renamed".into(),
+            },
+        )
+        .await;
+        ship(
+            &mut w,
+            &AgentEvent::MessageAppended {
+                message: user.clone(),
+            },
+        )
+        .await;
+        ship(&mut w, &AgentEvent::MessageAppended { message: assistant }).await;
+
+        assert!(
+            timeout(Duration::from_millis(100), rx.recv())
+                .await
+                .is_err(),
+            "replacement startup replay should not broadcast duplicate history"
+        );
+
+        let (snapshot_after_replay, _) = session.subscribe();
+        assert_eq!(
+            snapshot_after_replay.len(),
+            4,
+            "replayed startup frames must not be appended to history"
+        );
+
+        ship(
+            &mut w,
+            &AgentEvent::MessageAppended {
+                message: Message::user("next turn"),
+            },
+        )
+        .await;
+        let evt = timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("live post-replay message was not broadcast")
+            .expect("broadcast closed");
+        match evt {
+            AgentEvent::MessageAppended { message } => assert_eq!(message.text(), "next turn"),
+            other => panic!("expected live MessageAppended after replay, got {other:?}"),
         }
     }
 

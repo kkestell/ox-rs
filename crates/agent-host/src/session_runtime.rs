@@ -23,6 +23,7 @@ pub struct SessionRuntime {
     pub error: Option<String>,
     pub session_id: Option<SessionId>,
     pub cancelled: bool,
+    pub closing: bool,
 }
 
 /// Outcome of [`begin_send`]. The caller flips properties only when `Send`
@@ -32,6 +33,14 @@ pub struct SessionRuntime {
 pub enum ShouldSend {
     Send,
     Skip,
+    Closing,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BeginClose {
+    Closing,
+    TurnInProgress,
+    AlreadyClosing,
 }
 
 impl SessionRuntime {
@@ -104,6 +113,9 @@ pub fn apply_event(state: &mut SessionRuntime, event: AgentEvent) {
 /// `cancelled`, and returns `Send`. The IPC dispatch happens in the caller
 /// after this returns `Send`.
 pub fn begin_send(state: &mut SessionRuntime) -> ShouldSend {
+    if state.closing {
+        return ShouldSend::Closing;
+    }
     if state.waiting {
         return ShouldSend::Skip;
     }
@@ -111,6 +123,21 @@ pub fn begin_send(state: &mut SessionRuntime) -> ShouldSend {
     state.error = None;
     state.cancelled = false;
     ShouldSend::Send
+}
+
+pub fn begin_close(state: &mut SessionRuntime) -> BeginClose {
+    if state.closing {
+        return BeginClose::AlreadyClosing;
+    }
+    if state.is_turn_in_progress() {
+        return BeginClose::TurnInProgress;
+    }
+    state.closing = true;
+    BeginClose::Closing
+}
+
+pub fn clear_closing(state: &mut SessionRuntime) {
+    state.closing = false;
 }
 
 #[cfg(test)]
@@ -375,5 +402,30 @@ mod tests {
         assert!(state.waiting);
         assert!(state.error.is_none());
         assert!(!state.cancelled);
+    }
+
+    #[test]
+    fn begin_close_marks_idle_session_and_blocks_send() {
+        let mut state = SessionRuntime::new();
+        assert_eq!(begin_close(&mut state), BeginClose::Closing);
+        assert!(state.closing);
+        assert_eq!(begin_send(&mut state), ShouldSend::Closing);
+        assert!(!state.waiting, "send must not flip waiting while closing");
+    }
+
+    #[test]
+    fn begin_close_rejects_turn_in_progress_without_marking_closing() {
+        let mut state = SessionRuntime::new();
+        state.waiting = true;
+        assert_eq!(begin_close(&mut state), BeginClose::TurnInProgress);
+        assert!(!state.closing);
+    }
+
+    #[test]
+    fn clear_closing_reopens_send_gate() {
+        let mut state = SessionRuntime::new();
+        assert_eq!(begin_close(&mut state), BeginClose::Closing);
+        clear_closing(&mut state);
+        assert_eq!(begin_send(&mut state), ShouldSend::Send);
     }
 }

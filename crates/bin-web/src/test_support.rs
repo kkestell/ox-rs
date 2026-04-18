@@ -16,9 +16,10 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use adapter_storage::DiskSessionStore;
+use adapter_storage::{DiskLayoutRepository, DiskSessionStore};
 use agent_host::{
-    AgentClient, AgentEventStream, AgentSpawnConfig, AgentSpawner, LayoutStore, WorkspaceContext,
+    AgentClient, AgentEventStream, AgentSpawnConfig, AgentSpawner, LayoutRepository,
+    WorkspaceContext,
     fake::{FakeGit, FakeSlugGenerator, NoopCloseRequestSink, NoopFirstTurnSink},
 };
 use anyhow::{Result, anyhow};
@@ -117,7 +118,7 @@ impl AgentSpawner for DuplexSpawner {
 /// workspace_root)`. The caller keeps the receiver alive to pick up
 /// the agent side of every `spawn` call.
 pub async fn test_registry(
-    layout: LayoutStore,
+    layout: Arc<dyn LayoutRepository>,
 ) -> (
     Arc<SessionRegistry>,
     mpsc::UnboundedReceiver<AgentHandles>,
@@ -160,11 +161,11 @@ pub fn unique_temp_dir(label: &str) -> PathBuf {
     dir
 }
 
-/// Empty `LayoutStore` pointed at a scratch JSON path. Used when a
+/// Empty layout repository pointed at a scratch JSON path. Used when a
 /// test doesn't care about pre-existing layout state.
-pub fn empty_layout() -> LayoutStore {
+pub fn empty_layout() -> Arc<dyn LayoutRepository> {
     let path = unique_temp_dir("layout").join("workspaces.json");
-    LayoutStore::load(path).expect("empty LayoutStore")
+    Arc::new(DiskLayoutRepository::load(path).expect("empty layout repository"))
 }
 
 /// Build a [`SessionLifecycle`] whose workspace root matches the

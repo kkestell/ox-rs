@@ -1,34 +1,8 @@
-//! Production [`SlugGenerator`] backed by a direct OpenRouter
-//! chat/completions call.
+//! OpenRouter-backed [`SlugGenerator`].
 //!
-//! The slug rename flow (see `SessionLifecycle::on_first_turn_complete`)
-//! asks the LLM for a short kebab-case label derived from the user's
-//! first message, then renames the session's git branch and worktree
-//! directory from `ox/<short-uuid>` to `ox/<slug>-<short-uuid>`. The
-//! whole flow is best-effort: every failure mode here — network error,
-//! timeout, malformed response, non-conforming slug — returns `None`
-//! and lets the coordinator keep the original short-UUID name.
-//!
-//! Implementation notes:
-//!
-//! - Uses `reqwest` directly rather than routing through
-//!   [`adapter_llm::OpenRouterProvider`]. That provider is built around
-//!   streaming chat turns with tool calls — overkill for a 1-turn,
-//!   non-streaming, JSON-response call. Keeping this path self-contained
-//!   means a change to the slug format doesn't drag the full chat
-//!   pipeline along.
-//! - 10-second timeout (`SLUG_TIMEOUT`) via `tokio::time::timeout`. If
-//!   the generator hangs the session stays on its short-UUID name —
-//!   never blocks session progress.
-//! - `temperature: 0.0` keeps the slug deterministic for identical first
-//!   messages (useful when debugging: re-sending the same first line on
-//!   a new session gets the same slug).
-//! - The prompt asks for JSON with a single `slug` field. We parse it
-//!   with `serde_json` and reject any shape mismatch as `None`.
-//! - The validator enforces `^[a-z0-9]+(-[a-z0-9]+){0,4}$` — up to five
-//!   lowercase-alphanum segments separated by hyphens. The LLM
-//!   occasionally returns an empty string, leading/trailing hyphens, or
-//!   mixed case; all of those are rejected.
+//! The host asks for a short kebab-case label after the first completed turn.
+//! This is provider-specific infrastructure, but intentionally separate from
+//! the streaming chat provider because slugging is a non-streaming JSON call.
 
 use std::time::Duration;
 
@@ -37,20 +11,15 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
 const SLUG_TIMEOUT: Duration = Duration::from_secs(10);
-
-/// System prompt that pins the model to the slug contract. Short and
-/// machine-readable — the model's only job here is to emit a single
-/// JSON object, so we leave all the "why" context out and just tell it
-/// what to return.
 const SLUG_SYSTEM_PROMPT: &str = "You generate short kebab-case slugs that summarize a software task request. Return ONLY a JSON object of the form {\"slug\": \"...\"} with a slug that is 1-5 lowercase-alphanumeric segments separated by single hyphens, 3-40 characters total. No leading or trailing hyphens. No punctuation. No quotes. No commentary.";
 
-pub struct CliSlugGenerator {
+pub struct OpenRouterSlugGenerator {
     client: reqwest::Client,
     api_key: String,
     model: String,
 }
 
-impl CliSlugGenerator {
+impl OpenRouterSlugGenerator {
     pub fn new(api_key: String, model: String) -> Self {
         Self {
             client: reqwest::Client::new(),
@@ -61,7 +30,7 @@ impl CliSlugGenerator {
 }
 
 #[async_trait]
-impl SlugGenerator for CliSlugGenerator {
+impl SlugGenerator for OpenRouterSlugGenerator {
     async fn generate(&self, first_message: &str) -> Option<String> {
         match tokio::time::timeout(SLUG_TIMEOUT, self.request(first_message)).await {
             Ok(Ok(Some(slug))) => Some(slug),
@@ -81,11 +50,7 @@ impl SlugGenerator for CliSlugGenerator {
     }
 }
 
-impl CliSlugGenerator {
-    /// Issue the OpenRouter request and pull a validated slug out of the
-    /// response. Any shape mismatch returns `Ok(None)` (not `Err`) so
-    /// the outer `generate` logs a different message for transport-level
-    /// errors vs. content-level rejects.
+impl OpenRouterSlugGenerator {
     async fn request(&self, first_message: &str) -> Result<Option<String>, reqwest::Error> {
         let body = RequestBody {
             model: &self.model,
@@ -118,13 +83,7 @@ impl CliSlugGenerator {
         let Some(choice) = parsed.choices.into_iter().next() else {
             return Ok(None);
         };
-        let text = choice.message.content;
-
-        // The model occasionally wraps the JSON in Markdown code fences
-        // despite the `response_format` hint. Tolerate a leading/trailing
-        // ``` fence by stripping it before deserializing.
-        let trimmed = strip_code_fence(text.trim());
-
+        let trimmed = strip_code_fence(choice.message.content.trim());
         let envelope: SlugEnvelope = match serde_json::from_str(trimmed) {
             Ok(e) => e,
             Err(_) => return Ok(None),
@@ -133,10 +92,6 @@ impl CliSlugGenerator {
     }
 }
 
-/// Return `Some(slug)` if it matches `^[a-z0-9]+(-[a-z0-9]+){0,4}$` and
-/// is within the length budget, else `None`. Hand-rolled rather than
-/// pulling in the `regex` crate — the rule is simple enough that an
-/// explicit walk is both clearer and cheaper.
 fn validate_slug(slug: &str) -> Option<String> {
     if slug.is_empty() || slug.len() > 40 {
         return None;
@@ -145,7 +100,6 @@ fn validate_slug(slug: &str) -> Option<String> {
     let mut segment_len = 0usize;
     for ch in slug.chars() {
         if ch == '-' {
-            // Leading hyphen, or two hyphens in a row → reject.
             if segment_len == 0 {
                 return None;
             }
@@ -157,25 +111,20 @@ fn validate_slug(slug: &str) -> Option<String> {
         } else if ch.is_ascii_lowercase() || ch.is_ascii_digit() {
             segment_len += 1;
         } else {
-            // Uppercase, punctuation, whitespace, non-ASCII: reject.
             return None;
         }
     }
-    // Trailing hyphen → final segment has length 0.
     if segment_len == 0 {
         return None;
     }
     Some(slug.to_owned())
 }
 
-/// Strip a leading ```[lang]\n … \n``` fence if present. The model is
-/// asked for raw JSON but sometimes inserts a fence anyway.
 fn strip_code_fence(text: &str) -> &str {
     let trimmed = text.trim();
     if !trimmed.starts_with("```") {
         return trimmed;
     }
-    // Drop the first line (the opening fence, with optional language tag).
     let after_open = match trimmed.find('\n') {
         Some(idx) => &trimmed[idx + 1..],
         None => return trimmed,
@@ -245,8 +194,6 @@ mod tests {
 
     #[test]
     fn validate_rejects_six_segments() {
-        // Six hyphen-separated segments exceeds the cap of five, which
-        // keeps the final directory name from growing unbounded.
         assert_eq!(validate_slug("a-b-c-d-e-f"), None);
     }
 
@@ -288,8 +235,6 @@ mod tests {
 
     #[test]
     fn validate_rejects_overlong() {
-        // 41 chars, just over the cap. Catches runaway model output
-        // before it becomes a surprising directory name.
         let s = "a".repeat(41);
         assert_eq!(validate_slug(&s), None);
     }

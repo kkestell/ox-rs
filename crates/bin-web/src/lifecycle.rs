@@ -6,8 +6,8 @@
 //! - the [`Git`] adapter (worktree + branch operations),
 //! - the [`SlugGenerator`] (turns the first user message into a slug
 //!   used for renaming the worktree dir + branch),
-//! - the [`DiskSessionStore`] (deletes the session JSON when merge /
-//!   abandon completes),
+//! - the [`SessionRecords`] port (loads/saves/deletes host-visible
+//!   session JSON),
 //! - the [`WorkspaceContext`] (main workspace root + base branch),
 //! - per-session close locks so concurrent merge / abandon requests
 //!   for the same session serialize cleanly.
@@ -48,17 +48,16 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
-use adapter_storage::DiskSessionStore;
 use agent_host::{
-    CloseRequestSink, FirstTurnSink, Git, MergeOutcome, SlugGenerator, WorkspaceContext,
-    WorktreeStatus, workspace_slug,
+    CloseRequestSink, FirstTurnSink, Git, MergeOutcome, SessionRecords, SlugGenerator,
+    WorkspaceContext, WorktreeStatus, workspace_slug,
 };
 use anyhow::{Context, Result, anyhow};
-use app::SessionStore;
 use async_trait::async_trait;
 use domain::{CloseIntent, SessionId};
 
 use crate::registry::SessionRegistry;
+use crate::session::CloseStart;
 
 /// Per-session close-in-flight flag. The coordinator takes the lock
 /// for the whole merge / abandon / close-request flow; concurrent
@@ -116,15 +115,10 @@ pub struct SessionLifecycle {
     /// Slug generator — an `OpenRouterProvider`-backed call in
     /// production, `FakeSlugGenerator` in tests.
     slug_generator: Arc<dyn SlugGenerator>,
-    /// Session store — used **only** by the coordinator to delete the
-    /// on-disk session JSON after a successful merge / abandon. The
-    /// agent subprocess owns all other session-store reads and writes.
-    /// A concrete `Arc<DiskSessionStore>` instead of `Arc<dyn
-    /// SessionStore>` because the `SessionStore` trait uses
-    /// return-position `impl Trait` and so is not dyn-compatible; the
-    /// coordinator has only one production impl and future tests can
-    /// introduce a narrower port if they need to fake deletion.
-    session_store: Arc<DiskSessionStore>,
+    /// Host-facing session records. The agent subprocess owns normal turn
+    /// persistence; lifecycle policy uses this narrow port for close
+    /// preflight, teardown deletion, and slug-rename path updates.
+    session_store: Arc<dyn SessionRecords>,
     /// Main workspace root + base branch, snapshotted at startup. Every
     /// worktree-add and merge runs against these values; they do not
     /// change over the server's lifetime.
@@ -148,7 +142,7 @@ impl SessionLifecycle {
     pub fn new(
         git: Arc<dyn Git>,
         slug_generator: Arc<dyn SlugGenerator>,
-        session_store: Arc<DiskSessionStore>,
+        session_store: Arc<dyn SessionRecords>,
         workspace: WorkspaceContext,
     ) -> Arc<Self> {
         Arc::new(Self {
@@ -245,9 +239,8 @@ impl SessionLifecycle {
     /// 2. No other close is in flight (else `AlreadyClosing`). Acquiring
     ///    the close lock is done via [`begin_close`], which returns an
     ///    RAII guard that releases the lock on drop.
-    /// 3. The agent is idle — no turn in flight (else `TurnInProgress`).
-    ///    Checked against [`ActiveSession::is_turn_in_progress`], which
-    ///    reflects the pump's view of the `SessionRuntime` state machine.
+    /// 3. The agent is idle and is marked closing. Later sends now
+    ///    receive `409 Conflict` instead of racing into teardown.
     /// 4. Worktree is clean (else `WorktreeDirty`). Dirty state means
     ///    the agent has uncommitted edits; merging silently would
     ///    discard them when we remove the worktree below.
@@ -258,15 +251,8 @@ impl SessionLifecycle {
     ///    succeeded so branch is already merged), delete the session
     ///    JSON, drop from the registry.
     ///
-    /// Note the TOCTOU window between (3) and (5): a new `POST
-    /// /messages` can race in after the turn-in-progress check clears
-    /// and land a `SendMessage` on the agent's stdin mid-merge. We
-    /// accept the race per the plan — the common case (idle session,
-    /// user clicks merge) is still guarded; the racy case leaves the
-    /// session closed with an interrupted final turn, which matches the
-    /// user's intent anyway.
     pub async fn merge(&self, id: SessionId) -> Result<(), MergeRejection> {
-        let (session, worktree_path, branch, _guard) = self.begin_close_flow(id).await?;
+        let (session, worktree_path, branch, mut _guard) = self.begin_close_flow(id).await?;
 
         let status = self
             .git
@@ -294,6 +280,7 @@ impl SessionLifecycle {
         // kill until our Arc goes out of scope at the end of the
         // function.
         drop(session);
+        _guard.keep_session_closing();
 
         self.teardown(id, &branch, &worktree_path, /* force_branch */ false)
             .await
@@ -314,7 +301,7 @@ impl SessionLifecycle {
     /// an abandoned session branch may have commits that never landed
     /// on main, so `git branch -d` (the unforced version) would refuse.
     pub async fn abandon(&self, id: SessionId, confirm: bool) -> Result<(), MergeRejection> {
-        let (session, worktree_path, branch, _guard) = self.begin_close_flow(id).await?;
+        let (session, worktree_path, branch, mut _guard) = self.begin_close_flow(id).await?;
 
         let status = self
             .git
@@ -326,6 +313,7 @@ impl SessionLifecycle {
         }
 
         drop(session);
+        _guard.keep_session_closing();
 
         self.teardown(id, &branch, &worktree_path, /* force_branch */ true)
             .await
@@ -357,13 +345,16 @@ impl SessionLifecycle {
             .ok_or_else(|| MergeRejection::Internal("registry has been dropped".to_owned()))?;
         let session = registry.get(id).ok_or(MergeRejection::NotFound)?;
 
-        let guard = self.begin_close(id).ok_or(MergeRejection::AlreadyClosing)?;
+        let mut guard = self.begin_close(id).ok_or(MergeRejection::AlreadyClosing)?;
 
-        // The turn-idle check must run *after* we own the close lock —
-        // otherwise a concurrent merge/abandon could see us as idle,
-        // start closing too, and we'd race past the check together.
-        if session.is_turn_in_progress() {
-            return Err(MergeRejection::TurnInProgress);
+        // The session marker closes the send/close race: once set, a
+        // later POST /messages returns conflict before touching the
+        // agent's stdin. The close guard clears the marker on every
+        // rejected preflight path.
+        match session.begin_close() {
+            CloseStart::Closing => guard.protect_session(session.clone()),
+            CloseStart::TurnInProgress => return Err(MergeRejection::TurnInProgress),
+            CloseStart::AlreadyClosing => return Err(MergeRejection::AlreadyClosing),
         }
 
         // The session JSON is the authoritative source for worktree
@@ -444,6 +435,8 @@ impl SessionLifecycle {
                 Some(CloseGuard {
                     closing: &self.closing,
                     id,
+                    session: None,
+                    clear_session_on_drop: true,
                 })
             }
         }
@@ -461,10 +454,27 @@ impl SessionLifecycle {
 struct CloseGuard<'a> {
     closing: &'a Mutex<HashMap<SessionId, CloseState>>,
     id: SessionId,
+    session: Option<Arc<crate::session::ActiveSession>>,
+    clear_session_on_drop: bool,
+}
+
+impl CloseGuard<'_> {
+    fn protect_session(&mut self, session: Arc<crate::session::ActiveSession>) {
+        self.session = Some(session);
+    }
+
+    fn keep_session_closing(&mut self) {
+        self.clear_session_on_drop = false;
+    }
 }
 
 impl Drop for CloseGuard<'_> {
     fn drop(&mut self) {
+        if self.clear_session_on_drop
+            && let Some(session) = &self.session
+        {
+            session.clear_closing();
+        }
         let mut map = self.closing.lock().expect("close map poisoned");
         map.remove(&self.id);
     }
@@ -683,6 +693,7 @@ impl FirstTurnSink for SessionLifecycle {
 mod tests {
     use std::path::PathBuf;
 
+    use adapter_storage::DiskSessionStore;
     use agent_host::fake::{FakeGit, FakeSlugGenerator, GitCall};
     use domain::SessionId;
 
@@ -854,9 +865,10 @@ mod tests {
         let first_msg = "help me fix the login flow".to_owned();
         slug.set_response(&first_msg, Some("fix-login".into()));
 
-        use app::SessionStore;
         let seed = domain::Session::new(id, workspace_root.clone(), old_worktree.clone());
-        store.save(&seed).await.expect("seed session");
+        app::SessionStore::save(store.as_ref(), &seed)
+            .await
+            .expect("seed session");
 
         let sink: Arc<dyn FirstTurnSink> = lifecycle.clone();
         sink.on_first_turn_complete(id, first_msg.clone()).await;

@@ -4,8 +4,8 @@
 //! The slug is used to rename `ox/<short-uuid>` to
 //! `ox/<slug>-<short-uuid>` after the first turn completes, so sessions
 //! get a human-readable name without any user input. Production
-//! (`CliSlugGenerator` in `bin-web`) wraps an LLM call with a short
-//! timeout and validates the output shape; tests use the
+//! (`OpenRouterSlugGenerator` in `adapter-llm`) wraps an LLM call with a
+//! short timeout and validates the output shape; tests use the
 //! `fake::FakeSlugGenerator` double.
 //!
 //! The trait returns `Option<String>` (not `Result`) so callers can

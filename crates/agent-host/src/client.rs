@@ -5,25 +5,19 @@
 //! so a drain task can `await` on the stream without contending with the
 //! shared state the command sender lives behind.
 //!
-//! The split between [`AgentClient::new`] and [`AgentClient::spawn`] exists
-//! for testing: `new` takes any `AsyncBufRead` / `AsyncWrite` pair so unit
-//! tests drive a real client over `tokio::io::duplex`. `spawn` is the thin
-//! `tokio::process::Command` wrapper around `new`.
-//!
-//! The agent is killed on drop (`kill_on_drop(true)`) so dropping the
-//! `AgentClient` is the cancellation path: the subprocess always dies with
-//! the host, not the other way around.
+//! `AgentClient::new` takes any `AsyncBufRead` / `AsyncWrite` pair so unit
+//! tests drive a real client over `tokio::io::duplex`, while production
+//! adapters can wire those same generic halves to a subprocess, socket, or any
+//! other transport.
 
 use std::path::PathBuf;
 
-use anyhow::{Context, Result};
 use domain::SessionId;
 use protocol::{AgentCommand, AgentEvent, read_frame, write_frame};
-use tokio::io::{AsyncBufRead, AsyncWrite, BufReader};
-use tokio::process::{Child, Command};
+use tokio::io::{AsyncBufRead, AsyncWrite};
 use tokio::sync::mpsc;
 
-/// Config passed to [`AgentClient::spawn`]. Deliberately small — extra agent
+/// Config passed to an [`AgentSpawner`](crate::AgentSpawner). Deliberately small — extra agent
 /// knobs belong in the agent's env, not in a twelve-field "options" struct.
 #[derive(Debug, Clone)]
 pub struct AgentSpawnConfig {
@@ -55,9 +49,10 @@ pub struct AgentSpawnConfig {
 /// across tasks without cloning the client.
 pub struct AgentClient {
     cmd_tx: mpsc::UnboundedSender<AgentCommand>,
-    /// Handle to the child process, if this client was created by `spawn`.
-    /// Dropped along with the client, which triggers `kill_on_drop`.
-    _child: Option<Child>,
+    /// Optional owner for transport lifetime resources supplied by an
+    /// adapter. The process adapter stores its `tokio::process::Child`
+    /// here so dropping the client also drops the child handle.
+    _drop_guard: Option<Box<dyn Send>>,
 }
 
 /// Receive-side handle. Owned by a drain task in the host binary — kept
@@ -75,14 +70,13 @@ impl AgentEventStream {
 }
 
 impl AgentClient {
-    /// Build a client over any pair of reader + writer. Used by both
-    /// `spawn` (which passes the child's stdout / stdin) and by unit tests
-    /// (which pass `tokio::io::duplex` halves).
+    /// Build a client over any pair of reader + writer. Production adapters
+    /// pass the transport's read/write halves; unit tests pass
+    /// `tokio::io::duplex` halves.
     ///
     /// Internally spawns one reader task and one writer task via the
-    /// `spawn_reader` / `spawn_writer` helpers. `spawn` calls this function
-    /// too, so both code paths share a single implementation — no risk of
-    /// drift between test and production.
+    /// `spawn_reader` / `spawn_writer` helpers so test and production
+    /// transports share the same IPC implementation.
     pub fn new<R, W>(reader: R, writer: W) -> (Self, AgentEventStream)
     where
         R: AsyncBufRead + Send + Unpin + 'static,
@@ -101,54 +95,18 @@ impl AgentClient {
         spawn_writer(writer, cmd_rx, evt_tx, reader_closed_rx);
         let client = Self {
             cmd_tx,
-            _child: None,
+            _drop_guard: None,
         };
         let stream = AgentEventStream { rx: evt_rx };
         (client, stream)
     }
 
-    /// Spawn `ox-agent` as a subprocess and return a client wired to its
-    /// stdio along with the event stream.
-    ///
-    /// `kill_on_drop(true)` ties the agent's lifetime to the client — the
-    /// moment the `AgentClient` is dropped (session removed, server
-    /// shutdown, etc.), the child is SIGKILL'd.
-    pub fn spawn(config: AgentSpawnConfig) -> Result<(Self, AgentEventStream)> {
-        let mut cmd = Command::new(&config.binary);
-        cmd.arg("--workspace-root")
-            .arg(&config.workspace_root)
-            .arg("--model")
-            .arg(&config.model)
-            .arg("--sessions-dir")
-            .arg(&config.sessions_dir);
-        if let Some(id) = config.resume {
-            cmd.arg("--resume").arg(id.to_string());
-        } else if let Some(id) = config.session_id {
-            // `--session-id` is only meaningful for fresh sessions —
-            // `--resume` already carries the id there.
-            cmd.arg("--session-id").arg(id.to_string());
-        }
-        for (k, v) in &config.env {
-            cmd.env(k, v);
-        }
-        cmd.stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::inherit())
-            .kill_on_drop(true);
-
-        let mut child = cmd
-            .spawn()
-            .with_context(|| format!("spawning {}", config.binary.display()))?;
-
-        let stdin = child.stdin.take().context("child stdin missing")?;
-        let stdout = child.stdout.take().context("child stdout missing")?;
-        let reader = BufReader::new(stdout);
-
-        // Route through `new` so the reader/writer tasks come from the
-        // same code as the duplex-backed unit tests.
-        let (mut client, stream) = Self::new(reader, stdin);
-        client._child = Some(child);
-        Ok((client, stream))
+    /// Attach an adapter-owned lifetime guard to this client. The guard
+    /// is dropped with the client; production process spawning uses this
+    /// to keep the child handle tied to the command sender.
+    pub fn with_drop_guard(mut self, guard: impl Send + 'static) -> Self {
+        self._drop_guard = Some(Box::new(guard));
+        self
     }
 
     /// Send a command to the agent. Returns `Err` only if the writer task
@@ -162,9 +120,8 @@ impl AgentClient {
     }
 }
 
-// Reader and writer task helpers. Both `new` and `spawn` route through
-// `new`, which calls these helpers, so there's exactly one implementation of
-// each task body. No risk of drift between test and production code paths.
+// Reader and writer task helpers. Every transport routes through `new`, which
+// calls these helpers, so there's exactly one implementation of each task body.
 
 fn spawn_reader<R>(
     mut reader: R,

@@ -4,12 +4,14 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+agent-host = { version = "0.1.0", path = "../agent-host" }
 anyhow = "1.0.102"
 app = { version = "0.1.0", path = "../app" }
+async-trait = "0.1.89"
 domain = { version = "0.1.0", path = "../domain" }
 futures = "0.3.32"
 reqwest = { version = "0.13.2", features = ["json", "stream"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
-tokio = { version = "1.52.0", features = ["rt", "sync"] }
+tokio = { version = "1.52.0", features = ["rt", "sync", "time"] }
 tokio-stream = "0.1.18"

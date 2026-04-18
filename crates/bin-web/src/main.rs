@@ -2,10 +2,11 @@
 //!
 //! Boots an axum server on `127.0.0.1:<port>`, restores the saved layout
 //! for the current workspace root, spawns one `ox-agent` subprocess per
-//! saved session, and opens a browser tab pointed at the URL (unless
-//! `--no-open`). The server keeps running until SIGINT; on shutdown it
-//! flushes the current layout to disk and lets `kill_on_drop` tear
-//! down every child.
+//! saved session. If no sessions are restored, the workspace starts
+//! empty and waits for the user to create one. The server opens a
+//! browser tab pointed at the URL (unless `--no-open`) and keeps
+//! running until SIGINT; on shutdown it flushes the current layout to
+//! disk and lets `kill_on_drop` tear down every child.
 //!
 //! This binary is intentionally thin. All server logic lives in the
 //! sibling modules (`routes`, `sse`, `registry`, `session`). `main.rs`
@@ -20,7 +21,6 @@ mod lifecycle;
 mod registry;
 mod routes;
 mod session;
-mod slug;
 mod sse;
 mod startup;
 mod state;
@@ -32,9 +32,11 @@ use std::process::ExitCode;
 use std::sync::Arc;
 
 use adapter_git::CliGit;
-use adapter_storage::DiskSessionStore;
+use adapter_llm::OpenRouterSlugGenerator;
+use adapter_process::ProcessSpawner;
+use adapter_storage::{DiskLayoutRepository, DiskSessionStore};
 use agent_host::{
-    AgentSpawnConfig, CloseRequestSink, FirstTurnSink, Git, LayoutStore, ProcessSpawner,
+    AgentSpawnConfig, CloseRequestSink, FirstTurnSink, Git, LayoutRepository, SessionRecords,
     SlugGenerator,
 };
 use anyhow::{Context, Result};
@@ -45,7 +47,6 @@ use tokio::net::TcpListener;
 use crate::lifecycle::SessionLifecycle;
 use crate::registry::SessionRegistry;
 use crate::routes::router;
-use crate::slug::CliSlugGenerator;
 use crate::startup::assert_workspace_ready;
 use crate::state::AppState;
 
@@ -62,6 +63,10 @@ struct Cli {
     /// Resume a single session by id, bypassing the saved layout.
     #[arg(long)]
     resume: Option<SessionId>,
+
+    /// Workspace directory to open (defaults to current directory).
+    #[arg(long)]
+    workspace: Option<PathBuf>,
 
     /// Default model for new sessions.
     #[arg(long, default_value = DEFAULT_MODEL)]
@@ -108,7 +113,10 @@ async fn run(cli: Cli) -> Result<()> {
     // Workspace root is the current working directory. Keeping the
     // server scoped to one root means the layout file can use CWD as
     // the key without any user-facing flag.
-    let workspace_root = std::env::current_dir().context("resolving current working directory")?;
+    let workspace_root = match cli.workspace {
+        Some(p) => p.canonicalize().context("resolving --workspace path")?,
+        None => std::env::current_dir().context("resolving current working directory")?,
+    };
 
     // Startup gate: refuse to launch outside a git working copy. The
     // worktree / merge flows built on top of `SessionLifecycle` assume
@@ -133,24 +141,25 @@ async fn run(cli: Cli) -> Result<()> {
     let sessions_dir = ox_dir.join("sessions");
     let layout_path = ox_dir.join("workspaces.json");
 
-    let layout = match LayoutStore::load(layout_path.clone()) {
-        Ok(l) => l,
-        Err(err) => {
-            // A corrupt layout file should not prevent the server from
-            // starting. Move the bad file aside and reload from the
-            // (now-missing) canonical path — `LayoutStore::load`
-            // returns an empty store when the file doesn't exist.
-            let bak = layout_path.with_extension("bak");
-            eprintln!(
-                "ox: failed to load {}: {err:#}; moving aside to {} and starting empty",
-                layout_path.display(),
-                bak.display()
-            );
-            let _ = std::fs::rename(&layout_path, &bak);
-            LayoutStore::load(layout_path.clone())
-                .context("reloading layout after corrupt-file fallback")?
-        }
-    };
+    let layout: Arc<dyn LayoutRepository> =
+        Arc::new(match DiskLayoutRepository::load(layout_path.clone()) {
+            Ok(l) => l,
+            Err(err) => {
+                // A corrupt layout file should not prevent the server from
+                // starting. Move the bad file aside and reload from the
+                // (now-missing) canonical path — `DiskLayoutRepository::load`
+                // returns an empty store when the file doesn't exist.
+                let bak = layout_path.with_extension("bak");
+                eprintln!(
+                    "ox: failed to load {}: {err:#}; moving aside to {} and starting empty",
+                    layout_path.display(),
+                    bak.display()
+                );
+                let _ = std::fs::rename(&layout_path, &bak);
+                DiskLayoutRepository::load(layout_path.clone())
+                    .context("reloading layout after corrupt-file fallback")?
+            }
+        });
 
     let spawn_config = AgentSpawnConfig {
         binary: agent_binary,
@@ -171,17 +180,15 @@ async fn run(cli: Cli) -> Result<()> {
     //   3. Call `lifecycle.set_registry(..)` so the coordinator can
     //      reach the registry through a weak-ref.
     //
-    // The session store is a concrete `Arc<DiskSessionStore>` because
-    // `SessionStore`'s RPIT makes it non-dyn-compatible; the coordinator
-    // owns the only production impl today.
     let slug_generator: Arc<dyn SlugGenerator> =
-        Arc::new(CliSlugGenerator::new(slug_api_key, slug_model));
+        Arc::new(OpenRouterSlugGenerator::new(slug_api_key, slug_model));
     let session_store = Arc::new(
         DiskSessionStore::new(&spawn_config.sessions_dir)
             .context("creating the session store directory")?,
     );
+    let session_records: Arc<dyn SessionRecords> = session_store.clone();
     let lifecycle =
-        SessionLifecycle::new(git, slug_generator, session_store.clone(), workspace_ctx);
+        SessionLifecycle::new(git, slug_generator, session_records.clone(), workspace_ctx);
     let close_sink: Arc<dyn CloseRequestSink> = lifecycle.clone();
     let first_turn_sink: Arc<dyn FirstTurnSink> = lifecycle.clone();
 
@@ -192,12 +199,12 @@ async fn run(cli: Cli) -> Result<()> {
         let reg = SessionRegistry::new(
             spawner.clone(),
             spawn_config.clone(),
-            layout,
+            layout.clone(),
             workspace_root.clone(),
             close_sink.clone(),
             first_turn_sink.clone(),
         );
-        resume_single(&reg, id, session_store.as_ref()).await?;
+        resume_single(&reg, id, session_records.as_ref()).await?;
         reg
     } else {
         SessionRegistry::restore(
@@ -207,7 +214,7 @@ async fn run(cli: Cli) -> Result<()> {
             workspace_root.clone(),
             close_sink.clone(),
             first_turn_sink.clone(),
-            session_store.clone(),
+            session_records.clone(),
         )
         .await?
     };
@@ -215,27 +222,6 @@ async fn run(cli: Cli) -> Result<()> {
     // Phase 3: close the init cycle. After this, any lifecycle method
     // that upgrades the weak-ref can reach the registry.
     lifecycle.set_registry(Arc::downgrade(&registry));
-
-    // Bootstrap an initial session if nothing resumed — this is the
-    // "fresh launch" path, and the only layer that knows how to create
-    // a worktree is the lifecycle coordinator. Done after
-    // `set_registry` so `create_and_spawn` can reach back into the
-    // registry to insert the new session.
-    if registry.is_empty() {
-        match lifecycle.create_and_spawn().await {
-            Ok(id) => {
-                // Persist a one-pane layout so the next restart knows
-                // which id to resume. Any client PUT will overwrite.
-                let layout = agent_host::Layout::new(vec![id], vec![1.0]);
-                if let Err(err) = registry.put_layout(layout) {
-                    eprintln!("ox: failed to persist initial layout: {err:#}");
-                }
-            }
-            Err(err) => {
-                return Err(err.context("failed to start the initial session"));
-            }
-        }
-    }
 
     let state = AppState {
         registry: registry.clone(),
@@ -305,7 +291,7 @@ fn resolve_agent_binary() -> Result<PathBuf> {
 async fn resume_single(
     registry: &SessionRegistry,
     id: SessionId,
-    session_store: &DiskSessionStore,
+    session_store: &dyn SessionRecords,
 ) -> Result<()> {
     // `restore`'s fallback path produces a one-pane registry already;
     // we replicate that shape here by creating the resumed session and

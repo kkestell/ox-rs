@@ -236,6 +236,11 @@ async fn post_message(
             Json(serde_json::json!({"reason": "already_turning"})),
         )
             .into_response(),
+        CommandDispatch::Closing => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({"reason": "closing"})),
+        )
+            .into_response(),
     }
 }
 
@@ -665,6 +670,31 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::GONE);
     }
 
+    #[tokio::test]
+    async fn post_message_returns_409_while_session_is_closing() {
+        let (app, registry, mut rx) = make_app().await;
+        let (_, id, mut handles) = create_via_router(app.clone(), &mut rx).await;
+        registry.get(id).expect("session").begin_close();
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/sessions/{id}/messages"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"input":"too late"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        let body = decode_json(resp).await;
+        assert_eq!(body["reason"], "closing");
+
+        let frame = timeout(Duration::from_millis(100), handles.next_command()).await;
+        assert!(frame.is_err(), "send while closing wrote to the agent");
+    }
+
     // -- POST /api/sessions/:id/cancel ------------------------------------
 
     #[tokio::test]
@@ -788,7 +818,7 @@ mod tests {
     #[tokio::test]
     async fn merge_rejects_dirty_worktree_with_409_and_skips_teardown() {
         let mut harness = make_harness().await;
-        let (id, worktree_path, _handles) = seed_live_session(&mut harness).await;
+        let (id, worktree_path, mut handles) = seed_live_session(&mut harness).await;
         harness.git.set_status(worktree_path, WorktreeStatus::Dirty);
 
         let resp = harness
@@ -820,6 +850,28 @@ mod tests {
                 .any(|c| matches!(c, GitCall::RemoveWorktree { .. })),
             "no RemoveWorktree call expected, got {calls:?}"
         );
+
+        let send = harness
+            .app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/sessions/{id}/messages"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"input":"still open"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(send.status(), StatusCode::NO_CONTENT);
+        match timeout(Duration::from_secs(2), handles.next_command())
+            .await
+            .expect("send after rejected merge timed out")
+        {
+            Some(AgentCommand::SendMessage { input }) => assert_eq!(input, "still open"),
+            other => panic!("expected SendMessage after rejected merge, got {other:?}"),
+        }
     }
 
     #[tokio::test]

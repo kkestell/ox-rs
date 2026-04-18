@@ -29,8 +29,10 @@ dependencies = [
 name = "adapter-llm"
 version = "0.1.0"
 dependencies = [
+ "agent-host",
  "anyhow",
  "app",
+ "async-trait",
  "domain",
  "futures",
  "reqwest",
@@ -38,6 +40,15 @@ dependencies = [
  "serde_json",
  "tokio",
  "tokio-stream",
+]
+
+[[package]]
+name = "adapter-process"
+version = "0.1.0"
+dependencies = [
+ "agent-host",
+ "anyhow",
+ "tokio",
 ]
 
 [[package]]
@@ -52,9 +63,12 @@ dependencies = [
 name = "adapter-storage"
 version = "0.1.0"
 dependencies = [
+ "agent-host",
  "anyhow",
  "app",
+ "async-trait",
  "domain",
+ "serde",
  "serde_json",
  "tempfile",
  "tokio",
@@ -70,7 +84,6 @@ dependencies = [
  "domain",
  "protocol",
  "serde",
- "serde_json",
  "tempfile",
  "tokio",
 ]
@@ -302,6 +315,8 @@ name = "bin-web"
 version = "0.1.0"
 dependencies = [
  "adapter-git",
+ "adapter-llm",
+ "adapter-process",
  "adapter-storage",
  "agent-host",
  "anyhow",
@@ -314,7 +329,6 @@ dependencies = [
  "futures-util",
  "http-body-util",
  "protocol",
- "reqwest",
  "serde",
  "serde_json",
  "tempfile",

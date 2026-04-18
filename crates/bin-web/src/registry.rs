@@ -4,7 +4,7 @@
 //!
 //! - a map of live sessions keyed by [`SessionId`],
 //! - the workspace root this server instance is scoped to,
-//! - the [`LayoutStore`] that persists pane order / sizes across runs,
+//! - the [`LayoutRepository`] that persists pane order / sizes across runs,
 //! - the [`AgentSpawner`] used to birth new subprocesses (or, in
 //!   tests, to hand back duplex-backed clients).
 //!
@@ -25,11 +25,11 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, RwLock};
 
-use adapter_storage::DiskSessionStore;
 use agent_host::{
-    AgentSpawnConfig, AgentSpawner, CloseRequestSink, FirstTurnSink, Layout, LayoutStore,
+    AgentSpawnConfig, AgentSpawner, CloseRequestSink, FirstTurnSink, Layout, LayoutRepository,
+    SessionRecords,
 };
 use anyhow::{Context, Result, anyhow};
 use domain::SessionId;
@@ -62,13 +62,14 @@ pub enum CommandDispatch {
     NotFound,
     Dead,
     AlreadyTurning,
+    Closing,
 }
 
 pub struct SessionRegistry {
     sessions: RwLock<HashMap<SessionId, Arc<ActiveSession>>>,
     spawner: Arc<dyn AgentSpawner>,
     spawn_config: AgentSpawnConfig,
-    layout: Mutex<LayoutStore>,
+    layout: Arc<dyn LayoutRepository>,
     workspace_root: PathBuf,
     /// Sink for `AgentEvent::RequestClose` frames the pump observes.
     /// Passed through to every `ActiveSession` at creation so the pump
@@ -89,7 +90,7 @@ impl SessionRegistry {
     pub fn new(
         spawner: Arc<dyn AgentSpawner>,
         spawn_config: AgentSpawnConfig,
-        layout: LayoutStore,
+        layout: Arc<dyn LayoutRepository>,
         workspace_root: PathBuf,
         close_sink: Arc<dyn CloseRequestSink>,
         first_turn_sink: Arc<dyn FirstTurnSink>,
@@ -98,7 +99,7 @@ impl SessionRegistry {
             sessions: RwLock::new(HashMap::new()),
             spawner,
             spawn_config,
-            layout: Mutex::new(layout),
+            layout,
             workspace_root,
             close_sink,
             first_turn_sink,
@@ -117,18 +118,17 @@ impl SessionRegistry {
     ///   date, etc.) is logged and the loop continues so one broken row
     ///   does not block the rest of the layout from restoring.
     ///
-    /// If no session resumes, the registry is returned empty — the
-    /// caller (`bin-web::run`) is responsible for bootstrapping a fresh
-    /// initial session through `SessionLifecycle::create_and_spawn`,
-    /// which is the only path that knows how to create a worktree.
+    /// If no session resumes, the registry is returned empty. The
+    /// frontend will show the workspace with no panes until the user
+    /// creates a session via `POST /api/sessions`.
     pub async fn restore(
         spawner: Arc<dyn AgentSpawner>,
         spawn_config: AgentSpawnConfig,
-        layout: LayoutStore,
+        layout: Arc<dyn LayoutRepository>,
         workspace_root: PathBuf,
         close_sink: Arc<dyn CloseRequestSink>,
         first_turn_sink: Arc<dyn FirstTurnSink>,
-        session_store: Arc<DiskSessionStore>,
+        session_store: Arc<dyn SessionRecords>,
     ) -> Result<Arc<Self>> {
         let registry = Self::new(
             spawner,
@@ -140,11 +140,14 @@ impl SessionRegistry {
         );
 
         let saved_order: Vec<SessionId> = {
-            let layout = registry.layout.lock().expect("layout mutex poisoned");
-            layout
-                .get(&workspace_root)
-                .map(|l| l.order.clone())
-                .unwrap_or_default()
+            match registry.layout.get(&workspace_root) {
+                Ok(Some(layout)) => layout.order,
+                Ok(None) => Vec::new(),
+                Err(err) => {
+                    eprintln!("ox: failed to load saved layout for restore: {err:#}");
+                    Vec::new()
+                }
+            }
         };
 
         for id in saved_order {
@@ -189,7 +192,7 @@ impl SessionRegistry {
     pub async fn create_resumed(
         &self,
         id: SessionId,
-        session_store: &DiskSessionStore,
+        session_store: &dyn SessionRecords,
     ) -> Result<SessionId> {
         let session = session_store
             .try_load(id)
@@ -231,9 +234,8 @@ impl SessionRegistry {
         sessions.get(&id).cloned()
     }
 
-    /// `true` when no sessions are registered. Used by the startup path
-    /// to decide whether to bootstrap a fresh initial session via
-    /// the lifecycle coordinator.
+    /// `true` when no sessions are registered.
+    #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
         let sessions = self.sessions.read().expect("sessions lock poisoned");
         sessions.is_empty()
@@ -242,13 +244,14 @@ impl SessionRegistry {
     /// Snapshot for `GET /api/sessions`.
     pub fn snapshot(&self) -> SnapshotJson {
         let sessions = self.sessions.read().expect("sessions lock poisoned");
-        let layout = self
-            .layout
-            .lock()
-            .expect("layout mutex poisoned")
-            .get(&self.workspace_root)
-            .cloned()
-            .unwrap_or_default();
+        let layout = match self.layout.get(&self.workspace_root) {
+            Ok(Some(layout)) => layout,
+            Ok(None) => Layout::default(),
+            Err(err) => {
+                eprintln!("ox: failed to read workspace layout: {err:#}");
+                Layout::default()
+            }
+        };
 
         // Present sessions in layout order first, then append any
         // live sessions that aren't referenced by the layout (e.g.,
@@ -284,13 +287,13 @@ impl SessionRegistry {
 
     /// Persist a client-authored layout. Unknown session ids are
     /// filtered out (the client can race the server on remove);
-    /// [`LayoutStore::put`] normalizes sizes.
+    /// [`LayoutRepository::put`] normalizes sizes.
     pub fn put_layout(&self, mut layout: Layout) -> Result<()> {
         {
             let sessions = self.sessions.read().expect("sessions lock poisoned");
             // Filter order by known ids, preserving sizes by index.
             // After filtering we may have fewer sizes than entries,
-            // which `LayoutStore::put` re-normalizes to equal widths.
+            // which `LayoutRepository::put` re-normalizes to equal widths.
             let mut new_order = Vec::with_capacity(layout.order.len());
             let mut new_sizes = Vec::with_capacity(layout.order.len());
             for (i, id) in layout.order.iter().enumerate() {
@@ -305,8 +308,7 @@ impl SessionRegistry {
             layout.sizes = new_sizes;
         }
 
-        let mut store = self.layout.lock().expect("layout mutex poisoned");
-        store.put(&self.workspace_root, layout)
+        self.layout.put(&self.workspace_root, layout)
     }
 
     /// Persist the current registry state as a one-row layout with
@@ -322,8 +324,7 @@ impl SessionRegistry {
         }
         let n = ids.len();
         let layout = Layout::new(ids, vec![1.0 / n as f32; n]);
-        let mut store = self.layout.lock().expect("layout mutex poisoned");
-        store.put(&self.workspace_root, layout)
+        self.layout.put(&self.workspace_root, layout)
     }
 
     /// Dispatch a command to a session by id. Maps `SendOutcome`
@@ -339,6 +340,7 @@ impl SessionRegistry {
                 SendOutcome::Ok => CommandDispatch::Ok,
                 SendOutcome::Dead => CommandDispatch::Dead,
                 SendOutcome::AlreadyTurning => CommandDispatch::AlreadyTurning,
+                SendOutcome::Closing => CommandDispatch::Closing,
             },
             AgentCommand::Cancel => {
                 session.cancel();
@@ -466,7 +468,8 @@ mod tests {
     use std::path::PathBuf;
     use std::time::Duration;
 
-    use agent_host::{AgentSpawnConfig, Layout, LayoutStore};
+    use adapter_storage::{DiskLayoutRepository, DiskSessionStore};
+    use agent_host::{AgentSpawnConfig, Layout};
     use domain::SessionId;
     use protocol::AgentEvent;
     use tokio::time::timeout;
@@ -744,7 +747,7 @@ mod tests {
         // A PUT-then-reload cycle must round-trip order and (normalized)
         // sizes so a restart picks up the same pane tiling.
         let layout_path = unique_temp_dir("persist").join("workspaces.json");
-        let store = LayoutStore::load(layout_path.clone()).unwrap();
+        let store = DiskLayoutRepository::load(layout_path.clone()).unwrap();
         let workspace_root = unique_temp_dir("ws-persist");
         let (spawner, mut rx) = DuplexSpawner::new();
         let registry = SessionRegistry::new(
@@ -758,7 +761,7 @@ mod tests {
                 session_id: None,
                 env: vec![],
             },
-            store,
+            Arc::new(store),
             workspace_root.clone(),
             Arc::new(agent_host::fake::NoopCloseRequestSink),
             Arc::new(agent_host::fake::NoopFirstTurnSink),
@@ -769,8 +772,11 @@ mod tests {
             .expect("put_layout");
 
         // Reload and confirm the file contains the expected entry.
-        let reloaded = LayoutStore::load(layout_path).unwrap();
-        let got = reloaded.get(&workspace_root).expect("layout row");
+        let reloaded = DiskLayoutRepository::load(layout_path).unwrap();
+        let got = reloaded
+            .get(&workspace_root)
+            .expect("layout read")
+            .expect("layout row");
         assert_eq!(got.order, vec![id]);
         assert_eq!(got.sizes, vec![1.0]);
     }
@@ -804,10 +810,9 @@ mod tests {
         workspace_root: &Path,
         label: &str,
     ) -> PathBuf {
-        use app::SessionStore;
         let worktree = unique_temp_dir(label);
         let session = domain::Session::new(id, workspace_root.to_path_buf(), worktree.clone());
-        store.save(&session).await.unwrap();
+        app::SessionStore::save(store, &session).await.unwrap();
         worktree
     }
 
@@ -820,13 +825,13 @@ mod tests {
         let workspace_root = unique_temp_dir("ws-restore-no-file");
         let stale_id = SessionId::new_v4();
         {
-            let mut store = LayoutStore::load(layout_path.clone()).unwrap();
+            let store = DiskLayoutRepository::load(layout_path.clone()).unwrap();
             store
                 .put(&workspace_root, Layout::new(vec![stale_id], vec![1.0]))
                 .unwrap();
         }
 
-        let layout = LayoutStore::load(layout_path).unwrap();
+        let layout = DiskLayoutRepository::load(layout_path).unwrap();
         // Empty session store — no `{id}.json` exists for stale_id.
         let sessions_dir = unique_temp_dir("sessions-no-file");
         let session_store = Arc::new(DiskSessionStore::new(&sessions_dir).unwrap());
@@ -844,7 +849,7 @@ mod tests {
         let registry = SessionRegistry::restore(
             spawner,
             spawn_config,
-            layout,
+            Arc::new(layout),
             workspace_root,
             Arc::new(agent_host::fake::NoopCloseRequestSink),
             Arc::new(agent_host::fake::NoopFirstTurnSink),
@@ -874,19 +879,20 @@ mod tests {
 
         // Seed a session whose worktree_path is a non-existent directory.
         {
-            use app::SessionStore;
             let fake_wt = std::env::temp_dir().join("does-not-exist-intentionally");
             let session = domain::Session::new(id, workspace_root.clone(), fake_wt);
-            session_store.save(&session).await.unwrap();
+            app::SessionStore::save(session_store.as_ref(), &session)
+                .await
+                .unwrap();
         }
         {
-            let mut layout = LayoutStore::load(layout_path.clone()).unwrap();
+            let layout = DiskLayoutRepository::load(layout_path.clone()).unwrap();
             layout
                 .put(&workspace_root, Layout::new(vec![id], vec![1.0]))
                 .unwrap();
         }
 
-        let layout = LayoutStore::load(layout_path).unwrap();
+        let layout = DiskLayoutRepository::load(layout_path).unwrap();
         let (spawner, mut rx) = DuplexSpawner::new();
         let spawn_config = AgentSpawnConfig {
             binary: PathBuf::from("/nonexistent/ox-agent"),
@@ -901,7 +907,7 @@ mod tests {
         let registry = SessionRegistry::restore(
             spawner,
             spawn_config,
-            layout,
+            Arc::new(layout),
             workspace_root,
             Arc::new(agent_host::fake::NoopCloseRequestSink),
             Arc::new(agent_host::fake::NoopFirstTurnSink),
@@ -927,13 +933,13 @@ mod tests {
         let id = SessionId::new_v4();
         let worktree = seed_saved_session(&session_store, id, &workspace_root, "wt-happy").await;
         {
-            let mut layout = LayoutStore::load(layout_path.clone()).unwrap();
+            let layout = DiskLayoutRepository::load(layout_path.clone()).unwrap();
             layout
                 .put(&workspace_root, Layout::new(vec![id], vec![1.0]))
                 .unwrap();
         }
 
-        let layout = LayoutStore::load(layout_path).unwrap();
+        let layout = DiskLayoutRepository::load(layout_path).unwrap();
         let (spawner, mut rx) = DuplexSpawner::new();
         let spawn_config = AgentSpawnConfig {
             binary: PathBuf::from("/nonexistent/ox-agent"),
@@ -949,7 +955,7 @@ mod tests {
             SessionRegistry::restore(
                 spawner,
                 spawn_config,
-                layout,
+                Arc::new(layout),
                 workspace_root.clone(),
                 Arc::new(agent_host::fake::NoopCloseRequestSink),
                 Arc::new(agent_host::fake::NoopFirstTurnSink),
@@ -993,13 +999,13 @@ mod tests {
         let _wt_a = seed_saved_session(&session_store, a, &workspace_root, "wt-fail-a").await;
         let _wt_b = seed_saved_session(&session_store, b, &workspace_root, "wt-fail-b").await;
         {
-            let mut layout = LayoutStore::load(layout_path.clone()).unwrap();
+            let layout = DiskLayoutRepository::load(layout_path.clone()).unwrap();
             layout
                 .put(&workspace_root, Layout::new(vec![a, b], vec![0.5, 0.5]))
                 .unwrap();
         }
 
-        let layout = LayoutStore::load(layout_path).unwrap();
+        let layout = DiskLayoutRepository::load(layout_path).unwrap();
         let spawner = DuplexSpawner::failing();
         let spawn_config = AgentSpawnConfig {
             binary: PathBuf::from("/nonexistent/ox-agent"),
@@ -1014,7 +1020,7 @@ mod tests {
         let registry = SessionRegistry::restore(
             spawner,
             spawn_config,
-            layout,
+            Arc::new(layout),
             workspace_root,
             Arc::new(agent_host::fake::NoopCloseRequestSink),
             Arc::new(agent_host::fake::NoopFirstTurnSink),
@@ -1030,7 +1036,7 @@ mod tests {
     #[tokio::test]
     async fn persist_current_layout_writes_equal_sizes() {
         let layout_path = unique_temp_dir("persist-current").join("workspaces.json");
-        let store = LayoutStore::load(layout_path.clone()).unwrap();
+        let store = DiskLayoutRepository::load(layout_path.clone()).unwrap();
         let workspace_root = unique_temp_dir("ws-persist-current");
         let (spawner, mut rx) = DuplexSpawner::new();
         let registry = SessionRegistry::new(
@@ -1044,7 +1050,7 @@ mod tests {
                 session_id: None,
                 env: vec![],
             },
-            store,
+            Arc::new(store),
             workspace_root.clone(),
             Arc::new(agent_host::fake::NoopCloseRequestSink),
             Arc::new(agent_host::fake::NoopFirstTurnSink),
@@ -1056,8 +1062,11 @@ mod tests {
             .persist_current_layout()
             .expect("persist_current_layout");
 
-        let reloaded = LayoutStore::load(layout_path).unwrap();
-        let got = reloaded.get(&workspace_root).expect("row");
+        let reloaded = DiskLayoutRepository::load(layout_path).unwrap();
+        let got = reloaded
+            .get(&workspace_root)
+            .expect("layout read")
+            .expect("row");
         assert_eq!(got.order.len(), 2);
         // Equal-size fallback: both entries should be ~0.5.
         for s in &got.sizes {

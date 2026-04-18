@@ -1,25 +1,28 @@
 # AGENTS.md
 
-Ox is a desktop AI coding assistant built in Rust. It uses a hexagonal (ports-and-adapters) architecture and a two-process design: a native gtk4-rs + libadwaita GUI (`ox`) spawns one or more headless agent subprocesses (`ox-agent`) and talks to each over NDJSON on stdin/stdout. Pluggable backends cover model providers, session persistence, filesystem access, and secret management.
+Ox is a local web AI coding assistant built in Rust. It uses a hexagonal (ports-and-adapters) architecture and a two-process design: the `ox` web host (`bin-web`) runs an Axum server, serves a no-build static frontend, spawns one or more headless agent subprocesses (`ox-agent`), and talks to each agent over NDJSON on stdin/stdout. Pluggable backends cover model providers, session persistence, filesystem access, git/worktree operations, and secret management.
 
 ## Tech Stack
 
 - **Language:** Rust (edition 2024).
-- **Build system:** Cargo (virtual workspace — 8 library crates + 2 binary crates).
-- **GUI framework:** gtk4-rs + libadwaita (GTK 4.18+ / libadwaita 1.7+) via GObject subclassing. Everything UI-touching runs on the GTK main thread; cross-thread state lives only on the tokio runtime used by `AgentClient` reader/writer tasks.
-- **IPC:** NDJSON over stdin/stdout between the GUI process and each agent subprocess (tokio pipes, `kill_on_drop` for child lifetime).
+- **Build system:** Cargo (virtual workspace — 10 library crates + 2 binary crates).
+- **Web framework:** Axum + Tokio in `bin-web`; static `index.html`, `app.js`, and `styles.css` are embedded into the binary with `include_str!` and served with `Cache-Control: no-store`.
+- **Frontend:** Plain browser JavaScript, no build step. The client uses HTTP JSON endpoints for commands/layout and Server-Sent Events (SSE) for live `AgentEvent` updates.
+- **IPC:** NDJSON over stdin/stdout between the web host process and each agent subprocess (tokio pipes, process adapter owns `kill_on_drop` child lifetime).
 
 ## Codebase Map
 
-- `crates/domain/` — Core types: `Session`, `Message`, `ContentBlock`, `Role`, `SessionId`, `SessionSummary`, `StreamEvent`, `Usage`. All serde-derived so the same shapes serialize to disk *and* cross the GUI↔agent wire.
+- `crates/domain/` — Core types: `Session`, `Message`, `ContentBlock`, `Role`, `SessionId`, `SessionSummary`, `StreamEvent`, `Usage`. All serde-derived so the same shapes serialize to disk *and* cross the host↔agent wire.
 - `crates/app/` — Application layer: port traits (`LlmProvider`, `SessionStore`, `SecretStore`, `FileSystem`, `Shell`), use cases (`SessionRunner`, `TurnEvent`, `TurnOutcome`), cancellation (`CancelToken`), streaming (`StreamAccumulator`, `ToolDef`), tools (`Tool` trait, `ToolRegistry`, `ReadFileTool`, `WriteFileTool`, `EditFileTool`, `GlobTool`, `GrepTool`, `BashTool`, hashline helpers, spill-to-file utility). Re-exports `StreamEvent`/`Usage` from domain for caller convenience.
-- `crates/protocol/` — Wire protocol between the GUI process and `ox-agent`: `AgentCommand`, `AgentEvent`, and `read_frame`/`write_frame` helpers. Depends only on `domain` — no dep on `app` so the wire types cannot accidentally leak application-layer concerns.
-- `crates/adapter-llm/` — LLM provider implementations: OpenRouter (streaming via SSE), Ollama (stub).
-- `crates/adapter-storage/` — Session persistence: `DiskSessionStore` (one JSON file per session).
+- `crates/protocol/` — Wire protocol between the web host process and `ox-agent`: `AgentCommand`, `AgentEvent`, and `read_frame`/`write_frame` helpers. Depends only on `domain` — no dep on `app` so the wire types cannot accidentally leak application-layer concerns.
+- `crates/adapter-llm/` — LLM provider implementations: OpenRouter streaming chat/SSE plus OpenRouter slug generation; Ollama remains intentionally deferred.
+- `crates/adapter-storage/` — User-local storage adapters: `DiskSessionStore` (one JSON file per session) and `DiskLayoutRepository` (`~/.ox/workspaces.json` layout persistence).
 - `crates/adapter-fs/` — Filesystem and shell: `LocalFileSystem` (implemented), `BashShell` (implemented — spawns `/bin/bash -c`, concurrent stdout/stderr capture, timeout via `tokio::time::timeout`, kill on timeout, byte-capped output with pipe draining).
+- `crates/adapter-git/` — Git adapter: repository validation, current-branch discovery, worktree/branch management, merge/abandon support, and dirty/conflict detection through the git CLI.
+- `crates/adapter-process/` — Process adapter implementing `agent-host::AgentSpawner` with `tokio::process::Command` and child lifetime management.
 - `crates/adapter-secrets/` — Secret retrieval: `EnvSecretStore` (implemented).
-- `crates/agent-host/` — Host library: `AgentClient` / `AgentEventStream` (IPC client over stdio with reader/writer tasks), `AgentSpawnConfig`, `SplitId`, `WorkspaceLayouts` (layout persistence), `classify_input` / `SplitAction` (slash-command parser). Depends on `app`, `domain`, `protocol`; implements no app ports. Framework-agnostic — the GUI binary owns all per-split and multi-split state.
-- `crates/bin-gtk/` — `ox` binary: gtk4-rs + libadwaita composition root for the GUI. `SplitObject` GObject owns per-split state (receive-side state machine, `AgentClient` handle, messages store, streaming row, draft buffer); `OxWindow` GObject subclass of `adw::ApplicationWindow` owns the multi-split workspace (`gio::ListStore<SplitObject>`, split fractions, focus, layout persistence). Transcript is a `gtk::ListView` over the per-split `gio::ListStore<TranscriptRowObject>` with a `SignalListItemFactory`. Splits tile horizontally via a left-leaning `gtk::Paned` tree.
+- `crates/agent-host/` — Host library: `AgentClient` / `AgentEventStream` (IPC client over generic async I/O with reader/writer tasks), `AgentSpawnConfig`, `AgentSpawner`, `SessionRuntime`, `LayoutRepository`, `SessionRecords`, `WorkspaceContext`, lifecycle sink traits, git/slug abstractions, and layout/path helpers. Depends on `app`, `domain`, `protocol`; implements no app ports or concrete storage/process adapters. Framework-agnostic — `bin-web` owns HTTP, SSE, browser state, and lifecycle orchestration.
+- `crates/bin-web/` — `ox` binary: Axum composition root for the local web UI. `main.rs` resolves CLI/env/paths, validates the git workspace, restores saved sessions, wires lifecycle + registry + router, binds `127.0.0.1:<port>`, and optionally opens the browser. `routes.rs` exposes session/message/cancel/layout/merge/abandon endpoints, `sse.rs` streams `AgentEvent` history + live updates, `session.rs` owns per-session pump/runtime/history/broadcast state, `registry.rs` owns the live session map and layout persistence, and `assets/` contains the embedded no-build frontend.
 - `crates/bin-agent/` — `ox-agent` binary: composition root for the agent process. Parses CLI, wires adapters, builds a `SessionRunner`, and hands control to `driver::agent_driver` which drives NDJSON I/O over stdin/stdout.
 - `experiments/` — Throwaway scripts for testing provider APIs.
 - `docs/` — Research and design notes.
@@ -27,7 +30,7 @@ Ox is a desktop AI coding assistant built in Rust. It uses a hexagonal (ports-an
 ## Commands
 
 - Build (Rust workspace): `cargo build`
-- Run the GUI: `cargo run -p bin-gtk`
+- Run the web UI: `cargo run -p bin-web`
 - Run the agent headless: `cargo run -p bin-agent -- --workspace-root … --model … --sessions-dir …`
 - Test: `cargo test`
 - Test (single crate): `cargo test -p <crate-name>`
@@ -38,7 +41,7 @@ Ox is a desktop AI coding assistant built in Rust. It uses a hexagonal (ports-an
 
 - This is greenfield development. There are no users. There are no backwards compatibility concerns.
 - Nothing is pre-existing. All builds and tests are green upstream. If something fails, your work caused it. Investigate and fix — never dismiss a failure as pre-existing.
-- Use `cargo add` for third-party dependencies -- never hand-edit `[dependencies]` in Cargo.toml. 
+- Use `cargo add` for third-party dependencies -- never hand-edit `[dependencies]` in Cargo.toml.
 - Commits must follow the 7 rules of great commit messages with NO Claude Code attribution.
 
 ### Git workspace

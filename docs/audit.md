@@ -17,7 +17,7 @@
 
 ## Duplicated / Dead Code
 
-~~10. **`AgentClient::new` and `AgentClient::spawn` duplicate reader/writer setup**~~ — _Resolved in `dee8565`: `spawn` routes through `Self::new`; both share `spawn_reader`/`spawn_writer` helpers._
+~~10. **`AgentClient::new` and `AgentClient::spawn` duplicate reader/writer setup**~~ — _Resolved: concrete process spawning moved to `adapter-process`; `agent-host` retains only generic IPC construction and the `AgentSpawner` port._
 11. **`DiskSessionStore` created twice in `bin-agent`** — `crates/bin-agent/src/main.rs:109-110` — one `store` for the runner and a separate `history_store` for the driver's preload, both pointing at the same directory. The comment says "stateless beyond its root path" which is true, but it's still a smell — the runner could expose a `store()` accessor instead.
 12. **`ToolRegistry::execute` calls `.def()` on every tool on every dispatch** — `crates/app/src/tools/mod.rs:102` — linear scan calling `def()` (which allocates `ToolDef`) for name matching. Should store tools in a `HashMap<String, Arc<dyn Tool>>` or at least compare names without building the full `ToolDef`.
 
@@ -34,6 +34,14 @@
 18. **SSE endpoint URL hardcoded** — `crates/adapter-llm/src/openrouter/mod.rs:40` — `"https://openrouter.ai/api/v1/chat/completions"` baked in. No way to point at a proxy or different base URL.
 19. **Channel buffer size 64 is arbitrary** — `crates/adapter-llm/src/openrouter/mod.rs:49` — `tokio::sync::mpsc::channel(64)`. No justification; if the producer outruns the consumer, events silently backpressure.
 20. **Reasoning flags always sent** — `wire.rs:145-146` — `reasoning: Some(serde_json::json!({}))` and `include_reasoning: Some(true)` are always included regardless of model. Some models may reject or be confused by these.
+
+## Host Boundary
+
+~~25. **`agent-host` owned concrete process spawning**~~ — _Resolved: `ProcessSpawner` now lives in `adapter-process`; `agent-host` has no `tokio::process` dependency in normal builds._
+~~26. **`agent-host` owned file-backed layout persistence**~~ — _Resolved: layout data and normalization remain in `agent-host`, while `DiskLayoutRepository` lives in `adapter-storage` behind the `LayoutRepository` port._
+~~27. **`SessionLifecycle` depended on concrete `DiskSessionStore`**~~ — _Resolved: lifecycle and registry use the object-safe `SessionRecords` host port; `DiskSessionStore` implements it in `adapter-storage`._
+~~28. **OpenRouter slug request code lived in `bin-web`**~~ — _Resolved: `OpenRouterSlugGenerator` lives in `adapter-llm`; `bin-web` only wires the chosen model and key._
+~~29. **Merge/abandon could race a new send after close preflight began**~~ — _Resolved: close flow marks the `ActiveSession` closing before git/storage preflight; later `POST /messages` returns `409 {"reason":"closing"}` without writing to the agent, and rejected close paths clear the marker._
 
 ## Driver Batching Problem
 

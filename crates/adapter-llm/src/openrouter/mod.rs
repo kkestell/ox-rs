@@ -1,3 +1,4 @@
+mod slug;
 pub mod sse;
 pub mod wire;
 
@@ -16,6 +17,8 @@ pub struct OpenRouterProvider {
     api_key: String,
     model: String,
 }
+
+pub use slug::OpenRouterSlugGenerator;
 
 impl OpenRouterProvider {
     pub fn new(api_key: String, model: String) -> Self {

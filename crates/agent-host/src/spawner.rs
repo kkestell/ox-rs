@@ -1,7 +1,4 @@
-//! `AgentSpawner` — indirection over the bytes-to-subprocess step.
-//!
-//! `ProcessSpawner` is the production wrapper around
-//! [`AgentClient::spawn`]; it launches a real `ox-agent` child.
+//! `AgentSpawner` — indirection over the bytes-to-agent step.
 //!
 //! Tests substitute an in-memory implementation that pairs
 //! [`AgentClient::new`] with a `tokio::io::duplex` partner the test drives
@@ -18,13 +15,4 @@ use crate::client::{AgentClient, AgentEventStream, AgentSpawnConfig};
 
 pub trait AgentSpawner: Send + Sync + 'static {
     fn spawn(&self, config: AgentSpawnConfig) -> Result<(AgentClient, AgentEventStream)>;
-}
-
-/// Production spawner. Thin wrapper around [`AgentClient::spawn`].
-pub struct ProcessSpawner;
-
-impl AgentSpawner for ProcessSpawner {
-    fn spawn(&self, config: AgentSpawnConfig) -> Result<(AgentClient, AgentEventStream)> {
-        AgentClient::spawn(config)
-    }
 }
