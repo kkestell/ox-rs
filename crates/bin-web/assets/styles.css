@@ -84,6 +84,7 @@ button:disabled {
 .session {
   flex: 1 1 0;
   min-width: 200px;
+  position: relative;
   display: flex;
   flex-direction: column;
   min-height: 0;
@@ -115,6 +116,75 @@ button:disabled {
   display: flex;
   flex-direction: column;
   gap: 10px;
+}
+
+.approval-panel {
+  position: absolute;
+  z-index: 5;
+  top: 46px;
+  left: 50%;
+  width: min(96%, 780px);
+  max-height: 50vh;
+  transform: translateX(-50%);
+  display: flex;
+  flex-direction: column;
+  padding: 14px;
+  background: var(--bg-block);
+  border: 1px solid var(--border);
+  overflow: hidden;
+}
+
+.approval-list {
+  overflow-y: auto;
+}
+
+.approval-item {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding-top: 12px;
+  border-top: 1px solid var(--border);
+}
+
+.approval-item:first-child {
+  padding-top: 0;
+  border-top: none;
+}
+
+.approval-name {
+  color: var(--role-tool);
+  font-family: var(--font-mono);
+  font-weight: 600;
+}
+
+.approval-reason {
+  overflow-wrap: anywhere;
+}
+
+.approval-item summary {
+  cursor: pointer;
+  color: var(--fg-muted);
+}
+
+.approval-item pre {
+  max-height: 180px;
+  overflow: auto;
+  padding: 8px 10px;
+  background: var(--bg);
+  font-family: var(--font-mono);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.approval-actions {
+  display: flex;
+  gap: 8px;
+}
+
+.approval-actions button:first-child {
+  background: var(--accent);
+  color: #fff;
+  border-color: var(--accent);
 }
 
 /*

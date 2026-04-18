@@ -21,18 +21,80 @@
 //!   keeps reading, so one bad line cannot kill a split.
 //! - Clean EOF on the reader (the GUI hung up) returns `Ok(())`.
 
+use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::Result;
 use app::{
-    CancelToken, CloseSignal, LlmProvider, SessionRunner, SessionStore, TurnEvent, TurnOutcome,
+    CancelToken, CloseSignal, LlmProvider, SessionRunner, SessionStore, ToolApprovalDecision,
+    ToolApprovalRequest as AppToolApprovalRequest, ToolApprover, TurnEvent, TurnOutcome,
 };
 use domain::SessionId;
 use protocol::{AgentCommand, AgentEvent, read_frame, write_frame};
 use tokio::io::{AsyncBufRead, AsyncWrite};
-use tokio::sync::mpsc;
+use tokio::sync::{Mutex, mpsc, oneshot};
+
+#[derive(Default)]
+struct ApprovalBroker {
+    pending: Mutex<HashMap<String, oneshot::Sender<bool>>>,
+}
+
+impl ApprovalBroker {
+    async fn resolve(&self, request_id: String, approved: bool) {
+        if let Some(tx) = self.pending.lock().await.remove(&request_id) {
+            let _ = tx.send(approved);
+        }
+    }
+}
+
+impl ToolApprover for ApprovalBroker {
+    fn approve<'a>(
+        &'a self,
+        requests: Vec<AppToolApprovalRequest>,
+        cancel: CancelToken,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Vec<ToolApprovalDecision>>> + Send + 'a>,
+    > {
+        Box::pin(async move {
+            let mut receivers = Vec::with_capacity(requests.len());
+            {
+                let mut pending = self.pending.lock().await;
+                for request in requests {
+                    let (tx, rx) = oneshot::channel();
+                    pending.insert(request.request_id.clone(), tx);
+                    receivers.push((request.request_id, rx));
+                }
+            }
+
+            let mut decisions = Vec::with_capacity(receivers.len());
+            for (request_id, mut rx) in receivers {
+                loop {
+                    if cancel.is_cancelled() {
+                        self.pending.lock().await.remove(&request_id);
+                        decisions.push(ToolApprovalDecision {
+                            request_id,
+                            approved: false,
+                        });
+                        break;
+                    }
+                    tokio::select! {
+                        decision = &mut rx => {
+                            decisions.push(ToolApprovalDecision {
+                                request_id,
+                                approved: decision.unwrap_or(false),
+                            });
+                            break;
+                        }
+                        _ = tokio::time::sleep(std::time::Duration::from_millis(25)) => {}
+                    }
+                }
+            }
+            Ok(decisions)
+        })
+    }
+}
 
 enum ReaderEvent {
     Command(AgentCommand),
@@ -167,13 +229,18 @@ where
                 let result = {
                     let cancel = CancelToken::new();
                     let cancel_clone = cancel.clone();
+                    let approvals = Arc::new(ApprovalBroker::default());
+                    let approvals_for_turn = approvals.clone();
                     let mut turn_fut = std::pin::pin!(run_turn(
                         runner,
-                        &workspace_root,
-                        session_id,
-                        &input,
-                        initialized,
-                        cancel_clone,
+                        TurnRun {
+                            workspace_root: &workspace_root,
+                            session_id,
+                            input: &input,
+                            initialized,
+                            cancel: cancel_clone,
+                            approvals: approvals_for_turn,
+                        },
                         &mut writer,
                     ));
                     // Race the turn against incoming commands so we can detect
@@ -193,6 +260,9 @@ where
                                         cancel.cancel();
                                         // Don't break — let the turn future
                                         // finish so it flushes remaining events.
+                                    }
+                                    Some(ReaderEvent::Command(AgentCommand::ResolveToolApproval { request_id, approved })) => {
+                                        approvals.resolve(request_id, approved).await;
                                     }
                                     Some(ReaderEvent::Eof) | None => {
                                         // GUI hung up mid-turn. Cancel so the
@@ -256,6 +326,10 @@ where
                 // Cancel outside a turn — nothing to do. Silently ignore
                 // rather than emitting an error, since it's harmless.
             }
+            AgentCommand::ResolveToolApproval { .. } => {
+                // Approval decisions are meaningful only while a turn is
+                // blocked on them. Stale decisions are ignored.
+            }
             // `AgentCommand` is `#[non_exhaustive]` so future variants compile
             // cleanly. Until they're implemented, surface an Error so the GUI
             // knows its request was ignored — preferable to silent drops.
@@ -288,13 +362,18 @@ where
 /// - When the runner returns, its closure is dropped, which drops the
 ///   sender, which closes the channel, which causes the drain future to
 ///   finish after flushing the last events.
-async fn run_turn<L, S, W>(
-    runner: &SessionRunner<L, S>,
-    workspace_root: &std::path::Path,
+struct TurnRun<'a> {
+    workspace_root: &'a std::path::Path,
     session_id: SessionId,
-    input: &str,
+    input: &'a str,
     initialized: bool,
     cancel: CancelToken,
+    approvals: Arc<ApprovalBroker>,
+}
+
+async fn run_turn<L, S, W>(
+    runner: &SessionRunner<L, S>,
+    turn: TurnRun<'_>,
     writer: &mut W,
 ) -> Result<TurnOutcome>
 where
@@ -308,7 +387,7 @@ where
     // The callback is `FnMut` because `SessionRunner::start` / `resume`
     // want `FnMut`, but it only needs `&tx` — unbounded senders are `Sync`
     // and `send(&self)` is enough.
-    let workspace = workspace_root.to_path_buf();
+    let workspace = turn.workspace_root.to_path_buf();
     let run_fut = async move {
         let callback = |evt: TurnEvent<'_>| match evt {
             TurnEvent::StreamDelta(e) => {
@@ -317,12 +396,49 @@ where
             TurnEvent::MessageAppended(m) => {
                 let _ = tx.send(AgentEvent::MessageAppended { message: m.clone() });
             }
+            TurnEvent::ToolApprovalRequested { requests } => {
+                let requests = requests
+                    .into_iter()
+                    .map(|request| protocol::ToolApprovalRequest {
+                        request_id: request.request_id,
+                        tool_call_id: request.tool_call_id,
+                        name: request.name,
+                        arguments: request.arguments,
+                        reason: request.reason,
+                    })
+                    .collect();
+                let _ = tx.send(AgentEvent::ToolApprovalRequested { requests });
+            }
+            TurnEvent::ToolApprovalResolved {
+                request_id,
+                approved,
+            } => {
+                let _ = tx.send(AgentEvent::ToolApprovalResolved {
+                    request_id,
+                    approved,
+                });
+            }
         };
-        if initialized {
-            runner.resume(session_id, input, cancel, callback).await
+        if turn.initialized {
+            runner
+                .resume_with_approver(
+                    turn.session_id,
+                    turn.input,
+                    turn.cancel,
+                    turn.approvals.as_ref(),
+                    callback,
+                )
+                .await
         } else {
             runner
-                .start(session_id, workspace, input, cancel, callback)
+                .start_with_approver(
+                    turn.session_id,
+                    workspace,
+                    turn.input,
+                    turn.cancel,
+                    turn.approvals.as_ref(),
+                    callback,
+                )
                 .await
         }
         // `tx` (captured inside the callback) is dropped when this future
@@ -354,7 +470,7 @@ mod tests {
 
     use app::fake::{FakeLlmProvider, FakeSessionStore, FakeTool, tool_registry_with};
     use app::{Tool, ToolRegistry};
-    use domain::{Message, Role, Session, StreamEvent, Usage};
+    use domain::{ContentBlock, Message, Role, Session, StreamEvent, Usage};
     use protocol::{AgentCommand, AgentEvent, read_frame, write_frame};
     use tokio::io::{BufReader, duplex};
 
@@ -1113,6 +1229,45 @@ mod tests {
         .await
         .unwrap();
 
+        match read_frame::<_, AgentEvent>(&mut evt_rx).await.unwrap() {
+            Some(AgentEvent::MessageAppended { message }) => assert_eq!(message.role, Role::User),
+            other => panic!("expected user message, got {other:?}"),
+        }
+        match read_frame::<_, AgentEvent>(&mut evt_rx).await.unwrap() {
+            Some(AgentEvent::StreamDelta { .. }) => {}
+            other => panic!("expected stream delta, got {other:?}"),
+        }
+        match read_frame::<_, AgentEvent>(&mut evt_rx).await.unwrap() {
+            Some(AgentEvent::StreamDelta { .. }) => {}
+            other => panic!("expected stream delta, got {other:?}"),
+        }
+        match read_frame::<_, AgentEvent>(&mut evt_rx).await.unwrap() {
+            Some(AgentEvent::StreamDelta { .. }) => {}
+            other => panic!("expected stream delta, got {other:?}"),
+        }
+        match read_frame::<_, AgentEvent>(&mut evt_rx).await.unwrap() {
+            Some(AgentEvent::MessageAppended { message }) => {
+                assert_eq!(message.role, Role::Assistant);
+            }
+            other => panic!("expected assistant message, got {other:?}"),
+        }
+        match read_frame::<_, AgentEvent>(&mut evt_rx).await.unwrap() {
+            Some(AgentEvent::ToolApprovalRequested { requests }) => {
+                assert_eq!(requests.len(), 1);
+                assert_eq!(requests[0].request_id, "call_1");
+            }
+            other => panic!("expected approval request, got {other:?}"),
+        }
+        write_frame(
+            &mut cmd_tx,
+            &AgentCommand::ResolveToolApproval {
+                request_id: "call_1".into(),
+                approved: true,
+            },
+        )
+        .await
+        .unwrap();
+
         let (_events, terminator) = drain_turn(&mut evt_rx).await;
         assert!(
             matches!(terminator, Some(AgentEvent::TurnComplete)),
@@ -1136,6 +1291,100 @@ mod tests {
 
         // The signal was drained by the driver — a later take sees None.
         assert!(signal.take().is_none());
+
+        drop(cmd_tx);
+        handle.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn rejected_tool_approval_produces_error_result_and_turn_completes() {
+        // A tool whose default approval_requirement returns Required (the
+        // Tool trait default). The driver emits ToolApprovalRequested,
+        // we send rejected, and the turn continues to completion with an
+        // is_error tool result and a final assistant message.
+        let llm = FakeLlmProvider::new();
+        llm.push_tool_call("call_1", "needs_approval", "{}");
+        llm.push_text("recovered");
+
+        let tool = Arc::new(app::fake::FakeTool::new_requiring_approval("needs_approval")) as Arc<dyn Tool>;
+        let tools = tool_registry_with(vec![tool]);
+
+        let (mut cmd_tx, mut evt_rx, handle) =
+            spawn_driver(llm, FakeSessionStore::new(), tools, None);
+        let _ = expect_ready(&mut evt_rx).await;
+
+        write_frame(
+            &mut cmd_tx,
+            &AgentCommand::SendMessage {
+                input: "do something risky".into(),
+            },
+        )
+        .await
+        .unwrap();
+
+        // Skip to the approval request.
+        loop {
+            match read_frame::<_, AgentEvent>(&mut evt_rx).await.unwrap() {
+                Some(AgentEvent::ToolApprovalRequested { requests }) => {
+                    assert_eq!(requests.len(), 1);
+                    assert_eq!(requests[0].request_id, "call_1");
+                    break;
+                }
+                Some(_) => continue,
+                None => panic!("unexpected EOF before approval request"),
+            }
+        }
+
+        write_frame(
+            &mut cmd_tx,
+            &AgentCommand::ResolveToolApproval {
+                request_id: "call_1".into(),
+                approved: false,
+            },
+        )
+        .await
+        .unwrap();
+
+        let (events, terminator) = drain_turn(&mut evt_rx).await;
+        let msg_appended: Vec<_> = events
+            .iter()
+            .filter_map(|e| match e {
+                AgentEvent::MessageAppended { message } => Some(message.clone()),
+                _ => None,
+            })
+            .collect();
+
+        // Find the tool result message with the rejection text.
+        let tool_result = msg_appended
+            .iter()
+            .find(|m| {
+                m.content
+                    .iter()
+                    .any(|b| matches!(b, ContentBlock::ToolResult { is_error: true, .. }))
+            })
+            .expect("should have a tool result with is_error");
+        match &tool_result.content[0] {
+            ContentBlock::ToolResult {
+                content, is_error, ..
+            } => {
+                assert_eq!(content, app::TOOL_REJECTED_MESSAGE);
+                assert!(is_error);
+            }
+            _ => panic!("expected ToolResult block"),
+        }
+
+        // The turn must complete normally — rejection does not end it.
+        assert!(
+            matches!(terminator, Some(AgentEvent::TurnComplete)),
+            "expected TurnComplete after rejection, got {terminator:?}"
+        );
+
+        // The final assistant message "recovered" should be present.
+        let final_text = msg_appended
+            .iter()
+            .rfind(|m| m.role == Role::Assistant)
+            .expect("should have final assistant message");
+        assert_eq!(final_text.text(), "recovered");
 
         drop(cmd_tx);
         handle.await.unwrap().unwrap();

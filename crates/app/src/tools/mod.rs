@@ -24,6 +24,7 @@ use std::sync::Arc;
 
 use anyhow::{Result, bail};
 
+use crate::approval::ApprovalRequirement;
 use crate::stream::ToolDef;
 
 pub mod bash;
@@ -55,6 +56,17 @@ pub use write_file::WriteFileTool;
 /// produce human-readable (and LLM-readable) output.
 pub trait Tool: Send + Sync {
     fn def(&self) -> ToolDef;
+
+    fn approval_requirement<'a>(
+        &'a self,
+        _args: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<ApprovalRequirement>> + Send + 'a>> {
+        Box::pin(async move {
+            Ok(ApprovalRequirement::Required {
+                reason: "Tool requires user approval".into(),
+            })
+        })
+    }
 
     /// Execute the tool with raw JSON arguments. Returns a success string or
     /// an error. An error is translated by the caller into a
@@ -119,6 +131,18 @@ impl ToolRegistry {
             .get(name)
             .ok_or_else(|| anyhow::anyhow!("unknown tool: {name}"))?;
         tool.execute(args).await
+    }
+
+    pub async fn approval_requirement(
+        &self,
+        name: &str,
+        args: &str,
+    ) -> Result<ApprovalRequirement> {
+        let tool = self
+            .by_name
+            .get(name)
+            .ok_or_else(|| anyhow::anyhow!("unknown tool: {name}"))?;
+        tool.approval_requirement(args).await
     }
 }
 

@@ -313,6 +313,24 @@ impl ActiveSession {
         let _ = agent.send(AgentCommand::Cancel);
     }
 
+    pub fn resolve_tool_approval(&self, request_id: String, approved: bool) -> SendOutcome {
+        if !self.is_alive() {
+            return SendOutcome::Dead;
+        }
+        let send_result = {
+            let agent = self.agent.lock().expect("session agent mutex poisoned");
+            agent.send(AgentCommand::ResolveToolApproval {
+                request_id,
+                approved,
+            })
+        };
+        if send_result.is_err() {
+            self.alive.store(false, Ordering::SeqCst);
+            return SendOutcome::Dead;
+        }
+        SendOutcome::Ok
+    }
+
     /// Snapshot of the receive-side runtime's "turn in flight" flag.
     /// Used by the merge/abandon flow to refuse a close while the agent
     /// is mid-turn: tearing a worktree out from under an active tool

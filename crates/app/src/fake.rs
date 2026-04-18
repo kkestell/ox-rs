@@ -310,6 +310,10 @@ impl Default for FakeFileSystem {
 }
 
 impl FileSystem for FakeFileSystem {
+    async fn canonicalize(&self, path: &Path) -> Result<PathBuf> {
+        Ok(crate::approval::normalize_lexical(path))
+    }
+
     async fn read(&self, path: &Path) -> Result<String> {
         self.files
             .lock()
@@ -392,11 +396,10 @@ pub struct FakeTool {
     def: ToolDef,
     results: Mutex<VecDeque<Result<String, String>>>,
     calls: Mutex<Vec<String>>,
+    requires_approval: bool,
 }
 
 impl FakeTool {
-    /// Construct a fake tool with a minimal schema (no parameters). The
-    /// schema shape doesn't matter for loop tests — only `name` does.
     pub fn new(name: &str) -> Self {
         Self {
             def: ToolDef {
@@ -406,7 +409,14 @@ impl FakeTool {
             },
             results: Mutex::new(VecDeque::new()),
             calls: Mutex::new(Vec::new()),
+            requires_approval: false,
         }
+    }
+
+    pub fn new_requiring_approval(name: &str) -> Self {
+        let mut tool = Self::new(name);
+        tool.requires_approval = true;
+        tool
     }
 
     /// Queue a successful result.
@@ -429,6 +439,23 @@ impl FakeTool {
 impl Tool for FakeTool {
     fn def(&self) -> ToolDef {
         self.def.clone()
+    }
+
+    fn approval_requirement<'a>(
+        &'a self,
+        _args: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<crate::approval::ApprovalRequirement>> + Send + 'a>>
+    {
+        let requires = self.requires_approval;
+        Box::pin(async move {
+            if requires {
+                Ok(crate::approval::ApprovalRequirement::Required {
+                    reason: "test tool requires approval".into(),
+                })
+            } else {
+                Ok(crate::approval::ApprovalRequirement::NotRequired)
+            }
+        })
     }
 
     fn execute<'a>(

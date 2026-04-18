@@ -37,12 +37,27 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 pub enum AgentCommand {
     /// User submitted a chat message. The agent appends it to the session
     /// and drives a turn.
-    SendMessage { input: String },
+    SendMessage {
+        input: String,
+    },
     /// Request cancellation of the in-progress turn. The agent sets a
     /// cooperative cancel flag; actual cancellation happens at the next
     /// check point (between stream events, before tool calls). Idempotent
     /// — sending multiple `Cancel` commands is harmless.
     Cancel,
+    ResolveToolApproval {
+        request_id: String,
+        approved: bool,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolApprovalRequest {
+    pub request_id: String,
+    pub tool_call_id: String,
+    pub name: String,
+    pub arguments: String,
+    pub reason: String,
 }
 
 /// Events the agent streams back to the GUI.
@@ -72,10 +87,21 @@ pub enum AgentEvent {
         workspace_root: PathBuf,
     },
     /// An incremental stream event from the LLM.
-    StreamDelta { event: StreamEvent },
+    StreamDelta {
+        event: StreamEvent,
+    },
     /// A message was just committed to the session. Used both for live turn
     /// messages and for historical replay on resume.
-    MessageAppended { message: Message },
+    MessageAppended {
+        message: Message,
+    },
+    ToolApprovalRequested {
+        requests: Vec<ToolApprovalRequest>,
+    },
+    ToolApprovalResolved {
+        request_id: String,
+        approved: bool,
+    },
     /// The current turn ended successfully. The GUI may re-enable input.
     TurnComplete,
     /// The current turn was cancelled at the user's request. Partial
@@ -85,14 +111,18 @@ pub enum AgentEvent {
     TurnCancelled,
     /// Fatal error for the current turn (or, pre-`Ready`, for startup).
     /// No `TurnComplete` follows.
-    Error { message: String },
+    Error {
+        message: String,
+    },
     /// The agent has executed a lifecycle tool (`merge` or `abandon`) and
     /// is now requesting that the host close the session. Emitted by the
     /// driver immediately after the turn's terminal frame; the agent exits
     /// its command loop right after, so the host sees EOF on stdout next.
     /// Not user-visible — the host's pump routes this to a
     /// `CloseRequestSink`, not to the session's broadcast channel.
-    RequestClose { intent: CloseIntent },
+    RequestClose {
+        intent: CloseIntent,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -188,6 +218,18 @@ mod tests {
     }
 
     #[test]
+    fn roundtrip_resolve_tool_approval_command() {
+        let json = roundtrip_json(AgentCommand::ResolveToolApproval {
+            request_id: "call_1".into(),
+            approved: true,
+        });
+        assert_eq!(
+            json,
+            r#"{"type":"resolve_tool_approval","request_id":"call_1","approved":true}"#
+        );
+    }
+
+    #[test]
     fn roundtrip_ready_event() {
         roundtrip_json(AgentEvent::Ready {
             session_id: SessionId::new_v4(),
@@ -202,6 +244,32 @@ mod tests {
                 delta: "hello".into(),
             },
         });
+    }
+
+    #[test]
+    fn roundtrip_tool_approval_requested() {
+        let json = roundtrip_json(AgentEvent::ToolApprovalRequested {
+            requests: vec![ToolApprovalRequest {
+                request_id: "call_1".into(),
+                tool_call_id: "call_1".into(),
+                name: "bash".into(),
+                arguments: r#"{"command":"cargo test"}"#.into(),
+                reason: "Tool requires user approval".into(),
+            }],
+        });
+        assert!(json.contains(r#""type":"tool_approval_requested""#));
+    }
+
+    #[test]
+    fn roundtrip_tool_approval_resolved() {
+        let json = roundtrip_json(AgentEvent::ToolApprovalResolved {
+            request_id: "call_1".into(),
+            approved: false,
+        });
+        assert_eq!(
+            json,
+            r#"{"type":"tool_approval_resolved","request_id":"call_1","approved":false}"#
+        );
     }
 
     #[test]

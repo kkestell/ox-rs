@@ -14,6 +14,7 @@ use anyhow::{Context, Result};
 use serde::Deserialize;
 
 use super::{Tool, display_path, require_non_empty, resolve_path};
+use crate::approval::{ApprovalRequirement, MissingPathPolicy, path_approval_requirement};
 use crate::ports::FileSystem;
 use crate::stream::ToolDef;
 
@@ -57,6 +58,24 @@ impl<F: FileSystem + Send + Sync + 'static> Tool for WriteFileTool<F> {
                 "required": ["file_path", "content"]
             }),
         }
+    }
+
+    fn approval_requirement<'a>(
+        &'a self,
+        args: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<ApprovalRequirement>> + Send + 'a>> {
+        Box::pin(async move {
+            let parsed: WriteArgs =
+                serde_json::from_str(args).context("write_file: invalid JSON arguments")?;
+            require_non_empty("file_path", &parsed.file_path)?;
+            path_approval_requirement(
+                self.fs.as_ref(),
+                &self.workspace_root,
+                &parsed.file_path,
+                MissingPathPolicy::AllowMissingTarget,
+            )
+            .await
+        })
     }
 
     fn execute<'a>(
@@ -110,6 +129,34 @@ mod tests {
             fs.get(std::path::Path::new("/ws/notes.txt")).as_deref(),
             Some("hello")
         );
+    }
+
+    #[tokio::test]
+    async fn approval_not_required_for_missing_target_under_workspace() {
+        let fs = Arc::new(FakeFileSystem::new());
+        let t = tool(fs, "/ws");
+        let requirement = t
+            .approval_requirement(r#"{"file_path":"new/notes.txt","content":"hello"}"#)
+            .await
+            .unwrap();
+        assert_eq!(
+            requirement,
+            crate::approval::ApprovalRequirement::NotRequired
+        );
+    }
+
+    #[tokio::test]
+    async fn approval_required_for_missing_target_outside_workspace() {
+        let fs = Arc::new(FakeFileSystem::new());
+        let t = tool(fs, "/ws");
+        let requirement = t
+            .approval_requirement(r#"{"file_path":"../outside.txt","content":"hello"}"#)
+            .await
+            .unwrap();
+        assert!(matches!(
+            requirement,
+            crate::approval::ApprovalRequirement::Required { .. }
+        ));
     }
 
     #[tokio::test]

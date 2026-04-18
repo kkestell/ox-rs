@@ -142,6 +142,7 @@ pub fn parse_anchor(s: &str) -> Result<Anchor> {
     if line == 0 {
         bail!("anchor line numbers are 1-indexed; got 0");
     }
+    let hash = hash.split('|').next().unwrap().trim();
     if hash.is_empty() {
         bail!("anchor hash must not be empty");
     }
@@ -276,6 +277,18 @@ mod tests {
     #[test]
     fn parse_numeric_anchor() {
         let a = parse_anchor("42:a3z").unwrap();
+        assert_eq!(
+            a,
+            Anchor::Line {
+                line: 42,
+                hash: "a3z".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn parse_numeric_anchor_strips_pipe_suffix() {
+        let a = parse_anchor("42:a3z| some content here").unwrap();
         assert_eq!(
             a,
             Anchor::Line {

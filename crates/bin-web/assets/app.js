@@ -172,6 +172,7 @@ function mountSession(id, model, size) {
     root: node,
     transcript: node.querySelector(".transcript"),
     banner: node.querySelector(".banner"),
+    approvalPanel: null,
     composer: node.querySelector(".composer"),
     textarea: node.querySelector("textarea"),
     cancelButton: node.querySelector(".cancel"),
@@ -181,6 +182,7 @@ function mountSession(id, model, size) {
     accumulator: null,
     streamingEl: null,
     toolBlocks: new Map(),
+    pendingApprovals: new Map(),
     turning: false,
     ended: false,
   };
@@ -250,17 +252,127 @@ function applyEvent(sess, event) {
     case "turn_complete":
     case "turn_cancelled":
       finishStreaming(sess);
+      clearApprovals(sess);
       clearBanner(sess);
       sess.turning = false;
       setComposerEnabled(sess, true);
       break;
+    case "tool_approval_requested":
+      for (const request of event.requests || []) {
+        sess.pendingApprovals.set(request.request_id, {
+          request,
+          resolving: false,
+        });
+      }
+      renderApprovalPanel(sess);
+      break;
+    case "tool_approval_resolved":
+      sess.pendingApprovals.delete(event.request_id);
+      renderApprovalPanel(sess);
+      break;
     case "error":
       finishStreaming(sess);
+      clearApprovals(sess);
       showBanner(sess, event.message);
       sess.turning = false;
       setComposerEnabled(sess, true);
       break;
   }
+}
+
+function renderApprovalPanel(sess) {
+  if (sess.pendingApprovals.size === 0) {
+    if (sess.approvalPanel) {
+      sess.approvalPanel.remove();
+      sess.approvalPanel = null;
+    }
+    return;
+  }
+
+  if (!sess.approvalPanel) {
+    sess.approvalPanel = document.createElement("div");
+    sess.approvalPanel.className = "approval-panel";
+    sess.root.appendChild(sess.approvalPanel);
+  }
+  sess.approvalPanel.textContent = "";
+
+  const list = document.createElement("div");
+  list.className = "approval-list";
+  for (const item of sess.pendingApprovals.values()) {
+    list.appendChild(renderApprovalItem(sess, item));
+  }
+  sess.approvalPanel.appendChild(list);
+}
+
+function renderApprovalItem(sess, item) {
+  const { request, resolving } = item;
+  const row = document.createElement("div");
+  row.className = "approval-item";
+
+  const name = document.createElement("div");
+  name.className = "approval-name";
+  name.textContent = request.name;
+  const reason = document.createElement("div");
+  reason.className = "approval-reason";
+  reason.textContent = request.reason;
+  const details = document.createElement("details");
+  const summary = document.createElement("summary");
+  summary.textContent = "Arguments";
+  details.appendChild(summary);
+  const pre = document.createElement("pre");
+  pre.textContent = prettyJson(request.arguments);
+  details.appendChild(pre);
+
+  const actions = document.createElement("div");
+  actions.className = "approval-actions";
+  const approve = document.createElement("button");
+  approve.type = "button";
+  approve.textContent = "Approve";
+  approve.disabled = resolving;
+  approve.addEventListener("click", () => resolveApproval(sess, request.request_id, true));
+  const reject = document.createElement("button");
+  reject.type = "button";
+  reject.textContent = "Reject";
+  reject.disabled = resolving;
+  reject.addEventListener("click", () => resolveApproval(sess, request.request_id, false));
+  actions.append(approve, reject);
+
+  row.append(name, reason, details, actions);
+  return row;
+}
+
+async function resolveApproval(sess, requestId, approved) {
+  const item = sess.pendingApprovals.get(requestId);
+  if (!item || item.resolving) return;
+  item.resolving = true;
+  renderApprovalPanel(sess);
+  let res;
+  try {
+    res = await fetch(`/api/sessions/${sess.id}/tool-approvals/${encodeURIComponent(requestId)}`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ approved }),
+    });
+  } catch (err) {
+    item.resolving = false;
+    renderApprovalPanel(sess);
+    showBanner(sess, `approval failed: ${err}`);
+    return;
+  }
+  if (res.status === 204) return;
+  item.resolving = false;
+  renderApprovalPanel(sess);
+  if (res.status === 404 || res.status === 410) {
+    markSessionEnded(sess);
+    showBanner(sess, "session not found");
+    return;
+  }
+  showBanner(sess, `approval failed: HTTP ${res.status}`);
+}
+
+function clearApprovals(sess) {
+  sess.pendingApprovals.clear();
+  renderApprovalPanel(sess);
 }
 
 function beginStreaming(sess) {

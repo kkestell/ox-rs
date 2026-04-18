@@ -16,6 +16,7 @@ use serde::Deserialize;
 
 use super::spill::{self, PREVIEW_LINES};
 use super::{Tool, display_path, require_non_empty, resolve_path};
+use crate::approval::{ApprovalRequirement, MissingPathPolicy, path_approval_requirement};
 use crate::ports::FileSystem;
 use crate::stream::ToolDef;
 
@@ -82,6 +83,25 @@ impl<F: FileSystem + Send + Sync + 'static> Tool for GrepTool<F> {
                 "required": ["pattern"]
             }),
         }
+    }
+
+    fn approval_requirement<'a>(
+        &'a self,
+        args: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<ApprovalRequirement>> + Send + 'a>> {
+        Box::pin(async move {
+            let parsed: GrepArgs =
+                serde_json::from_str(args).context("grep: invalid JSON arguments")?;
+            require_non_empty("pattern", &parsed.pattern)?;
+            let path = parsed.path.as_deref().unwrap_or(".");
+            path_approval_requirement(
+                self.fs.as_ref(),
+                &self.workspace_root,
+                path,
+                MissingPathPolicy::MustExist,
+            )
+            .await
+        })
     }
 
     fn execute<'a>(
@@ -388,5 +408,35 @@ mod tests {
         assert!(out.contains("Found 1 match:"));
         assert!(out.contains("/other/f.rs:1:"));
         assert!(!out.contains("g.rs"));
+    }
+
+    #[tokio::test]
+    async fn approval_not_required_for_path_under_workspace() {
+        let fs = Arc::new(FakeFileSystem::new());
+        fs.insert("/ws/a.txt", "hello\n");
+        let t = tool(fs, "/ws");
+        let requirement = t
+            .approval_requirement(r#"{"pattern":"hello"}"#)
+            .await
+            .unwrap();
+        assert_eq!(
+            requirement,
+            crate::approval::ApprovalRequirement::NotRequired
+        );
+    }
+
+    #[tokio::test]
+    async fn approval_required_for_path_outside_workspace() {
+        let fs = Arc::new(FakeFileSystem::new());
+        fs.insert("/other/a.txt", "hello\n");
+        let t = tool(fs, "/ws");
+        let requirement = t
+            .approval_requirement(r#"{"pattern":"hello","path":"../other"}"#)
+            .await
+            .unwrap();
+        assert!(matches!(
+            requirement,
+            crate::approval::ApprovalRequirement::Required { .. }
+        ));
     }
 }

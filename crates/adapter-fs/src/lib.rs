@@ -5,6 +5,12 @@ use anyhow::{Context, Result};
 pub struct LocalFileSystem;
 
 impl app::FileSystem for LocalFileSystem {
+    async fn canonicalize(&self, path: &Path) -> Result<PathBuf> {
+        tokio::fs::canonicalize(path)
+            .await
+            .with_context(|| format!("canonicalizing {}", path.display()))
+    }
+
     async fn read(&self, path: &Path) -> Result<String> {
         Ok(tokio::fs::read_to_string(path).await?)
     }

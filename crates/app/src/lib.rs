@@ -1,3 +1,4 @@
+pub mod approval;
 pub mod cancel;
 pub mod lifecycle;
 mod ports;
@@ -8,6 +9,10 @@ mod use_cases;
 #[cfg(any(test, feature = "test-support"))]
 pub mod fake;
 
+pub use approval::{
+    ApprovalRequirement, MissingPathPolicy, NoApprovalRequired, TOOL_REJECTED_MESSAGE,
+    ToolApprovalDecision, ToolApprovalRequest, ToolApprover,
+};
 pub use cancel::CancelToken;
 pub use lifecycle::{AbandonTool, CloseSignal, MergeTool};
 pub use ports::*;

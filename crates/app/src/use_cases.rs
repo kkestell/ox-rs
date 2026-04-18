@@ -1,9 +1,15 @@
 use std::path::PathBuf;
 
+use std::collections::HashMap;
+
 use anyhow::{Result, bail};
 use domain::{Message, Session, SessionId, StreamEvent};
 use futures::StreamExt;
 
+use crate::approval::{
+    ApprovalRequirement, NoApprovalRequired, TOOL_REJECTED_MESSAGE, ToolApprovalRequest,
+    ToolApprover,
+};
 use crate::cancel::CancelToken;
 use crate::ports::{LlmProvider, SessionStore};
 use crate::stream::StreamAccumulator;
@@ -35,6 +41,8 @@ pub enum TurnOutcome {
 pub enum TurnEvent<'a> {
     StreamDelta(&'a StreamEvent),
     MessageAppended(&'a Message),
+    ToolApprovalRequested { requests: Vec<ToolApprovalRequest> },
+    ToolApprovalResolved { request_id: String, approved: bool },
 }
 
 /// Cap on tool-call loop iterations per turn.
@@ -98,6 +106,20 @@ impl<L: LlmProvider, S: SessionStore> SessionRunner<L, S> {
         self.run_turn(&mut session, input, cancel, on_event).await
     }
 
+    pub async fn start_with_approver(
+        &self,
+        id: SessionId,
+        workspace_root: PathBuf,
+        input: &str,
+        cancel: CancelToken,
+        approver: &dyn ToolApprover,
+        on_event: impl FnMut(TurnEvent<'_>) + Send,
+    ) -> Result<TurnOutcome> {
+        let mut session = Session::new(id, workspace_root.clone(), workspace_root);
+        self.run_turn_with_approver(&mut session, input, cancel, approver, on_event)
+            .await
+    }
+
     /// Load an existing session and run the next turn.
     pub async fn resume(
         &self,
@@ -108,6 +130,19 @@ impl<L: LlmProvider, S: SessionStore> SessionRunner<L, S> {
     ) -> Result<TurnOutcome> {
         let mut session = self.store.load(id).await?;
         self.run_turn(&mut session, input, cancel, on_event).await
+    }
+
+    pub async fn resume_with_approver(
+        &self,
+        id: SessionId,
+        input: &str,
+        cancel: CancelToken,
+        approver: &dyn ToolApprover,
+        on_event: impl FnMut(TurnEvent<'_>) + Send,
+    ) -> Result<TurnOutcome> {
+        let mut session = self.store.load(id).await?;
+        self.run_turn_with_approver(&mut session, input, cancel, approver, on_event)
+            .await
     }
 
     /// Core turn loop. Appends the user input, then iteratively:
@@ -132,6 +167,19 @@ impl<L: LlmProvider, S: SessionStore> SessionRunner<L, S> {
         session: &mut Session,
         input: &str,
         cancel: CancelToken,
+        on_event: impl FnMut(TurnEvent<'_>) + Send,
+    ) -> Result<TurnOutcome> {
+        let approver = NoApprovalRequired;
+        self.run_turn_with_approver(session, input, cancel, &approver, on_event)
+            .await
+    }
+
+    async fn run_turn_with_approver(
+        &self,
+        session: &mut Session,
+        input: &str,
+        cancel: CancelToken,
+        approver: &dyn ToolApprover,
         mut on_event: impl FnMut(TurnEvent<'_>) + Send,
     ) -> Result<TurnOutcome> {
         // Commit the user message before any network work — its presence in
@@ -196,10 +244,70 @@ impl<L: LlmProvider, S: SessionStore> SessionRunner<L, S> {
                 bail!("model returned tool calls but no tools are registered");
             }
 
-            for (id, name, arguments) in tool_calls {
+            let approval_plan = self.plan_tool_approvals(tool_calls).await;
+            if cancel.is_cancelled() {
+                return Ok(TurnOutcome::Cancelled);
+            }
+
+            let approval_requests: Vec<_> = approval_plan
+                .iter()
+                .filter_map(|planned| match planned {
+                    PlannedToolCall::NeedsApproval { request, .. } => Some(request.clone()),
+                    _ => None,
+                })
+                .collect();
+            let mut decisions = HashMap::new();
+            if !approval_requests.is_empty() {
+                on_event(TurnEvent::ToolApprovalRequested {
+                    requests: approval_requests.clone(),
+                });
+                let resolved = approver.approve(approval_requests, cancel.clone()).await?;
+                for decision in resolved {
+                    on_event(TurnEvent::ToolApprovalResolved {
+                        request_id: decision.request_id.clone(),
+                        approved: decision.approved,
+                    });
+                    decisions.insert(decision.request_id, decision.approved);
+                }
+            }
+
+            for planned in approval_plan {
                 if cancel.is_cancelled() {
                     return Ok(TurnOutcome::Cancelled);
                 }
+                let (id, name, arguments) = match planned {
+                    PlannedToolCall::Ready {
+                        id,
+                        name,
+                        arguments,
+                    } => (id, name, arguments),
+                    PlannedToolCall::NeedsApproval {
+                        id,
+                        name,
+                        arguments,
+                        request,
+                    } => {
+                        if !decisions.get(&request.request_id).copied().unwrap_or(false) {
+                            let tool_msg = Message::tool_result(id, TOOL_REJECTED_MESSAGE, true);
+                            session.push_message(tool_msg);
+                            on_event(TurnEvent::MessageAppended(
+                                session.messages.last().expect("just pushed"),
+                            ));
+                            self.store.save(session).await?;
+                            continue;
+                        }
+                        (id, name, arguments)
+                    }
+                    PlannedToolCall::PolicyError { id, error } => {
+                        let tool_msg = Message::tool_result(id, error, true);
+                        session.push_message(tool_msg);
+                        on_event(TurnEvent::MessageAppended(
+                            session.messages.last().expect("just pushed"),
+                        ));
+                        self.store.save(session).await?;
+                        continue;
+                    }
+                };
                 let (content, is_error) = match self.tools.execute(&name, &arguments).await {
                     Ok(out) => (out, false),
                     Err(e) => (format!("{e:#}"), true),
@@ -215,18 +323,75 @@ impl<L: LlmProvider, S: SessionStore> SessionRunner<L, S> {
 
         bail!("tool-call loop exceeded {MAX_LOOP_ITERATIONS} iterations — model is not converging");
     }
+
+    async fn plan_tool_approvals(
+        &self,
+        tool_calls: Vec<(String, String, String)>,
+    ) -> Vec<PlannedToolCall> {
+        let mut planned = Vec::with_capacity(tool_calls.len());
+        for (id, name, arguments) in tool_calls {
+            match self.tools.approval_requirement(&name, &arguments).await {
+                Ok(ApprovalRequirement::NotRequired) => planned.push(PlannedToolCall::Ready {
+                    id,
+                    name,
+                    arguments,
+                }),
+                Ok(ApprovalRequirement::Required { reason }) => {
+                    let request = ToolApprovalRequest {
+                        request_id: id.clone(),
+                        tool_call_id: id.clone(),
+                        name: name.clone(),
+                        arguments: arguments.clone(),
+                        reason,
+                    };
+                    planned.push(PlannedToolCall::NeedsApproval {
+                        id,
+                        name,
+                        arguments,
+                        request,
+                    });
+                }
+                Err(err) => planned.push(PlannedToolCall::PolicyError {
+                    id,
+                    error: format!("{err:#}"),
+                }),
+            }
+        }
+        planned
+    }
+}
+
+enum PlannedToolCall {
+    Ready {
+        id: String,
+        name: String,
+        arguments: String,
+    },
+    NeedsApproval {
+        id: String,
+        name: String,
+        arguments: String,
+        request: ToolApprovalRequest,
+    },
+    PolicyError {
+        id: String,
+        error: String,
+    },
 }
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::sync::{Arc, Mutex};
 
     use domain::{ContentBlock, Role};
 
     use super::*;
-    use crate::Tool;
+    use crate::approval::ToolApprovalDecision;
     use crate::cancel::CancelToken;
     use crate::fake::{FakeLlmProvider, FakeSessionStore, FakeTool, tool_registry_with};
+    use crate::{Tool, ToolDef};
     use domain::Usage;
 
     fn make_runner(
@@ -235,6 +400,101 @@ mod tests {
         tools: ToolRegistry,
     ) -> SessionRunner<FakeLlmProvider, FakeSessionStore> {
         SessionRunner::new(llm, store, tools, String::new())
+    }
+
+    struct ApprovalFakeTool {
+        name: String,
+        output: String,
+        calls: Mutex<Vec<String>>,
+    }
+
+    impl ApprovalFakeTool {
+        fn new(name: &str, output: &str) -> Self {
+            Self {
+                name: name.into(),
+                output: output.into(),
+                calls: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn calls(&self) -> Vec<String> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    impl Tool for ApprovalFakeTool {
+        fn def(&self) -> ToolDef {
+            ToolDef {
+                name: self.name.clone(),
+                description: "approval fake".into(),
+                parameters: serde_json::json!({"type": "object"}),
+            }
+        }
+
+        fn approval_requirement<'a>(
+            &'a self,
+            _args: &'a str,
+        ) -> Pin<Box<dyn Future<Output = Result<ApprovalRequirement>> + Send + 'a>> {
+            Box::pin(async {
+                Ok(ApprovalRequirement::Required {
+                    reason: "test approval required".into(),
+                })
+            })
+        }
+
+        fn execute<'a>(
+            &'a self,
+            args: &'a str,
+        ) -> Pin<Box<dyn Future<Output = Result<String>> + Send + 'a>> {
+            Box::pin(async move {
+                self.calls.lock().unwrap().push(args.to_owned());
+                Ok(self.output.clone())
+            })
+        }
+    }
+
+    struct ScriptedApprover {
+        decisions: HashMap<String, bool>,
+        batches: Mutex<Vec<Vec<ToolApprovalRequest>>>,
+    }
+
+    impl ScriptedApprover {
+        fn new(decisions: impl IntoIterator<Item = (&'static str, bool)>) -> Self {
+            Self {
+                decisions: decisions
+                    .into_iter()
+                    .map(|(id, approved)| (id.to_owned(), approved))
+                    .collect(),
+                batches: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn batches(&self) -> Vec<Vec<ToolApprovalRequest>> {
+            self.batches.lock().unwrap().clone()
+        }
+    }
+
+    impl ToolApprover for ScriptedApprover {
+        fn approve<'a>(
+            &'a self,
+            requests: Vec<ToolApprovalRequest>,
+            _cancel: CancelToken,
+        ) -> Pin<Box<dyn Future<Output = Result<Vec<ToolApprovalDecision>>> + Send + 'a>> {
+            Box::pin(async move {
+                self.batches.lock().unwrap().push(requests.clone());
+                Ok(requests
+                    .into_iter()
+                    .map(|request| ToolApprovalDecision {
+                        approved: self
+                            .decisions
+                            .get(&request.request_id)
+                            .copied()
+                            .unwrap_or(false),
+                        request_id: request.request_id,
+                    })
+                    .collect())
+            })
+        }
     }
 
     // -- start --
@@ -620,6 +880,429 @@ mod tests {
                 assert_eq!(id2, "c2");
             }
             _ => panic!("expected two ToolResult blocks"),
+        }
+    }
+
+    #[tokio::test]
+    async fn approval_required_calls_are_batched_and_results_keep_original_order() {
+        let llm = FakeLlmProvider::new();
+        llm.push_response(vec![
+            StreamEvent::ToolCallStart {
+                index: 0,
+                id: "c1".into(),
+                name: "a".into(),
+            },
+            StreamEvent::ToolCallStart {
+                index: 1,
+                id: "c2".into(),
+                name: "b".into(),
+            },
+            StreamEvent::ToolCallArgumentDelta {
+                index: 0,
+                delta: r#"{"first":true}"#.into(),
+            },
+            StreamEvent::ToolCallArgumentDelta {
+                index: 1,
+                delta: r#"{"second":true}"#.into(),
+            },
+            StreamEvent::Finished {
+                usage: Usage {
+                    prompt_tokens: 0,
+                    completion_tokens: 2,
+                    reasoning_tokens: 0,
+                },
+            },
+        ]);
+        llm.push_text("finished");
+
+        let a = Arc::new(ApprovalFakeTool::new("a", "from-a"));
+        let b = Arc::new(ApprovalFakeTool::new("b", "from-b"));
+        let tools =
+            tool_registry_with(vec![a.clone() as Arc<dyn Tool>, b.clone() as Arc<dyn Tool>]);
+        let store = FakeSessionStore::new();
+        let runner = make_runner(llm, store, tools);
+        let approver = ScriptedApprover::new([("c1", true), ("c2", true)]);
+        let id = SessionId::new_v4();
+        let mut approval_events = Vec::new();
+
+        runner
+            .start_with_approver(
+                id,
+                "/p".into(),
+                "hi",
+                CancelToken::new(),
+                &approver,
+                |evt| match evt {
+                    TurnEvent::ToolApprovalRequested { requests } => {
+                        approval_events.push(requests.len())
+                    }
+                    TurnEvent::ToolApprovalResolved {
+                        request_id,
+                        approved,
+                    } => {
+                        assert!(approved, "expected approved decision for {request_id}");
+                    }
+                    _ => {}
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(approval_events, vec![2]);
+        let batches = approver.batches();
+        assert_eq!(batches.len(), 1);
+        assert_eq!(
+            batches[0]
+                .iter()
+                .map(|r| r.request_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["c1", "c2"]
+        );
+
+        let saved = runner.store.get(id).unwrap();
+        match (&saved.messages[2].content[0], &saved.messages[3].content[0]) {
+            (
+                ContentBlock::ToolResult {
+                    content: c1,
+                    tool_call_id: id1,
+                    ..
+                },
+                ContentBlock::ToolResult {
+                    content: c2,
+                    tool_call_id: id2,
+                    ..
+                },
+            ) => {
+                assert_eq!(id1, "c1");
+                assert_eq!(c1, "from-a");
+                assert_eq!(id2, "c2");
+                assert_eq!(c2, "from-b");
+            }
+            _ => panic!("expected tool results"),
+        }
+        assert_eq!(a.calls(), vec![r#"{"first":true}"#.to_owned()]);
+        assert_eq!(b.calls(), vec![r#"{"second":true}"#.to_owned()]);
+    }
+
+    #[tokio::test]
+    async fn rejected_approval_appends_error_result_and_turn_continues() {
+        let llm = FakeLlmProvider::new();
+        llm.push_tool_call("c1", "danger", "{}");
+        llm.push_text("recovered");
+
+        let danger = Arc::new(ApprovalFakeTool::new("danger", "should not run"));
+        let tools = tool_registry_with(vec![danger.clone() as Arc<dyn Tool>]);
+        let store = FakeSessionStore::new();
+        let runner = make_runner(llm, store, tools);
+        let approver = ScriptedApprover::new([("c1", false)]);
+        let id = SessionId::new_v4();
+
+        runner
+            .start_with_approver(id, "/p".into(), "hi", CancelToken::new(), &approver, |_| {})
+            .await
+            .unwrap();
+
+        assert!(danger.calls().is_empty());
+        let saved = runner.store.get(id).unwrap();
+        assert_eq!(saved.messages[3].text(), "recovered");
+        match &saved.messages[2].content[0] {
+            ContentBlock::ToolResult {
+                content, is_error, ..
+            } => {
+                assert_eq!(content, TOOL_REJECTED_MESSAGE);
+                assert!(is_error);
+            }
+            _ => panic!("expected rejected tool result"),
+        }
+    }
+
+    #[tokio::test]
+    async fn cancel_while_waiting_for_approval_returns_cancelled_without_executing() {
+        use std::sync::Arc;
+        use tokio::sync::mpsc;
+
+        let llm = FakeLlmProvider::new();
+        llm.push_tool_call("c1", "danger", "{}");
+
+        let danger = Arc::new(ApprovalFakeTool::new("danger", "should not run"));
+        let tools = tool_registry_with(vec![danger.clone() as Arc<dyn Tool>]);
+        let store = FakeSessionStore::new();
+        let runner = make_runner(llm, store, tools);
+
+        struct BlockingApprover {
+            tx: mpsc::Sender<Vec<ToolApprovalRequest>>,
+        }
+        impl ToolApprover for BlockingApprover {
+            fn approve<'a>(
+                &'a self,
+                requests: Vec<ToolApprovalRequest>,
+                cancel: CancelToken,
+            ) -> Pin<Box<dyn Future<Output = Result<Vec<ToolApprovalDecision>>> + Send + 'a>>
+            {
+                let tx = self.tx.clone();
+                Box::pin(async move {
+                    let _ = tx.send(requests).await;
+                    loop {
+                        if cancel.is_cancelled() {
+                            return Ok(Vec::new());
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    }
+                })
+            }
+        }
+
+        let (tx, mut rx) = mpsc::channel(1);
+        let approver = BlockingApprover { tx };
+        let token = CancelToken::new();
+        let token_clone = token.clone();
+        let id = SessionId::new_v4();
+
+        let handle = tokio::spawn(async move {
+            runner
+                .start_with_approver(id, "/p".into(), "hi", token_clone, &approver, |_| {})
+                .await
+        });
+
+        let requests = rx.recv().await.expect("approver should receive requests");
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].request_id, "c1");
+
+        token.cancel();
+
+        let outcome = handle.await.unwrap().unwrap();
+        assert_eq!(outcome, TurnOutcome::Cancelled);
+        assert!(
+            danger.calls().is_empty(),
+            "cancelled approval must not execute the tool"
+        );
+    }
+
+    #[tokio::test]
+    async fn mixed_approval_and_not_required_preserves_original_order() {
+        let llm = FakeLlmProvider::new();
+        llm.push_response(vec![
+            StreamEvent::ToolCallStart {
+                index: 0,
+                id: "c1".into(),
+                name: "safe".into(),
+            },
+            StreamEvent::ToolCallArgumentDelta {
+                index: 0,
+                delta: r#"{"x":1}"#.into(),
+            },
+            StreamEvent::ToolCallStart {
+                index: 1,
+                id: "c2".into(),
+                name: "risky".into(),
+            },
+            StreamEvent::ToolCallArgumentDelta {
+                index: 1,
+                delta: r#"{"y":2}"#.into(),
+            },
+            StreamEvent::Finished {
+                usage: Usage {
+                    prompt_tokens: 0,
+                    completion_tokens: 2,
+                    reasoning_tokens: 0,
+                },
+            },
+        ]);
+        llm.push_text("done");
+
+        let safe = Arc::new(FakeTool::new("safe"));
+        safe.push_ok("safe-result");
+        let risky = Arc::new(ApprovalFakeTool::new("risky", "risky-result"));
+        let tools = tool_registry_with(vec![
+            safe.clone() as Arc<dyn Tool>,
+            risky.clone() as Arc<dyn Tool>,
+        ]);
+        let store = FakeSessionStore::new();
+        let runner = make_runner(llm, store, tools);
+        let approver = ScriptedApprover::new([("c2", true)]);
+        let id = SessionId::new_v4();
+        let mut approval_event_count = 0;
+
+        runner
+            .start_with_approver(
+                id,
+                "/p".into(),
+                "hi",
+                CancelToken::new(),
+                &approver,
+                |evt| {
+                    if let TurnEvent::ToolApprovalRequested { requests } = evt {
+                        approval_event_count += 1;
+                        assert_eq!(requests.len(), 1);
+                        assert_eq!(requests[0].request_id, "c2");
+                    }
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(approval_event_count, 1);
+
+        let saved = runner.store.get(id).unwrap();
+        match (&saved.messages[2].content[0], &saved.messages[3].content[0]) {
+            (
+                ContentBlock::ToolResult {
+                    content: c1,
+                    tool_call_id: id1,
+                    is_error: e1,
+                    ..
+                },
+                ContentBlock::ToolResult {
+                    content: c2,
+                    tool_call_id: id2,
+                    is_error: e2,
+                    ..
+                },
+            ) => {
+                assert_eq!(id1, "c1");
+                assert_eq!(c1, "safe-result");
+                assert!(!e1);
+                assert_eq!(id2, "c2");
+                assert_eq!(c2, "risky-result");
+                assert!(!e2);
+            }
+            _ => panic!("expected two tool results"),
+        }
+    }
+
+    #[tokio::test]
+    async fn partial_approval_in_batch_executes_approved_and_rejects_rest() {
+        let llm = FakeLlmProvider::new();
+        llm.push_response(vec![
+            StreamEvent::ToolCallStart {
+                index: 0,
+                id: "c1".into(),
+                name: "a".into(),
+            },
+            StreamEvent::ToolCallArgumentDelta {
+                index: 0,
+                delta: r#"{"first":true}"#.into(),
+            },
+            StreamEvent::ToolCallStart {
+                index: 1,
+                id: "c2".into(),
+                name: "b".into(),
+            },
+            StreamEvent::ToolCallArgumentDelta {
+                index: 1,
+                delta: r#"{"second":true}"#.into(),
+            },
+            StreamEvent::Finished {
+                usage: Usage {
+                    prompt_tokens: 0,
+                    completion_tokens: 2,
+                    reasoning_tokens: 0,
+                },
+            },
+        ]);
+        llm.push_text("done");
+
+        let a = Arc::new(ApprovalFakeTool::new("a", "from-a"));
+        let b = Arc::new(ApprovalFakeTool::new("b", "from-b"));
+        let tools =
+            tool_registry_with(vec![a.clone() as Arc<dyn Tool>, b.clone() as Arc<dyn Tool>]);
+        let store = FakeSessionStore::new();
+        let runner = make_runner(llm, store, tools);
+        let approver = ScriptedApprover::new([("c1", true), ("c2", false)]);
+        let id = SessionId::new_v4();
+
+        runner
+            .start_with_approver(id, "/p".into(), "hi", CancelToken::new(), &approver, |_| {})
+            .await
+            .unwrap();
+
+        assert_eq!(a.calls(), vec![r#"{"first":true}"#.to_owned()]);
+        assert!(b.calls().is_empty(), "rejected tool must not execute");
+
+        let saved = runner.store.get(id).unwrap();
+        match (&saved.messages[2].content[0], &saved.messages[3].content[0]) {
+            (
+                ContentBlock::ToolResult {
+                    content: c1,
+                    tool_call_id: id1,
+                    is_error: e1,
+                    ..
+                },
+                ContentBlock::ToolResult {
+                    content: c2,
+                    tool_call_id: id2,
+                    is_error: e2,
+                    ..
+                },
+            ) => {
+                assert_eq!(id1, "c1");
+                assert_eq!(c1, "from-a");
+                assert!(!e1);
+                assert_eq!(id2, "c2");
+                assert_eq!(c2, TOOL_REJECTED_MESSAGE);
+                assert!(e2);
+            }
+            _ => panic!("expected two tool results in original order"),
+        }
+    }
+
+    #[tokio::test]
+    async fn policy_error_on_approval_requirement_becomes_error_tool_result() {
+        let llm = FakeLlmProvider::new();
+        llm.push_tool_call("c1", "picky", "anything");
+        llm.push_text("recovered");
+
+        struct PickyTool;
+        impl Tool for PickyTool {
+            fn def(&self) -> crate::stream::ToolDef {
+                crate::stream::ToolDef {
+                    name: "picky".into(),
+                    description: "always errors".into(),
+                    parameters: serde_json::json!({"type": "object"}),
+                }
+            }
+            fn approval_requirement<'a>(
+                &'a self,
+                args: &'a str,
+            ) -> Pin<Box<dyn Future<Output = Result<ApprovalRequirement>> + Send + 'a>>
+            {
+                Box::pin(async move { bail!("policy check failed: {args}") })
+            }
+            fn execute<'a>(
+                &'a self,
+                _args: &'a str,
+            ) -> Pin<Box<dyn Future<Output = Result<String>> + Send + 'a>> {
+                Box::pin(async { Ok("should not run".into()) })
+            }
+        }
+
+        let tools = tool_registry_with(vec![Arc::new(PickyTool) as Arc<dyn Tool>]);
+        let store = FakeSessionStore::new();
+        let runner = make_runner(llm, store, tools);
+
+        let id = SessionId::new_v4();
+        runner
+            .start_with_approver(
+                id,
+                "/p".into(),
+                "hi",
+                CancelToken::new(),
+                &NoApprovalRequired,
+                |_| {},
+            )
+            .await
+            .unwrap();
+
+        let saved = runner.store.get(id).unwrap();
+        assert_eq!(saved.messages[3].text(), "recovered");
+        match &saved.messages[2].content[0] {
+            ContentBlock::ToolResult {
+                content, is_error, ..
+            } => {
+                assert!(content.contains("policy check failed"), "got: {content}");
+                assert!(is_error);
+            }
+            _ => panic!("expected policy error tool result"),
         }
     }
 

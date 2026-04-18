@@ -19,6 +19,7 @@ use serde::Deserialize;
 
 use super::hashlines::{render_with_hashlines, split_lines};
 use super::{Tool, display_path, require_non_empty, resolve_path};
+use crate::approval::{ApprovalRequirement, MissingPathPolicy, path_approval_requirement};
 use crate::ports::FileSystem;
 use crate::stream::ToolDef;
 
@@ -79,6 +80,24 @@ impl<F: FileSystem + Send + Sync + 'static> Tool for ReadFileTool<F> {
                 "required": ["file_path"]
             }),
         }
+    }
+
+    fn approval_requirement<'a>(
+        &'a self,
+        args: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<ApprovalRequirement>> + Send + 'a>> {
+        Box::pin(async move {
+            let parsed: ReadArgs =
+                serde_json::from_str(args).context("read_file: invalid JSON arguments")?;
+            require_non_empty("file_path", &parsed.file_path)?;
+            path_approval_requirement(
+                self.fs.as_ref(),
+                &self.workspace_root,
+                &parsed.file_path,
+                MissingPathPolicy::MustExist,
+            )
+            .await
+        })
     }
 
     fn execute<'a>(
@@ -211,6 +230,36 @@ mod tests {
             .await
             .unwrap();
         assert!(out.contains("hi"));
+    }
+
+    #[tokio::test]
+    async fn approval_not_required_for_absolute_path_under_workspace() {
+        let fs = Arc::new(FakeFileSystem::new());
+        fs.insert("/ws/a.txt", "hi");
+        let t = tool(fs, "/ws");
+        let requirement = t
+            .approval_requirement(r#"{"file_path":"/ws/a.txt"}"#)
+            .await
+            .unwrap();
+        assert_eq!(
+            requirement,
+            crate::approval::ApprovalRequirement::NotRequired
+        );
+    }
+
+    #[tokio::test]
+    async fn approval_required_for_path_outside_workspace() {
+        let fs = Arc::new(FakeFileSystem::new());
+        fs.insert("/other/a.txt", "hi");
+        let t = tool(fs, "/ws");
+        let requirement = t
+            .approval_requirement(r#"{"file_path":"../other/a.txt"}"#)
+            .await
+            .unwrap();
+        assert!(matches!(
+            requirement,
+            crate::approval::ApprovalRequirement::Required { .. }
+        ));
     }
 
     #[tokio::test]

@@ -354,6 +354,24 @@ impl SessionRegistry {
         }
     }
 
+    pub async fn resolve_tool_approval(
+        &self,
+        id: SessionId,
+        request_id: String,
+        approved: bool,
+    ) -> CommandDispatch {
+        let session = match self.get(id) {
+            Some(s) => s,
+            None => return CommandDispatch::NotFound,
+        };
+        match session.resolve_tool_approval(request_id, approved) {
+            SendOutcome::Ok => CommandDispatch::Ok,
+            SendOutcome::Dead => CommandDispatch::Dead,
+            SendOutcome::AlreadyTurning => CommandDispatch::Ok,
+            SendOutcome::Closing => CommandDispatch::Closing,
+        }
+    }
+
     /// Shared entry point for spawning a session against a specific
     /// worktree. `create` / `restore` route through this today with
     /// `worktree_path = self.workspace_root`; the lifecycle coordinator

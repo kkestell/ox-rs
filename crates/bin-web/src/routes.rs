@@ -37,6 +37,10 @@ pub fn router(state: AppState) -> Router {
         .route("/api/sessions/{id}/abandon", post(abandon_session))
         .route("/api/sessions/{id}/messages", post(post_message))
         .route("/api/sessions/{id}/cancel", post(post_cancel))
+        .route(
+            "/api/sessions/{id}/tool-approvals/{request_id}",
+            post(post_tool_approval),
+        )
         .route("/api/sessions/{id}/events", get(sse::sse_handler))
         .route("/api/layout", put(put_layout))
         // Large tool outputs can push `MessageAppended` payloads into
@@ -252,6 +256,33 @@ async fn post_cancel(State(state): State<AppState>, Path(id): Path<SessionId>) -
         // calls out "204 otherwise." Treat `Dead` and `AlreadyTurning`
         // the same way.
         _ => StatusCode::NO_CONTENT.into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct ToolApprovalBody {
+    approved: bool,
+}
+
+async fn post_tool_approval(
+    State(state): State<AppState>,
+    Path((id, request_id)): Path<(SessionId, String)>,
+    Json(body): Json<ToolApprovalBody>,
+) -> Response {
+    match state
+        .registry
+        .resolve_tool_approval(id, request_id, body.approved)
+        .await
+    {
+        CommandDispatch::Ok => StatusCode::NO_CONTENT.into_response(),
+        CommandDispatch::NotFound => StatusCode::NOT_FOUND.into_response(),
+        CommandDispatch::Dead => StatusCode::GONE.into_response(),
+        CommandDispatch::AlreadyTurning => StatusCode::NO_CONTENT.into_response(),
+        CommandDispatch::Closing => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({"reason": "closing"})),
+        )
+            .into_response(),
     }
 }
 
@@ -638,6 +669,105 @@ mod tests {
             serde_json::from_slice(&second.into_body().collect().await.unwrap().to_bytes())
                 .unwrap();
         assert_eq!(body["reason"], "already_turning");
+    }
+
+    #[tokio::test]
+    async fn post_tool_approval_works_while_turn_is_active() {
+        let (app, _reg, mut rx) = make_app().await;
+        let (_, id, mut handles) = create_via_router(app.clone(), &mut rx).await;
+
+        let first = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/sessions/{id}/messages"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"input":"one"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(first.status(), StatusCode::NO_CONTENT);
+        let sent = timeout(Duration::from_secs(2), handles.next_command())
+            .await
+            .expect("send command timeout");
+        assert!(matches!(sent, Some(AgentCommand::SendMessage { .. })));
+
+        // Approval during an active turn must return 204, not 409.
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/sessions/{id}/tool-approvals/call_1"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"approved":true}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+        let cmd = timeout(Duration::from_secs(2), handles.next_command())
+            .await
+            .expect("approval command timeout");
+        match cmd {
+            Some(AgentCommand::ResolveToolApproval {
+                request_id,
+                approved,
+            }) => {
+                assert_eq!(request_id, "call_1");
+                assert!(approved);
+            }
+            other => panic!("expected ResolveToolApproval, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn post_tool_approval_returns_404_for_unknown_session() {
+        let (app, _reg, _rx) = make_app().await;
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!(
+                        "/api/sessions/{}/tool-approvals/call_1",
+                        SessionId::new_v4()
+                    ))
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"approved":true}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn post_tool_approval_returns_410_on_dead_session() {
+        let (app, registry, mut rx) = make_app().await;
+        let (_, id, handles) = create_via_router(app.clone(), &mut rx).await;
+
+        drop(handles);
+        for _ in 0..50 {
+            if !registry.get(id).unwrap().is_alive() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/sessions/{id}/tool-approvals/call_1"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"approved":true}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::GONE);
     }
 
     #[tokio::test]

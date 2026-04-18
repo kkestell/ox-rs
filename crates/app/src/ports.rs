@@ -35,6 +35,7 @@ pub trait SecretStore {
 }
 
 pub trait FileSystem: Send + Sync {
+    fn canonicalize(&self, path: &Path) -> impl Future<Output = Result<PathBuf>> + Send;
     fn read(&self, path: &Path) -> impl Future<Output = Result<String>> + Send;
     fn write(&self, path: &Path, content: &str) -> impl Future<Output = Result<()>> + Send;
 

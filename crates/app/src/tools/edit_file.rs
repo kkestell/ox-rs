@@ -36,6 +36,7 @@ use serde::Deserialize;
 
 use super::hashlines::{Anchor, parse_anchor, split_lines, verify_anchor};
 use super::{Tool, display_path, require_non_empty, resolve_path};
+use crate::approval::{ApprovalRequirement, MissingPathPolicy, path_approval_requirement};
 use crate::ports::FileSystem;
 use crate::stream::ToolDef;
 
@@ -154,6 +155,24 @@ impl<F: FileSystem + Send + Sync + 'static> Tool for EditFileTool<F> {
                 "required": ["file_path", "edits"]
             }),
         }
+    }
+
+    fn approval_requirement<'a>(
+        &'a self,
+        args: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<ApprovalRequirement>> + Send + 'a>> {
+        Box::pin(async move {
+            let parsed: EditArgs =
+                serde_json::from_str(args).context("edit_file: invalid JSON arguments")?;
+            require_non_empty("file_path", &parsed.file_path)?;
+            path_approval_requirement(
+                self.fs.as_ref(),
+                &self.workspace_root,
+                &parsed.file_path,
+                MissingPathPolicy::MustExist,
+            )
+            .await
+        })
     }
 
     fn execute<'a>(
@@ -794,5 +813,35 @@ mod tests {
         t.execute(&args).await.unwrap();
         let out = fs.get(Path::new("/ws/f.txt")).unwrap();
         assert_eq!(out, "ALPHA\nbeta"); // No trailing newline introduced.
+    }
+
+    #[tokio::test]
+    async fn approval_not_required_for_file_under_workspace() {
+        let fs = Arc::new(FakeFileSystem::new());
+        fs.insert("/ws/f.txt", "content\n");
+        let t = tool(fs, "/ws");
+        let requirement = t
+            .approval_requirement(r#"{"file_path":"f.txt","edits":[{"op":"replace","start":"1:abc","end":"1:abc","content":"X"}]}"#)
+            .await
+            .unwrap();
+        assert_eq!(
+            requirement,
+            crate::approval::ApprovalRequirement::NotRequired
+        );
+    }
+
+    #[tokio::test]
+    async fn approval_required_for_file_outside_workspace() {
+        let fs = Arc::new(FakeFileSystem::new());
+        fs.insert("/other/f.txt", "content\n");
+        let t = tool(fs, "/ws");
+        let requirement = t
+            .approval_requirement(r#"{"file_path":"../other/f.txt","edits":[{"op":"replace","start":"1:abc","end":"1:abc","content":"X"}]}"#)
+            .await
+            .unwrap();
+        assert!(matches!(
+            requirement,
+            crate::approval::ApprovalRequirement::Required { .. }
+        ));
     }
 }
