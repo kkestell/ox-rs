@@ -15,7 +15,6 @@
   <template id="session-template">
     <section class="session">
       <div class="session-header">
-        <span class="session-id"></span>
         <div class="session-actions">
           <button class="cancel" type="button" hidden>Cancel</button>
           <button class="close" type="button" aria-label="Close session">&times;</button>
@@ -24,8 +23,7 @@
       <div class="transcript"></div>
       <div class="banner" hidden></div>
       <form class="composer">
-        <textarea placeholder="Type a message. Ctrl+Enter to send." rows="3"></textarea>
-        <button type="submit">Send</button>
+        <textarea rows="3"></textarea>
       </form>
     </section>
   </template>

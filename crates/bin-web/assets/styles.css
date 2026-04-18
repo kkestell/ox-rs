@@ -98,7 +98,7 @@ button:disabled {
 .session-header {
   display: flex;
   align-items: center;
-  justify-content: space-between;
+  justify-content: flex-end;
   padding: 6px 10px;
   border-bottom: 1px solid var(--border);
   font-family: var(--font-mono);
@@ -107,8 +107,6 @@ button:disabled {
 }
 
 .session-actions { display: flex; gap: 6px; }
-
-.session-id { user-select: all; }
 
 .transcript {
   flex: 1 1 auto;

@@ -161,6 +161,16 @@ impl SessionRegistry {
         sessions.remove(&id).is_some()
     }
 
+    /// Drop every session. Used by the graceful-shutdown hook: dropping
+    /// each `ActiveSession` drops its broadcast `Sender`, which causes
+    /// the follow half of every live SSE stream to terminate, which
+    /// lets `axum::serve(..).with_graceful_shutdown(..)` finish instead
+    /// of hanging on those long-lived responses forever.
+    pub fn shutdown(&self) {
+        let mut sessions = self.sessions.write().expect("sessions lock poisoned");
+        sessions.clear();
+    }
+
     /// Look up a session by id, bumping its `Arc` count for the
     /// handler's lifetime.
     pub fn get(&self, id: SessionId) -> Option<Arc<ActiveSession>> {

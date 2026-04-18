@@ -178,8 +178,15 @@ async fn run(cli: Cli) -> Result<()> {
         eprintln!("ox: could not open browser ({err:#}); visit {url} manually");
     }
 
+    // Graceful shutdown: wait for the signal, then tear down every
+    // live session so their broadcast senders drop. Without this step,
+    // axum waits forever on the open SSE response bodies.
+    let registry_for_shutdown = registry.clone();
     axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
+        .with_graceful_shutdown(async move {
+            shutdown_signal().await;
+            registry_for_shutdown.shutdown();
+        })
         .await
         .context("axum serve")?;
 

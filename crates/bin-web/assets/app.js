@@ -170,12 +170,10 @@ function mountSession(id, model, size) {
     id,
     model,
     root: node,
-    header: node.querySelector(".session-id"),
     transcript: node.querySelector(".transcript"),
     banner: node.querySelector(".banner"),
     composer: node.querySelector(".composer"),
     textarea: node.querySelector("textarea"),
-    sendButton: node.querySelector(".composer button[type=submit]"),
     cancelButton: node.querySelector(".cancel"),
     closeButton: node.querySelector(".close"),
     eventSource: null,
@@ -184,14 +182,16 @@ function mountSession(id, model, size) {
     turning: false,
     ended: false,
   };
-  sess.header.textContent = id;
 
   sess.composer.addEventListener("submit", (ev) => {
     ev.preventDefault();
     sendMessage(sess);
   });
   sess.textarea.addEventListener("keydown", (ev) => {
-    if (ev.key === "Enter" && (ev.ctrlKey || ev.metaKey)) {
+    // Enter sends; Shift+Enter falls through to the default textarea
+    // behavior so the user gets a newline. We ignore Ctrl/Meta+Enter
+    // too — Enter alone is the only send key now.
+    if (ev.key === "Enter" && !ev.shiftKey && !ev.ctrlKey && !ev.metaKey) {
       ev.preventDefault();
       sendMessage(sess);
     }
@@ -233,9 +233,6 @@ function openStream(sess) {
 
 function applyEvent(sess, event) {
   switch (event.type) {
-    case "ready":
-      sess.header.textContent = event.session_id;
-      break;
     case "message_appended":
       // A committed message supersedes the in-progress draft for this turn:
       // drop the draft, then render the authoritative content.
@@ -445,8 +442,24 @@ async function closeSession(sess) {
   if (sess.eventSource) sess.eventSource.close();
   sess.root.remove();
   state.sessions.delete(sess.id);
+  // Flex is relative, so remaining panes already re-share the row —
+  // but their old fractions can leave very narrow remainders when the
+  // closed pane was large. Rebalance so the row always looks even
+  // after a close.
+  const remaining = [...document.querySelectorAll(".session")];
+  if (remaining.length > 0) {
+    const share = 1 / remaining.length;
+    for (const p of remaining) p.style.flex = `${share} 1 0`;
+  }
   renderGutters();
   putLayout();
+  // The close button we just clicked is gone, so focus fell to the
+  // document. Put it on a live textarea so the user can keep typing.
+  const next = remaining.find((p) => {
+    const ta = p.querySelector("textarea");
+    return ta && !ta.disabled;
+  });
+  if (next) next.querySelector("textarea").focus();
 }
 
 async function onNewSession() {
@@ -477,7 +490,6 @@ async function onNewSession() {
 function setComposerEnabled(sess, enabled) {
   if (sess.ended) return;
   sess.textarea.disabled = !enabled;
-  sess.sendButton.disabled = !enabled;
   sess.cancelButton.hidden = enabled;
 }
 
@@ -508,7 +520,6 @@ function markSessionEnded(sess) {
   }
   sess.root.classList.add("ended");
   sess.textarea.disabled = true;
-  sess.sendButton.disabled = true;
   sess.cancelButton.hidden = true;
   // `closeButton` stays enabled — the user needs a way to dismiss the pane.
 }
