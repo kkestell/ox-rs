@@ -24,6 +24,10 @@ pub trait SessionStore {
     fn load(&self, id: SessionId) -> impl Future<Output = Result<Session>> + Send;
     fn save(&self, session: &Session) -> impl Future<Output = Result<()>> + Send;
     fn list(&self) -> impl Future<Output = Result<Vec<SessionSummary>>> + Send;
+    /// Remove a session's on-disk record. Missing sessions are treated as
+    /// success so callers can invoke `delete` idempotently during merge /
+    /// abandon flows without having to race a concurrent removal.
+    fn delete(&self, id: SessionId) -> impl Future<Output = Result<()>> + Send;
 }
 
 pub trait SecretStore {

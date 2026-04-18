@@ -89,7 +89,12 @@ impl<L: LlmProvider, S: SessionStore> SessionRunner<L, S> {
         cancel: CancelToken,
         on_event: impl FnMut(TurnEvent<'_>) + Send,
     ) -> Result<TurnOutcome> {
-        let mut session = Session::new(id, workspace_root);
+        // The agent's `workspace_root` CLI argument is its CWD, which is
+        // the session's worktree path for worktree-backed sessions. The
+        // agent has no separate knowledge of the main repository root —
+        // only the host (which tracks it via `WorkspaceContext`) does — so
+        // both `Session` fields are populated from the same value here.
+        let mut session = Session::new(id, workspace_root.clone(), workspace_root);
         self.run_turn(&mut session, input, cancel, on_event).await
     }
 
@@ -291,7 +296,7 @@ mod tests {
         let store = FakeSessionStore::new();
 
         let id = SessionId::new_v4();
-        let mut existing = Session::new(id, "/project".into());
+        let mut existing = Session::new(id, "/project".into(), "/project".into());
         existing.push_message(Message::user("turn 1"));
         existing.push_message(Message::assistant(vec![ContentBlock::Text {
             text: "response 1".into(),

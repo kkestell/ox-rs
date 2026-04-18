@@ -106,7 +106,9 @@ mod tests {
     use crate::registry::SessionRegistry;
     use crate::routes::router;
     use crate::state::AppState;
-    use crate::test_support::{AgentHandles, DuplexSpawner, empty_layout, unique_temp_dir};
+    use crate::test_support::{
+        AgentHandles, DuplexSpawner, empty_layout, test_lifecycle, unique_temp_dir,
+    };
 
     async fn make_app() -> (
         Router,
@@ -121,6 +123,7 @@ mod tests {
             model: "sse/test".into(),
             sessions_dir: std::path::PathBuf::from("/nonexistent/sessions"),
             resume: None,
+            session_id: None,
             env: vec![],
         };
         let registry = SessionRegistry::new(
@@ -128,9 +131,14 @@ mod tests {
             spawn_config,
             empty_layout(),
             workspace_root.clone(),
+            std::sync::Arc::new(agent_host::fake::NoopCloseRequestSink),
+            std::sync::Arc::new(agent_host::fake::NoopFirstTurnSink),
         );
+        let lifecycle = test_lifecycle();
+        lifecycle.set_registry(std::sync::Arc::downgrade(&registry));
         let app = router(AppState {
             registry: registry.clone(),
+            lifecycle,
         });
         (app, registry, rx)
     }
@@ -149,7 +157,13 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        let id = SessionId::new_v4();
+        // Use the lifecycle-preallocated id — the wire contract is that
+        // a fresh agent launched with `--session-id <id>` reports that
+        // id in its Ready frame.
+        let id = handles
+            .config
+            .session_id
+            .expect("lifecycle pre-allocates session id on fresh spawn");
         handles.send_ready(id).await;
         let resp = timeout(Duration::from_secs(2), svc).await.unwrap().unwrap();
         let bytes = resp.into_body().collect().await.unwrap().to_bytes();
@@ -351,12 +365,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sse_closes_when_session_is_deleted() {
-        // Plan: "DELETE triggers explicit 'session ended' shutdown of
-        // any live EventSource." Our wire-level proxy for that is:
-        // deleting the session drops its `ActiveSession`, which drops
-        // the broadcast sender, which terminates the follow stream.
-        let (app, _registry, mut rx) = make_app().await;
+    async fn sse_closes_when_session_is_removed_from_registry() {
+        // The invariant this test exercises: when a session is dropped
+        // from the registry (by any code path — a successful merge, a
+        // force abandon, or the graceful-shutdown hook), its
+        // `ActiveSession` is dropped, which drops the broadcast sender,
+        // which terminates every live `EventSource` stream.
+        //
+        // We call `registry.remove` directly rather than routing through
+        // HTTP. The merge/abandon handlers' full matrix is covered in
+        // `routes.rs::tests`; here we care only about the SSE lifecycle.
+        let (app, registry, mut rx) = make_app().await;
         let (id, _handles) = create_and_send_ready(app.clone(), &mut rx).await;
 
         let resp = app
@@ -374,22 +393,12 @@ mod tests {
             .await
             .expect("ready");
 
-        // Delete the session. The follow stream should end soon after.
-        let del = app
-            .oneshot(
-                Request::builder()
-                    .method("DELETE")
-                    .uri(format!("/api/sessions/{id}"))
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(del.status(), StatusCode::NO_CONTENT);
+        // Drop the session from the registry. The follow stream must
+        // terminate shortly after — a stuck subscriber would hang until
+        // keep-alive fires, which is fine for a network hiccup but a
+        // bug for an explicit session teardown.
+        assert!(registry.remove(id));
 
-        // The next event should be None (stream closed) within a short
-        // window. A stuck subscriber would hang until keep-alive fires,
-        // which is fine for a proxy but a bug for a real DELETE.
         let closed = timeout(Duration::from_secs(2), next_sse_event(&mut body)).await;
         match closed {
             Ok(None) => {}

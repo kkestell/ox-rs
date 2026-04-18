@@ -235,6 +235,14 @@ impl SessionStore for FakeSessionStore {
             .collect();
         Ok(summaries)
     }
+
+    async fn delete(&self, id: SessionId) -> Result<()> {
+        // Mirrors `DiskSessionStore::delete`: removing a missing id is a
+        // success so tests can exercise idempotent delete paths without
+        // having to probe for existence first.
+        self.sessions.lock().unwrap().remove(&id);
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -606,7 +614,7 @@ mod tests {
     async fn store_save_load_roundtrip() {
         let store = FakeSessionStore::new();
         let id = SessionId::new_v4();
-        let mut session = Session::new(id, "/tmp/project".into());
+        let mut session = Session::new(id, "/tmp/project".into(), "/tmp/project/wt".into());
         session.push_message(Message::user("hello"));
 
         store.save(&session).await.unwrap();
@@ -614,6 +622,7 @@ mod tests {
 
         assert_eq!(loaded.id, id);
         assert_eq!(loaded.workspace_root.to_str().unwrap(), "/tmp/project");
+        assert_eq!(loaded.worktree_path.to_str().unwrap(), "/tmp/project/wt");
         assert_eq!(loaded.messages.len(), 1);
         assert_eq!(loaded.messages[0].text(), "hello");
     }
@@ -630,16 +639,32 @@ mod tests {
         let store = FakeSessionStore::new();
 
         let id1 = SessionId::new_v4();
-        let s1 = Session::new(id1, "/a".into());
+        let s1 = Session::new(id1, "/a".into(), "/a/wt1".into());
         store.save(&s1).await.unwrap();
 
         let id2 = SessionId::new_v4();
-        let s2 = Session::new(id2, "/b".into());
+        let s2 = Session::new(id2, "/b".into(), "/b/wt2".into());
         store.save(&s2).await.unwrap();
 
         let summaries = store.list().await.unwrap();
         assert_eq!(summaries.len(), 2);
         assert!(summaries.iter().any(|s| s.id == id1));
         assert!(summaries.iter().any(|s| s.id == id2));
+    }
+
+    #[tokio::test]
+    async fn store_delete_removes_and_is_idempotent() {
+        let store = FakeSessionStore::new();
+        let id = SessionId::new_v4();
+        let session = Session::new(id, "/a".into(), "/a/wt".into());
+        store.save(&session).await.unwrap();
+
+        store.delete(id).await.unwrap();
+        assert!(store.load(id).await.is_err(), "loaded a deleted session");
+
+        // Second delete of the same id succeeds — matches the port contract.
+        store.delete(id).await.unwrap();
+        // Deleting an id that was never inserted also succeeds.
+        store.delete(SessionId::new_v4()).await.unwrap();
     }
 }

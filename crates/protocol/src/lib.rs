@@ -18,7 +18,7 @@
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
-use domain::{Message, SessionId, StreamEvent};
+use domain::{CloseIntent, Message, SessionId, StreamEvent};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 
@@ -86,6 +86,13 @@ pub enum AgentEvent {
     /// Fatal error for the current turn (or, pre-`Ready`, for startup).
     /// No `TurnComplete` follows.
     Error { message: String },
+    /// The agent has executed a lifecycle tool (`merge` or `abandon`) and
+    /// is now requesting that the host close the session. Emitted by the
+    /// driver immediately after the turn's terminal frame; the agent exits
+    /// its command loop right after, so the host sees EOF on stdout next.
+    /// Not user-visible — the host's pump routes this to a
+    /// `CloseRequestSink`, not to the session's broadcast channel.
+    RequestClose { intent: CloseIntent },
 }
 
 // ---------------------------------------------------------------------------
@@ -323,6 +330,28 @@ mod tests {
             message: "stream interrupted".into(),
         });
         assert_eq!(json, r#"{"type":"error","message":"stream interrupted"}"#);
+    }
+
+    #[test]
+    fn roundtrip_request_close_merge() {
+        let json = roundtrip_json(AgentEvent::RequestClose {
+            intent: CloseIntent::Merge,
+        });
+        assert_eq!(
+            json,
+            r#"{"type":"request_close","intent":{"kind":"merge"}}"#
+        );
+    }
+
+    #[test]
+    fn roundtrip_request_close_abandon_with_confirm() {
+        let json = roundtrip_json(AgentEvent::RequestClose {
+            intent: CloseIntent::Abandon { confirm: true },
+        });
+        assert_eq!(
+            json,
+            r#"{"type":"request_close","intent":{"kind":"abandon","confirm":true}}"#
+        );
     }
 
     // -- write_frame / read_frame round-trip --------------------------------

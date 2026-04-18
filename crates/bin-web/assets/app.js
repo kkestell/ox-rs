@@ -175,7 +175,8 @@ function mountSession(id, model, size) {
     composer: node.querySelector(".composer"),
     textarea: node.querySelector("textarea"),
     cancelButton: node.querySelector(".cancel"),
-    closeButton: node.querySelector(".close"),
+    mergeButton: node.querySelector(".merge"),
+    abandonButton: node.querySelector(".abandon"),
     eventSource: null,
     accumulator: null,
     streamingEl: null,
@@ -197,7 +198,8 @@ function mountSession(id, model, size) {
     }
   });
   sess.cancelButton.addEventListener("click", () => cancelTurn(sess));
-  sess.closeButton.addEventListener("click", () => closeSession(sess));
+  sess.mergeButton.addEventListener("click", () => mergeSession(sess));
+  sess.abandonButton.addEventListener("click", () => abandonSession(sess));
 
   document.getElementById("sessions").appendChild(node);
   state.sessions.set(id, sess);
@@ -433,19 +435,150 @@ async function cancelTurn(sess) {
   }
 }
 
-async function closeSession(sess) {
+// Merge the session's branch into main and tear down the pane.
+//
+// On 204 the server has already removed the session from the registry and
+// torn down the worktree / branch — the pane is stale so we dismiss it.
+// 404 means the session was already gone server-side (another client closed
+// it, or the agent crashed and the lifecycle reaped it); we still dismiss.
+// 409 responses carry a `reason` field that names which precondition failed
+// (dirty worktree, dirty main, merge conflict, turn in progress, already
+// closing); we surface those inline so the user can resolve them and retry.
+async function mergeSession(sess) {
+  setCloseButtonsDisabled(sess, true);
+  clearBanner(sess);
+  let res;
   try {
-    await fetch(`/api/sessions/${sess.id}`, { method: "DELETE" });
+    res = await fetch(`/api/sessions/${sess.id}/merge`, { method: "POST" });
   } catch (err) {
-    console.error("ox: close failed", err);
+    setCloseButtonsDisabled(sess, false);
+    showBanner(sess, `merge failed: ${err}`);
+    return;
   }
+  if (res.status === 204 || res.status === 404) {
+    dismissPane(sess);
+    return;
+  }
+  if (res.status === 409) {
+    const reason = await readReason(res);
+    setCloseButtonsDisabled(sess, false);
+    showBanner(sess, `merge refused: ${reasonMessage(reason)}`);
+    return;
+  }
+  setCloseButtonsDisabled(sess, false);
+  showBanner(sess, `merge failed: HTTP ${res.status}`);
+}
+
+// Abandon the session's branch, discarding its work, and tear down the pane.
+//
+// The first request omits `confirm` so the server will reject a dirty
+// worktree with 409 `{reason: "uncommitted_changes", requires_confirmation:
+// true}`. On that specific response we show a native confirm dialog; if the
+// user accepts, we retry with `{confirm: true}`, which tells the server to
+// force-remove the worktree and force-delete the branch. Any other 409
+// (turn in progress, already closing) is surfaced inline and left for the
+// user to resolve.
+async function abandonSession(sess) {
+  setCloseButtonsDisabled(sess, true);
+  clearBanner(sess);
+  let res;
+  try {
+    res = await fetch(`/api/sessions/${sess.id}/abandon`, { method: "POST" });
+  } catch (err) {
+    setCloseButtonsDisabled(sess, false);
+    showBanner(sess, `abandon failed: ${err}`);
+    return;
+  }
+  if (res.status === 204 || res.status === 404) {
+    dismissPane(sess);
+    return;
+  }
+  if (res.status === 409) {
+    const body = await readJsonSafely(res);
+    if (body && body.requires_confirmation === true) {
+      const ok = window.confirm(
+        "This session has uncommitted changes that will be lost. Abandon anyway?",
+      );
+      if (!ok) {
+        setCloseButtonsDisabled(sess, false);
+        return;
+      }
+      let retry;
+      try {
+        retry = await fetch(`/api/sessions/${sess.id}/abandon`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ confirm: true }),
+        });
+      } catch (err) {
+        setCloseButtonsDisabled(sess, false);
+        showBanner(sess, `abandon failed: ${err}`);
+        return;
+      }
+      if (retry.status === 204 || retry.status === 404) {
+        dismissPane(sess);
+        return;
+      }
+      if (retry.status === 409) {
+        const reason = await readReason(retry);
+        setCloseButtonsDisabled(sess, false);
+        showBanner(sess, `abandon refused: ${reasonMessage(reason)}`);
+        return;
+      }
+      setCloseButtonsDisabled(sess, false);
+      showBanner(sess, `abandon failed: HTTP ${retry.status}`);
+      return;
+    }
+    setCloseButtonsDisabled(sess, false);
+    showBanner(sess, `abandon refused: ${reasonMessage(body && body.reason)}`);
+    return;
+  }
+  setCloseButtonsDisabled(sess, false);
+  showBanner(sess, `abandon failed: HTTP ${res.status}`);
+}
+
+async function readJsonSafely(res) {
+  try {
+    return await res.json();
+  } catch {
+    return null;
+  }
+}
+
+async function readReason(res) {
+  const body = await readJsonSafely(res);
+  return body && body.reason;
+}
+
+// Translate the server's machine-readable reason codes into short phrases
+// suitable for the session banner. Unknown codes pass through so a new
+// rejection variant still surfaces something actionable instead of silent.
+function reasonMessage(reason) {
+  switch (reason) {
+    case "worktree_dirty":
+    case "uncommitted_changes":
+      return "worktree has uncommitted changes";
+    case "main_dirty":
+      return "main branch has uncommitted changes";
+    case "merge_conflict":
+      return "merge conflicts with main";
+    case "turn_in_progress":
+      return "a turn is in progress — cancel it first";
+    case "already_closing":
+      return "already closing";
+    default:
+      return reason ? String(reason) : "unknown reason";
+  }
+}
+
+// Tear down the pane's DOM and client-side state. Called after the server
+// confirms the session is gone (204) or reports it's already gone (404).
+// Rebalances the remaining panes to equal shares — the flex fractions the
+// closed pane was carrying would otherwise leave thin strips on the left.
+function dismissPane(sess) {
   if (sess.eventSource) sess.eventSource.close();
   sess.root.remove();
   state.sessions.delete(sess.id);
-  // Flex is relative, so remaining panes already re-share the row —
-  // but their old fractions can leave very narrow remainders when the
-  // closed pane was large. Rebalance so the row always looks even
-  // after a close.
   const remaining = [...document.querySelectorAll(".session")];
   if (remaining.length > 0) {
     const share = 1 / remaining.length;
@@ -453,13 +586,16 @@ async function closeSession(sess) {
   }
   renderGutters();
   putLayout();
-  // The close button we just clicked is gone, so focus fell to the
-  // document. Put it on a live textarea so the user can keep typing.
   const next = remaining.find((p) => {
     const ta = p.querySelector("textarea");
     return ta && !ta.disabled;
   });
   if (next) next.querySelector("textarea").focus();
+}
+
+function setCloseButtonsDisabled(sess, disabled) {
+  sess.mergeButton.disabled = disabled;
+  sess.abandonButton.disabled = disabled;
 }
 
 async function onNewSession() {
@@ -521,7 +657,9 @@ function markSessionEnded(sess) {
   sess.root.classList.add("ended");
   sess.textarea.disabled = true;
   sess.cancelButton.hidden = true;
-  // `closeButton` stays enabled — the user needs a way to dismiss the pane.
+  // Merge/Abandon stay enabled — the user still needs a way to finalize the
+  // pane even if the agent exited. Merge/Abandon hitting 404 is the normal
+  // dismiss path for an ended session whose server-side entry is already gone.
 }
 
 // ---------------------------------------------------------------------------

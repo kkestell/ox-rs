@@ -1,4 +1,5 @@
 pub mod cancel;
+pub mod lifecycle;
 mod ports;
 pub mod stream;
 pub mod tools;
@@ -8,6 +9,7 @@ mod use_cases;
 pub mod fake;
 
 pub use cancel::CancelToken;
+pub use lifecycle::{AbandonTool, CloseSignal, MergeTool};
 pub use ports::*;
 pub use stream::{Snapshot, StreamAccumulator, ToolDef};
 pub use tools::{

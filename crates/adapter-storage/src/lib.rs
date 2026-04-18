@@ -18,6 +18,31 @@ impl DiskSessionStore {
     fn session_path(&self, id: SessionId) -> PathBuf {
         self.dir.join(format!("{id}.json"))
     }
+
+    /// Load a session iff its file already exists. Returns `Ok(None)` when
+    /// the file is missing — the "session has never been persisted yet"
+    /// case, expected for brand-new sessions that have not had a
+    /// successful `TurnComplete`. Other errors (malformed JSON,
+    /// permission denied, etc.) still surface as `Err`.
+    ///
+    /// The lifecycle coordinator uses this during restore to probe
+    /// whether a layout-row session id has a corresponding on-disk file
+    /// before trying to resume it: if not, the worktree is stale and
+    /// can be cleaned up rather than resumed.
+    pub async fn try_load(&self, id: SessionId) -> Result<Option<Session>> {
+        let path = self.session_path(id);
+        match tokio::fs::read_to_string(&path).await {
+            Ok(data) => {
+                let session: Session = serde_json::from_str(&data)
+                    .with_context(|| format!("failed to deserialize session {id}"))?;
+                Ok(Some(session))
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(err) => {
+                Err(err).with_context(|| format!("failed to read session file {}", path.display()))
+            }
+        }
+    }
 }
 
 impl app::SessionStore for DiskSessionStore {
@@ -69,6 +94,20 @@ impl app::SessionStore for DiskSessionStore {
 
         Ok(summaries)
     }
+
+    async fn delete(&self, id: SessionId) -> Result<()> {
+        let path = self.session_path(id);
+        // `NotFound` is treated as success so the merge / abandon flows
+        // can call `delete` unconditionally without probing the filesystem
+        // first. Any other I/O error surfaces — a permission or disk
+        // problem should not be silently swallowed.
+        match tokio::fs::remove_file(&path).await {
+            Ok(()) => Ok(()),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(err) => Err(err)
+                .with_context(|| format!("failed to delete session file {}", path.display())),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -89,7 +128,7 @@ mod tests {
     /// Build a session containing one message of each role (user, assistant,
     /// tool) to exercise all ContentBlock variants through serialization.
     fn multi_role_session(id: SessionId) -> Session {
-        let mut session = Session::new(id, "/tmp/project".into());
+        let mut session = Session::new(id, "/tmp/project".into(), "/tmp/project/wt".into());
         session.push_message(Message::user("hello"));
         session.push_message(Message::assistant(vec![
             ContentBlock::Text {
@@ -116,6 +155,7 @@ mod tests {
 
         assert_eq!(loaded.id, id);
         assert_eq!(loaded.workspace_root, session.workspace_root);
+        assert_eq!(loaded.worktree_path, session.worktree_path);
         assert_eq!(loaded.messages.len(), 3);
 
         // Verify each message role survived the round-trip.
@@ -145,15 +185,15 @@ mod tests {
         let (store, _tmp) = temp_store();
 
         let id1 = SessionId::new_v4();
-        let s1 = Session::new(id1, "/a".into());
+        let s1 = Session::new(id1, "/a".into(), "/a/wt1".into());
         store.save(&s1).await.unwrap();
 
         let id2 = SessionId::new_v4();
-        let s2 = Session::new(id2, "/b".into());
+        let s2 = Session::new(id2, "/b".into(), "/b/wt2".into());
         store.save(&s2).await.unwrap();
 
         let id3 = SessionId::new_v4();
-        let s3 = Session::new(id3, "/c".into());
+        let s3 = Session::new(id3, "/c".into(), "/c/wt3".into());
         store.save(&s3).await.unwrap();
 
         let summaries = store.list().await.unwrap();
@@ -171,7 +211,7 @@ mod tests {
         let (store, _tmp) = temp_store();
         let id = SessionId::new_v4();
 
-        let mut session = Session::new(id, "/tmp".into());
+        let mut session = Session::new(id, "/tmp".into(), "/tmp/wt".into());
         session.push_message(Message::user("first"));
         store.save(&session).await.unwrap();
 
@@ -190,7 +230,7 @@ mod tests {
 
         // Save a real session so the directory isn't empty.
         let id = SessionId::new_v4();
-        let session = Session::new(id, "/tmp".into());
+        let session = Session::new(id, "/tmp".into(), "/tmp/wt".into());
         store.save(&session).await.unwrap();
 
         // Drop non-json files and a json file with a non-UUID name into the
@@ -234,12 +274,86 @@ mod tests {
     async fn empty_session_round_trips() {
         let (store, _tmp) = temp_store();
         let id = SessionId::new_v4();
-        let session = Session::new(id, "/empty".into());
+        let session = Session::new(id, "/empty".into(), "/empty/wt".into());
 
         store.save(&session).await.unwrap();
         let loaded = store.load(id).await.unwrap();
 
         assert_eq!(loaded.id, id);
         assert!(loaded.messages.is_empty());
+    }
+
+    #[tokio::test]
+    async fn delete_removes_the_file_and_list_no_longer_reports_it() {
+        let (store, _tmp) = temp_store();
+        let id = SessionId::new_v4();
+        let session = Session::new(id, "/proj".into(), "/proj/wt".into());
+        store.save(&session).await.unwrap();
+
+        store.delete(id).await.unwrap();
+
+        // File is gone; list reflects that.
+        let summaries = store.list().await.unwrap();
+        assert!(summaries.iter().all(|s| s.id != id));
+
+        // Loading the same id now errors with a read-file error.
+        assert!(store.load(id).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn delete_missing_session_is_idempotent() {
+        // The port contract says a missing session is a successful delete.
+        // That lets merge / abandon call `delete` without a pre-check.
+        let (store, _tmp) = temp_store();
+        let id = SessionId::new_v4();
+        store
+            .delete(id)
+            .await
+            .expect("delete of unknown id should succeed");
+        // Calling again is also fine.
+        store
+            .delete(id)
+            .await
+            .expect("second delete of unknown id should succeed");
+    }
+
+    #[tokio::test]
+    async fn try_load_returns_none_for_missing_session() {
+        // `try_load` distinguishes "never saved" from "storage error" so
+        // the lifecycle's restore loop can treat a missing file as a stale
+        // layout row rather than a hard failure.
+        let (store, _tmp) = temp_store();
+        let id = SessionId::new_v4();
+        let result = store.try_load(id).await.expect("try_load must not error");
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn try_load_returns_some_for_saved_session() {
+        let (store, _tmp) = temp_store();
+        let id = SessionId::new_v4();
+        let session = Session::new(id, "/p".into(), "/p/wt".into());
+        store.save(&session).await.unwrap();
+
+        let loaded = store
+            .try_load(id)
+            .await
+            .expect("try_load ok")
+            .expect("some session");
+        assert_eq!(loaded.id, id);
+    }
+
+    #[tokio::test]
+    async fn try_load_surfaces_malformed_body_as_error() {
+        // A file that exists but whose body is unparseable should produce
+        // an error — not silently look like "missing". The caller wants
+        // to know the difference: "no file yet" is normal, "corrupt file"
+        // is a real bug to surface.
+        let (store, tmp) = temp_store();
+        let id = SessionId::new_v4();
+        std::fs::write(tmp.path().join(format!("{id}.json")), "{ not json").unwrap();
+
+        let err = store.try_load(id).await.unwrap_err();
+        assert!(err.to_string().contains("deserialize"), "{err}");
     }
 }

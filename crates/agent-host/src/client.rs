@@ -37,6 +37,12 @@ pub struct AgentSpawnConfig {
     pub sessions_dir: PathBuf,
     /// Optional session to resume. `None` starts a fresh session.
     pub resume: Option<SessionId>,
+    /// Pre-allocated session id for a **fresh** session. When set and
+    /// `resume` is `None`, the agent uses this id instead of generating
+    /// one — keeping the host-controlled worktree directory (named after
+    /// the id's short prefix) and the agent's `{id}.json` in lockstep.
+    /// Ignored when `resume` is set.
+    pub session_id: Option<SessionId>,
     /// Extra environment variables. Inherited-by-default env vars (like PATH)
     /// are not cleared; these are merged on top. Used primarily to pass
     /// `OPENROUTER_API_KEY` into the child process without inheriting the
@@ -117,6 +123,10 @@ impl AgentClient {
             .arg(&config.sessions_dir);
         if let Some(id) = config.resume {
             cmd.arg("--resume").arg(id.to_string());
+        } else if let Some(id) = config.session_id {
+            // `--session-id` is only meaningful for fresh sessions —
+            // `--resume` already carries the id there.
+            cmd.arg("--session-id").arg(id.to_string());
         }
         for (k, v) in &config.env {
             cmd.env(k, v);

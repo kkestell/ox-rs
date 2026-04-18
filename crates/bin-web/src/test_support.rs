@@ -16,13 +16,18 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use agent_host::{AgentClient, AgentEventStream, AgentSpawnConfig, AgentSpawner, LayoutStore};
+use adapter_storage::DiskSessionStore;
+use agent_host::{
+    AgentClient, AgentEventStream, AgentSpawnConfig, AgentSpawner, LayoutStore, WorkspaceContext,
+    fake::{FakeGit, FakeSlugGenerator, NoopCloseRequestSink, NoopFirstTurnSink},
+};
 use anyhow::{Result, anyhow};
 use domain::SessionId;
 use protocol::{AgentCommand, AgentEvent, read_frame, write_frame};
 use tokio::io::{BufReader, DuplexStream, duplex};
 use tokio::sync::mpsc;
 
+use crate::lifecycle::SessionLifecycle;
 use crate::registry::SessionRegistry;
 
 /// Handles the test side holds after a spawn: the bytes headed to the
@@ -126,9 +131,17 @@ pub async fn test_registry(
         model: "test/model".into(),
         sessions_dir: PathBuf::from("/nonexistent/sessions"),
         resume: None,
+        session_id: None,
         env: vec![],
     };
-    let registry = SessionRegistry::new(spawner, spawn_config, layout, workspace_root.clone());
+    let registry = SessionRegistry::new(
+        spawner,
+        spawn_config,
+        layout,
+        workspace_root.clone(),
+        Arc::new(NoopCloseRequestSink),
+        Arc::new(NoopFirstTurnSink),
+    );
     (registry, rx, workspace_root)
 }
 
@@ -152,4 +165,39 @@ pub fn unique_temp_dir(label: &str) -> PathBuf {
 pub fn empty_layout() -> LayoutStore {
     let path = unique_temp_dir("layout").join("workspaces.json");
     LayoutStore::load(path).expect("empty LayoutStore")
+}
+
+/// Build a [`SessionLifecycle`] whose workspace root matches the
+/// caller's registry. The returned `FakeGit` is the one the lifecycle
+/// holds as `Arc<dyn Git>`, so tests can script statuses / merge
+/// outcomes via its setters and assert on the `calls()` log.
+/// Likewise, the returned `DiskSessionStore` is the same `Arc` the
+/// lifecycle uses — tests seed sessions with its `save()` method so
+/// the merge/abandon flow can find their worktree paths via `try_load`.
+///
+/// `workspace_root` must equal the registry's own workspace root; the
+/// lifecycle's merge flow calls `git.status` / `git.remove_worktree`
+/// relative to it and uses it as the main-repo target of `git.merge`.
+pub fn test_lifecycle_for_workspace(
+    workspace_root: PathBuf,
+) -> (Arc<SessionLifecycle>, Arc<FakeGit>, Arc<DiskSessionStore>) {
+    let sessions_dir = unique_temp_dir("lifecycle-sessions");
+    let store = Arc::new(DiskSessionStore::new(&sessions_dir).expect("disk session store"));
+    let git = Arc::new(FakeGit::new());
+    let lifecycle = SessionLifecycle::new(
+        git.clone(),
+        Arc::new(FakeSlugGenerator::new()),
+        store.clone(),
+        WorkspaceContext::new(workspace_root, "main".to_owned()),
+    );
+    (lifecycle, git, store)
+}
+
+/// Convenience wrapper for tests that don't care about the fakes or the
+/// workspace root — they just need *some* lifecycle to complete an
+/// `AppState`. Uses a scratch workspace root under tempdir.
+pub fn test_lifecycle() -> Arc<SessionLifecycle> {
+    let workspace_root = unique_temp_dir("lifecycle-ws");
+    let (lifecycle, _git, _store) = test_lifecycle_for_workspace(workspace_root);
+    lifecycle
 }

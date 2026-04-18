@@ -12,12 +12,25 @@
 //! deltas into a renderable message snapshot.
 
 mod client;
+mod close_request_sink;
+pub mod fake;
+mod first_turn_sink;
+mod git;
 mod layout;
+mod paths;
 mod session_runtime;
+mod slug_generator;
 mod spawner;
+mod workspace_context;
 
 pub use app::StreamAccumulator;
 pub use client::{AgentClient, AgentEventStream, AgentSpawnConfig};
+pub use close_request_sink::CloseRequestSink;
+pub use first_turn_sink::FirstTurnSink;
+pub use git::{Git, MergeOutcome, WorktreeStatus};
 pub use layout::{Layout, LayoutStore, normalize_sizes};
+pub use paths::workspace_slug;
 pub use session_runtime::{SessionRuntime, ShouldSend, apply_event, begin_send};
+pub use slug_generator::SlugGenerator;
 pub use spawner::{AgentSpawner, ProcessSpawner};
+pub use workspace_context::WorkspaceContext;

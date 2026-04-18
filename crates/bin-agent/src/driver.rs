@@ -23,9 +23,12 @@
 
 use std::collections::VecDeque;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use anyhow::Result;
-use app::{CancelToken, LlmProvider, SessionRunner, SessionStore, TurnEvent, TurnOutcome};
+use app::{
+    CancelToken, CloseSignal, LlmProvider, SessionRunner, SessionStore, TurnEvent, TurnOutcome,
+};
 use domain::SessionId;
 use protocol::{AgentCommand, AgentEvent, read_frame, write_frame};
 use tokio::io::{AsyncBufRead, AsyncWrite};
@@ -42,10 +45,23 @@ enum ReaderEvent {
 /// `reader` yields `AgentCommand` frames; `writer` receives `AgentEvent`
 /// frames. The function returns when the reader hits EOF or a non-recoverable
 /// error occurs.
+///
+/// `session_id` is the host's pre-allocated id for a **fresh** session. When
+/// `resume` is `None` and `session_id` is `Some`, the agent uses it verbatim
+/// so the host's worktree directory, `ox/<slug>` branch, and `{id}.json`
+/// file all share one identifier. When both are `None` (ad-hoc CLI runs),
+/// a new id is generated locally.
+///
+/// `close_signal` is shared with the lifecycle tools (`MergeTool`,
+/// `AbandonTool`). The driver takes it after each terminal frame; on
+/// `Some(intent)` it emits `AgentEvent::RequestClose { intent }` and exits
+/// the command loop so the host sees a clean EOF on stdout.
 pub async fn agent_driver<L, S, R, W>(
     runner: &SessionRunner<L, S>,
     workspace_root: PathBuf,
     resume: Option<SessionId>,
+    session_id: Option<SessionId>,
+    close_signal: Arc<CloseSignal>,
     mut reader: R,
     mut writer: W,
 ) -> Result<()>
@@ -63,7 +79,7 @@ where
     // live turn messages.
     let (session_id, historical_messages) = match resume {
         Some(id) => (id, runner.load_history(id).await?),
-        None => (SessionId::new_v4(), Vec::new()),
+        None => (session_id.unwrap_or_else(SessionId::new_v4), Vec::new()),
     };
 
     // --- Step 2: Handshake. -----------------------------------------------
@@ -224,6 +240,17 @@ where
                         .await?;
                     }
                 }
+
+                // Drain the close signal *after* every terminal frame so
+                // `RequestClose` always trails a clean `TurnComplete` /
+                // `TurnCancelled` / `Error`. The host never has to reason
+                // about a mid-turn close. On `Some`, emit one
+                // `RequestClose` and exit the loop; the agent's stdout
+                // closes on return, which the pump observes as EOF.
+                if let Some(intent) = close_signal.take() {
+                    write_frame(&mut writer, &AgentEvent::RequestClose { intent }).await?;
+                    return Ok(());
+                }
             }
             AgentCommand::Cancel => {
                 // Cancel outside a turn — nothing to do. Silently ignore
@@ -355,10 +382,13 @@ mod tests {
 
         let handle = tokio::spawn(async move {
             let runner = SessionRunner::new(llm, store, tools, String::new());
+            let close_signal = Arc::new(CloseSignal::new());
             agent_driver(
                 &runner,
                 PathBuf::from("/test/workspace"),
                 resume,
+                None,
+                close_signal,
                 BufReader::new(cmd_drv),
                 evt_drv,
             )
@@ -454,7 +484,11 @@ mod tests {
     #[tokio::test]
     async fn resume_replays_history_in_order_after_ready() {
         let id = SessionId::new_v4();
-        let mut seeded = Session::new(id, PathBuf::from("/test/workspace"));
+        let mut seeded = Session::new(
+            id,
+            PathBuf::from("/test/workspace"),
+            PathBuf::from("/test/workspace"),
+        );
         seeded.push_message(Message::user("old 1"));
         seeded.push_message(Message::user("old 2"));
 
@@ -952,6 +986,243 @@ mod tests {
             ),
             "expected TurnComplete or TurnCancelled, got {terminator:?}"
         );
+
+        drop(cmd_tx);
+        handle.await.unwrap().unwrap();
+    }
+
+    // -- close-signal drain ------------------------------------------------
+    //
+    // The driver takes `close_signal` after every terminal frame. On
+    // `Some(intent)` it writes one `RequestClose` frame and exits the
+    // command loop — the agent's stdout closes on return, which the pump
+    // observes as a clean EOF and uses to tear the session down. These
+    // tests exercise the three corners of that contract: signal untouched,
+    // signal set by a tool during the turn, and signal set before the
+    // turn even begins.
+
+    /// Spawn the driver with a pre-built `Arc<CloseSignal>` that the test
+    /// retains a handle to. Lets the test inspect or preset the signal,
+    /// and share it with fake tools registered on the registry.
+    fn spawn_driver_with_signal(
+        llm: FakeLlmProvider,
+        store: FakeSessionStore,
+        tools: ToolRegistry,
+        close_signal: Arc<CloseSignal>,
+    ) -> (
+        tokio::io::DuplexStream,
+        BufReader<tokio::io::DuplexStream>,
+        tokio::task::JoinHandle<Result<()>>,
+    ) {
+        let (cmd_test, cmd_drv) = duplex(64 * 1024);
+        let (evt_drv, evt_test) = duplex(64 * 1024);
+
+        let handle = tokio::spawn(async move {
+            let runner = SessionRunner::new(llm, store, tools, String::new());
+            agent_driver(
+                &runner,
+                PathBuf::from("/test/workspace"),
+                None,
+                None,
+                close_signal,
+                BufReader::new(cmd_drv),
+                evt_drv,
+            )
+            .await
+        });
+
+        (cmd_test, BufReader::new(evt_test), handle)
+    }
+
+    #[tokio::test]
+    async fn no_close_signal_means_driver_keeps_looping_after_turn_complete() {
+        // Regression guard for the drain check: an unset signal must leave
+        // `take()` as `None`, the loop must continue, and no `RequestClose`
+        // frame must reach the wire. Two back-to-back turns on the same
+        // driver prove both halves.
+        let llm = FakeLlmProvider::new();
+        llm.push_text("first");
+        llm.push_text("second");
+        let store = FakeSessionStore::new();
+        let signal = Arc::new(CloseSignal::new());
+
+        let (mut cmd_tx, mut evt_rx, handle) =
+            spawn_driver_with_signal(llm, store, ToolRegistry::new(), signal.clone());
+        let _ = expect_ready(&mut evt_rx).await;
+
+        write_frame(
+            &mut cmd_tx,
+            &AgentCommand::SendMessage {
+                input: "one".into(),
+            },
+        )
+        .await
+        .unwrap();
+        let (_, term1) = drain_turn(&mut evt_rx).await;
+        assert!(matches!(term1, Some(AgentEvent::TurnComplete)));
+
+        // Second turn proves the loop did not exit after the first
+        // TurnComplete even though the drain fired.
+        write_frame(
+            &mut cmd_tx,
+            &AgentCommand::SendMessage {
+                input: "two".into(),
+            },
+        )
+        .await
+        .unwrap();
+        let (_, term2) = drain_turn(&mut evt_rx).await;
+        assert!(matches!(term2, Some(AgentEvent::TurnComplete)));
+
+        assert!(
+            signal.take().is_none(),
+            "no tool set the signal, so the driver should have taken None each time"
+        );
+
+        drop(cmd_tx);
+        handle.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn tool_setting_signal_mid_turn_emits_request_close_after_terminal_frame() {
+        // Wire a real `MergeTool` to the shared signal. The LLM issues a
+        // `merge` tool call; the loop executes it (setting the signal),
+        // loops back for a final text response, terminates the turn, then
+        // drains the signal and emits `RequestClose { Merge }` before exit.
+        use app::MergeTool;
+
+        let llm = FakeLlmProvider::new();
+        llm.push_tool_call("call_1", "merge", "{}");
+        llm.push_text("done");
+        let store = FakeSessionStore::new();
+        let signal = Arc::new(CloseSignal::new());
+
+        let merge_tool = Arc::new(MergeTool::new(signal.clone())) as Arc<dyn Tool>;
+        let tools = tool_registry_with(vec![merge_tool]);
+
+        let (mut cmd_tx, mut evt_rx, handle) =
+            spawn_driver_with_signal(llm, store, tools, signal.clone());
+        let _ = expect_ready(&mut evt_rx).await;
+
+        write_frame(
+            &mut cmd_tx,
+            &AgentCommand::SendMessage {
+                input: "please merge".into(),
+            },
+        )
+        .await
+        .unwrap();
+
+        let (_events, terminator) = drain_turn(&mut evt_rx).await;
+        assert!(
+            matches!(terminator, Some(AgentEvent::TurnComplete)),
+            "turn terminator must arrive before RequestClose: got {terminator:?}"
+        );
+
+        // The next frame must be RequestClose with the merge intent.
+        match read_frame::<_, AgentEvent>(&mut evt_rx).await.unwrap() {
+            Some(AgentEvent::RequestClose { intent }) => {
+                assert_eq!(intent, domain::CloseIntent::Merge);
+            }
+            other => panic!("expected RequestClose, got {other:?}"),
+        }
+
+        // After RequestClose the driver exits; the pipe reads as EOF.
+        let after = read_frame::<_, AgentEvent>(&mut evt_rx).await.unwrap();
+        assert!(
+            after.is_none(),
+            "driver must exit the command loop after RequestClose, got {after:?}"
+        );
+
+        // The signal was drained by the driver — a later take sees None.
+        assert!(signal.take().is_none());
+
+        drop(cmd_tx);
+        handle.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn preset_signal_drains_after_next_turn_not_pre_emptively() {
+        // Set the signal *before* any `SendMessage` arrives. The driver
+        // must still wait for the next terminal frame before emitting
+        // `RequestClose`; a preset signal alone is not a ship-it trigger.
+        let llm = FakeLlmProvider::new();
+        llm.push_text("okay");
+        let store = FakeSessionStore::new();
+        let signal = Arc::new(CloseSignal::new());
+        signal.set(domain::CloseIntent::Abandon { confirm: true });
+
+        let (mut cmd_tx, mut evt_rx, handle) =
+            spawn_driver_with_signal(llm, store, ToolRegistry::new(), signal.clone());
+        let (_, _) = expect_ready(&mut evt_rx).await;
+
+        // Give the driver a moment to start its command loop. The
+        // Ready-then-nothing state proves the signal isn't being drained
+        // before a turn has terminated; peeking at the signal confirms the
+        // preset value is still there.
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+        write_frame(
+            &mut cmd_tx,
+            &AgentCommand::SendMessage { input: "go".into() },
+        )
+        .await
+        .unwrap();
+
+        let (_events, terminator) = drain_turn(&mut evt_rx).await;
+        assert!(matches!(terminator, Some(AgentEvent::TurnComplete)));
+
+        match read_frame::<_, AgentEvent>(&mut evt_rx).await.unwrap() {
+            Some(AgentEvent::RequestClose { intent }) => {
+                assert_eq!(intent, domain::CloseIntent::Abandon { confirm: true });
+            }
+            other => panic!("expected RequestClose, got {other:?}"),
+        }
+
+        let after = read_frame::<_, AgentEvent>(&mut evt_rx).await.unwrap();
+        assert!(after.is_none(), "driver must exit after RequestClose");
+
+        drop(cmd_tx);
+        handle.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn request_close_follows_error_terminator_too() {
+        // The plan spec says `RequestClose` trails `TurnComplete`,
+        // `TurnCancelled`, *or* `Error`. Here the LLM errors mid-turn and
+        // the signal was preset — the drain must still fire after the
+        // Error frame so the agent can exit cleanly. (The server may
+        // reject the close if the worktree is dirty, but that's not the
+        // driver's concern.)
+        let llm = FakeLlmProvider::new();
+        llm.push_error("model exploded");
+        let store = FakeSessionStore::new();
+        let signal = Arc::new(CloseSignal::new());
+        signal.set(domain::CloseIntent::Merge);
+
+        let (mut cmd_tx, mut evt_rx, handle) =
+            spawn_driver_with_signal(llm, store, ToolRegistry::new(), signal.clone());
+        let _ = expect_ready(&mut evt_rx).await;
+
+        write_frame(
+            &mut cmd_tx,
+            &AgentCommand::SendMessage { input: "hi".into() },
+        )
+        .await
+        .unwrap();
+
+        let (_events, terminator) = drain_turn(&mut evt_rx).await;
+        assert!(
+            matches!(terminator, Some(AgentEvent::Error { .. })),
+            "expected Error terminator, got {terminator:?}"
+        );
+
+        match read_frame::<_, AgentEvent>(&mut evt_rx).await.unwrap() {
+            Some(AgentEvent::RequestClose { intent }) => {
+                assert_eq!(intent, domain::CloseIntent::Merge);
+            }
+            other => panic!("expected RequestClose after Error, got {other:?}"),
+        }
 
         drop(cmd_tx);
         handle.await.unwrap().unwrap();

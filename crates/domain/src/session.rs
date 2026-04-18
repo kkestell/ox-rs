@@ -40,15 +40,24 @@ pub struct SessionSummary {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Session {
     pub id: SessionId,
+    /// The main repository root this session belongs to — i.e. the CWD the
+    /// user launched `ox` from. Stays stable across slug renames so the
+    /// session can be looked up by the workspace that birthed it.
     pub workspace_root: PathBuf,
+    /// The dedicated worktree checkout where this session does its work.
+    /// Every tool invocation, shell command, and file edit is scoped to
+    /// this path — never to `workspace_root`. On slug rename this path
+    /// is updated to the new `ox/<slug>-<short-uuid>` directory.
+    pub worktree_path: PathBuf,
     pub messages: Vec<Message>,
 }
 
 impl Session {
-    pub fn new(id: SessionId, workspace_root: PathBuf) -> Self {
+    pub fn new(id: SessionId, workspace_root: PathBuf, worktree_path: PathBuf) -> Self {
         Self {
             id,
             workspace_root,
+            worktree_path,
             messages: Vec::new(),
         }
     }
@@ -84,9 +93,11 @@ mod tests {
     fn session_new_has_workspace_root() {
         let id = SessionId::new_v4();
         let root = PathBuf::from("/tmp/project");
-        let session = Session::new(id, root.clone());
+        let worktree = PathBuf::from("/tmp/project/.ox/worktrees/ox/abcdef");
+        let session = Session::new(id, root.clone(), worktree.clone());
         assert_eq!(session.id, id);
         assert_eq!(session.workspace_root, root);
+        assert_eq!(session.worktree_path, worktree);
         assert!(session.messages.is_empty());
     }
 }

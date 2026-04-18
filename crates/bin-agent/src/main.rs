@@ -17,7 +17,10 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use app::tools::{BashTool, EditFileTool, ReadFileTool, WriteFileTool};
-use app::{GlobTool, GrepTool, SecretStore, SessionRunner, Tool, ToolRegistry};
+use app::{
+    AbandonTool, CloseSignal, GlobTool, GrepTool, MergeTool, SecretStore, SessionRunner, Tool,
+    ToolRegistry,
+};
 use chrono::Local;
 use clap::Parser;
 use domain::SessionId;
@@ -81,6 +84,14 @@ struct AgentCli {
     /// session is created lazily when the first `SendMessage` arrives.
     #[arg(long)]
     resume: Option<SessionId>,
+
+    /// Pre-allocated session id for a **fresh** session. Used by the host
+    /// so the worktree directory, `ox/<slug>` branch, and on-disk
+    /// `{id}.json` file all share a single identifier. Ignored when
+    /// `--resume` is present; without either flag, the agent generates a
+    /// new id internally for one-off CLI invocations.
+    #[arg(long)]
+    session_id: Option<SessionId>,
 }
 
 fn main() -> ExitCode {
@@ -165,6 +176,13 @@ async fn run(cli: AgentCli) -> Result<()> {
         Arc::new(BashTool::new(shell, fs.clone(), cli.workspace_root.clone())) as Arc<dyn Tool>,
     );
 
+    // Both lifecycle tools and the driver share one `CloseSignal` — the
+    // tools set it, the driver drains it after each terminal frame and
+    // emits `AgentEvent::RequestClose` on a non-empty take.
+    let close_signal = Arc::new(CloseSignal::new());
+    tools.register(Arc::new(MergeTool::new(close_signal.clone())) as Arc<dyn Tool>);
+    tools.register(Arc::new(AbandonTool::new(close_signal.clone())) as Arc<dyn Tool>);
+
     let store = adapter_storage::DiskSessionStore::new(cli.sessions_dir)?;
     let system_prompt = build_system_prompt(&cli.workspace_root, &cli.model);
     let runner = SessionRunner::new(llm, store, tools, system_prompt);
@@ -173,5 +191,14 @@ async fn run(cli: AgentCli) -> Result<()> {
     let stdout = tokio::io::stdout();
     let reader = BufReader::new(stdin);
 
-    driver::agent_driver(&runner, cli.workspace_root, cli.resume, reader, stdout).await
+    driver::agent_driver(
+        &runner,
+        cli.workspace_root,
+        cli.resume,
+        cli.session_id,
+        close_signal,
+        reader,
+        stdout,
+    )
+    .await
 }

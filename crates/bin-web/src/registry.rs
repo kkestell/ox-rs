@@ -27,7 +27,10 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 
-use agent_host::{AgentSpawnConfig, AgentSpawner, Layout, LayoutStore};
+use adapter_storage::DiskSessionStore;
+use agent_host::{
+    AgentSpawnConfig, AgentSpawner, CloseRequestSink, FirstTurnSink, Layout, LayoutStore,
+};
 use anyhow::{Context, Result, anyhow};
 use domain::SessionId;
 use protocol::AgentCommand;
@@ -67,6 +70,17 @@ pub struct SessionRegistry {
     spawn_config: AgentSpawnConfig,
     layout: Mutex<LayoutStore>,
     workspace_root: PathBuf,
+    /// Sink for `AgentEvent::RequestClose` frames the pump observes.
+    /// Passed through to every `ActiveSession` at creation so the pump
+    /// can route close intents to the lifecycle coordinator without a
+    /// cyclic reference back to the registry.
+    close_sink: Arc<dyn CloseRequestSink>,
+    /// Sink for the first `TurnComplete` of a fresh session. Passed
+    /// through to every `ActiveSession` at creation so the pump can
+    /// route the slug-rename trigger to the lifecycle coordinator.
+    /// Shares the coordinator's `Arc` with `close_sink` — they are two
+    /// trait projections of the same object in production.
+    first_turn_sink: Arc<dyn FirstTurnSink>,
 }
 
 impl SessionRegistry {
@@ -77,6 +91,8 @@ impl SessionRegistry {
         spawn_config: AgentSpawnConfig,
         layout: LayoutStore,
         workspace_root: PathBuf,
+        close_sink: Arc<dyn CloseRequestSink>,
+        first_turn_sink: Arc<dyn FirstTurnSink>,
     ) -> Arc<Self> {
         Arc::new(Self {
             sessions: RwLock::new(HashMap::new()),
@@ -84,21 +100,44 @@ impl SessionRegistry {
             spawn_config,
             layout: Mutex::new(layout),
             workspace_root,
+            close_sink,
+            first_turn_sink,
         })
     }
 
     /// Attempt to resume every saved session for this workspace root.
-    /// Sessions that fail to spawn (agent binary missing, session file
-    /// deleted, etc.) are skipped; the registry falls back to a single
-    /// fresh session if nothing resumes so the user always has a pane
-    /// to type into.
+    ///
+    /// For each layout-row session id:
+    /// - Look up its `{id}.json` via `session_store.try_load`. If no
+    ///   file exists, the row is stale (session was never persisted or
+    ///   was hand-deleted); skip it.
+    /// - Read `worktree_path` from the loaded session and spawn an
+    ///   agent pointed at that path with `resume: Some(id)`.
+    /// - Any per-session failure (worktree missing, agent binary out of
+    ///   date, etc.) is logged and the loop continues so one broken row
+    ///   does not block the rest of the layout from restoring.
+    ///
+    /// If no session resumes, the registry is returned empty — the
+    /// caller (`bin-web::run`) is responsible for bootstrapping a fresh
+    /// initial session through `SessionLifecycle::create_and_spawn`,
+    /// which is the only path that knows how to create a worktree.
     pub async fn restore(
         spawner: Arc<dyn AgentSpawner>,
         spawn_config: AgentSpawnConfig,
         layout: LayoutStore,
         workspace_root: PathBuf,
+        close_sink: Arc<dyn CloseRequestSink>,
+        first_turn_sink: Arc<dyn FirstTurnSink>,
+        session_store: Arc<DiskSessionStore>,
     ) -> Result<Arc<Self>> {
-        let registry = Self::new(spawner, spawn_config, layout, workspace_root.clone());
+        let registry = Self::new(
+            spawner,
+            spawn_config,
+            layout,
+            workspace_root.clone(),
+            close_sink,
+            first_turn_sink,
+        );
 
         let saved_order: Vec<SessionId> = {
             let layout = registry.layout.lock().expect("layout mutex poisoned");
@@ -108,49 +147,63 @@ impl SessionRegistry {
                 .unwrap_or_default()
         };
 
-        let mut resumed: Vec<SessionId> = Vec::new();
         for id in saved_order {
-            match registry.spawn_and_insert(Some(id)).await {
-                Ok(new_id) => resumed.push(new_id),
-                Err(err) => {
-                    // A failed resume is non-fatal — the agent binary
-                    // may be out of date, the session file may have
-                    // been deleted by hand, etc. Log and move on so
-                    // the rest of the saved layout can still restore.
-                    eprintln!("ox: failed to resume session {id}: {err:#}");
+            let session = match session_store.try_load(id).await {
+                Ok(Some(s)) => s,
+                Ok(None) => {
+                    // Session file never written — the previous run died
+                    // before the first `TurnComplete`. The layout row is
+                    // stale; skip it and move on.
+                    eprintln!("ox: skipping session {id}: no on-disk session file");
+                    continue;
                 }
-            }
-        }
+                Err(err) => {
+                    eprintln!("ox: failed to load session {id}: {err:#}");
+                    continue;
+                }
+            };
 
-        if resumed.is_empty() {
-            match registry.spawn_and_insert(None).await {
-                Ok(id) => {
-                    // Persist a one-pane layout so the next restart
-                    // finds something to resume. Any client-initiated
-                    // PUT will overwrite this with the real sizes.
-                    let layout = Layout::new(vec![id], vec![1.0]);
-                    registry.put_layout(layout)?;
-                }
-                Err(err) => {
-                    return Err(err.context("failed to start the initial session"));
-                }
+            if !session.worktree_path.exists() {
+                eprintln!(
+                    "ox: skipping session {id}: worktree {} is missing",
+                    session.worktree_path.display()
+                );
+                continue;
+            }
+
+            if let Err(err) = registry
+                .spawn_for_worktree(session.worktree_path.clone(), id, Some(id))
+                .await
+            {
+                eprintln!("ox: failed to resume session {id}: {err:#}");
             }
         }
 
         Ok(registry)
     }
 
-    /// Spawn a fresh agent (no resume) and register it. Returns the
-    /// session id reported by the agent's `Ready` frame.
-    pub async fn create(&self) -> Result<SessionId> {
-        self.spawn_and_insert(None).await
-    }
-
     /// Spawn an agent that resumes a specific session id. Used by the
-    /// CLI's `--resume` path to bypass the saved layout and open one
-    /// named session instead.
-    pub async fn create_resumed(&self, id: SessionId) -> Result<SessionId> {
-        self.spawn_and_insert(Some(id)).await
+    /// `--resume <id>` CLI path. The session's saved `worktree_path` is
+    /// loaded from the store so the agent comes back on the same branch
+    /// it was last working on.
+    pub async fn create_resumed(
+        &self,
+        id: SessionId,
+        session_store: &DiskSessionStore,
+    ) -> Result<SessionId> {
+        let session = session_store
+            .try_load(id)
+            .await
+            .with_context(|| format!("loading session {id} for --resume"))?
+            .ok_or_else(|| anyhow!("no saved session with id {id}"))?;
+        if !session.worktree_path.exists() {
+            return Err(anyhow!(
+                "session {id} worktree {} is missing",
+                session.worktree_path.display()
+            ));
+        }
+        self.spawn_for_worktree(session.worktree_path, id, Some(id))
+            .await
     }
 
     /// Drop the session from the registry. The `Arc<ActiveSession>`
@@ -176,6 +229,14 @@ impl SessionRegistry {
     pub fn get(&self, id: SessionId) -> Option<Arc<ActiveSession>> {
         let sessions = self.sessions.read().expect("sessions lock poisoned");
         sessions.get(&id).cloned()
+    }
+
+    /// `true` when no sessions are registered. Used by the startup path
+    /// to decide whether to bootstrap a fresh initial session via
+    /// the lifecycle coordinator.
+    pub fn is_empty(&self) -> bool {
+        let sessions = self.sessions.read().expect("sessions lock poisoned");
+        sessions.is_empty()
     }
 
     /// Snapshot for `GET /api/sessions`.
@@ -291,14 +352,54 @@ impl SessionRegistry {
         }
     }
 
-    /// Shared path for `create` and `restore`: spawn the agent,
-    /// await `Ready`, and insert it into the map.
-    async fn spawn_and_insert(&self, resume: Option<SessionId>) -> Result<SessionId> {
+    /// Shared entry point for spawning a session against a specific
+    /// worktree. `create` / `restore` route through this today with
+    /// `worktree_path = self.workspace_root`; the lifecycle coordinator
+    /// will call it directly with the session's own worktree directory
+    /// once R11 lands.
+    ///
+    /// `session_id` is advisory — the lifecycle coordinator pre-allocates
+    /// it to name the worktree directory before spawning, but the agent
+    /// still reports its own id via the `Ready` frame and that is the
+    /// source of truth for the registry map. Keeping the parameter on
+    /// the signature today means the coordinator can drop into the
+    /// same call shape without churn when it lands.
+    pub async fn spawn_for_worktree(
+        &self,
+        worktree_path: PathBuf,
+        session_id: SessionId,
+        resume: Option<SessionId>,
+    ) -> Result<SessionId> {
         let mut config = self.spawn_config.clone();
+        // The agent process's view of "workspace root" is the worktree —
+        // that's what its tools resolve relative paths against and what
+        // its shell's `current_dir` points at. The registry's own
+        // `workspace_root` field continues to refer to the main
+        // workspace; the two diverge once the lifecycle coordinator
+        // starts creating per-session worktrees.
+        config.workspace_root = worktree_path;
         config.resume = resume;
+        // Pass the pre-allocated id through to the agent so the
+        // on-disk `{id}.json`, the host-side worktree directory name,
+        // and the `ox/<slug>` branch all share the same identifier.
+        // The agent still announces its id via `Ready`, but on a fresh
+        // spawn that announced value will equal `session_id`.
+        config.session_id = Some(session_id);
+
+        // A session is "fresh" iff we're not resuming a saved one. The
+        // slug-rename hook checks this flag so it runs exactly once, on
+        // the first `TurnComplete` after a user starts a brand-new
+        // session.
+        let fresh = resume.is_none();
 
         let (client, stream) = self.spawner.spawn(config).context("spawning agent")?;
-        let session = ActiveSession::start(client, stream);
+        let session = ActiveSession::start(
+            client,
+            stream,
+            self.close_sink.clone(),
+            self.first_turn_sink.clone(),
+            fresh,
+        );
 
         let id = session
             .await_ready()
@@ -312,6 +413,44 @@ impl SessionRegistry {
         let mut sessions = self.sessions.write().expect("sessions lock poisoned");
         sessions.insert(id, session);
         Ok(id)
+    }
+
+    /// Respawn an existing session's agent under a new worktree path.
+    ///
+    /// Used by the slug-rename hook after the worktree directory has
+    /// been moved and the branch renamed: a fresh `ox-agent` is spawned
+    /// with `--workspace-root=<new-path>` and `--resume=<id>`, and the
+    /// resulting client+stream are installed into the existing
+    /// [`ActiveSession`] via [`ActiveSession::replace_agent`]. SSE
+    /// subscribers keep their connection and history survives across
+    /// the swap.
+    ///
+    /// Returns an error if the session is not known, or if the spawner
+    /// itself fails. The agent's `Ready` frame is NOT awaited here
+    /// because the session's existing `session_id` is already known; the
+    /// replacement pump records the new `Ready` into history like any
+    /// other event.
+    pub async fn spawn_new_agent_for_existing(
+        &self,
+        id: SessionId,
+        new_worktree_path: PathBuf,
+    ) -> Result<()> {
+        let session = self
+            .get(id)
+            .ok_or_else(|| anyhow!("session {id} not found in registry"))?;
+
+        let mut config = self.spawn_config.clone();
+        config.workspace_root = new_worktree_path;
+        config.resume = Some(id);
+        config.session_id = Some(id);
+
+        let (client, stream) = self
+            .spawner
+            .spawn(config)
+            .context("spawning replacement agent")?;
+
+        session.replace_agent(client, stream);
+        Ok(())
     }
 
     /// Accessor for handlers and tests that need the workspace root
@@ -335,37 +474,41 @@ mod tests {
     use super::*;
     use crate::test_support::{DuplexSpawner, empty_layout, test_registry, unique_temp_dir};
 
-    /// Drive `registry.create()` to completion by receiving the
+    /// Drive `registry.spawn_for_worktree` to completion by receiving the
     /// agent-side handles, writing `Ready(id)`, and awaiting the
     /// registry's returned session id. Returns the id and the live
-    /// agent handles so the test can keep interacting with them.
+    /// agent handles so the test can keep interacting with them. The
+    /// worktree path is the registry's workspace root — tests here do
+    /// not exercise the per-session-worktree path; that's the
+    /// lifecycle coordinator's job.
     async fn create_session(
         registry: Arc<SessionRegistry>,
         rx: &mut tokio::sync::mpsc::UnboundedReceiver<crate::test_support::AgentHandles>,
     ) -> (SessionId, crate::test_support::AgentHandles) {
+        let id = SessionId::new_v4();
+        let worktree = registry.workspace_root().to_path_buf();
         let create = tokio::spawn({
             let r = registry.clone();
-            async move { r.create().await }
+            async move { r.spawn_for_worktree(worktree, id, None).await }
         });
         let mut handles = timeout(Duration::from_secs(2), rx.recv())
             .await
             .expect("spawner timed out")
             .expect("spawner receiver dropped");
-        let id = SessionId::new_v4();
         handles.send_ready(id).await;
         let ret_id = timeout(Duration::from_secs(2), create)
             .await
             .expect("create timed out")
             .expect("join failure")
-            .expect("create returned Err");
+            .expect("spawn_for_worktree returned Err");
         assert_eq!(ret_id, id);
         (id, handles)
     }
 
-    // -- create ----------------------------------------------------------
+    // -- spawn_for_worktree ----------------------------------------------
 
     #[tokio::test]
-    async fn create_awaits_ready_then_registers_session() {
+    async fn spawn_awaits_ready_then_registers_session() {
         let (registry, mut rx, _ws) = test_registry(empty_layout()).await;
         let (id, _handles) = create_session(registry.clone(), &mut rx).await;
 
@@ -376,11 +519,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn create_returns_error_if_agent_exits_before_ready() {
+    async fn spawn_returns_error_if_agent_exits_before_ready() {
         let (registry, mut rx, _ws) = test_registry(empty_layout()).await;
+        let id = SessionId::new_v4();
+        let worktree = registry.workspace_root().to_path_buf();
         let create = tokio::spawn({
             let r = registry.clone();
-            async move { r.create().await }
+            async move { r.spawn_for_worktree(worktree, id, None).await }
         });
         let handles = timeout(Duration::from_secs(2), rx.recv())
             .await
@@ -388,13 +533,13 @@ mod tests {
             .expect("spawner dropped");
         // Drop the handles without writing `Ready`. The agent stdout
         // side closes, the pump observes `None`, alive flips false,
-        // await_ready resolves None, and create returns an Err.
+        // await_ready resolves None, and spawn_for_worktree returns an Err.
         drop(handles);
         let result = timeout(Duration::from_secs(2), create)
             .await
-            .expect("create timed out")
+            .expect("spawn_for_worktree timed out")
             .expect("join failure");
-        assert!(result.is_err(), "expected create to fail");
+        assert!(result.is_err(), "expected spawn_for_worktree to fail");
     }
 
     // -- remove ----------------------------------------------------------
@@ -610,10 +755,13 @@ mod tests {
                 model: "test/model".into(),
                 sessions_dir: PathBuf::from("/nonexistent/sessions"),
                 resume: None,
+                session_id: None,
                 env: vec![],
             },
             store,
             workspace_root.clone(),
+            Arc::new(agent_host::fake::NoopCloseRequestSink),
+            Arc::new(agent_host::fake::NoopFirstTurnSink),
         );
         let (id, _handles) = create_session(registry.clone(), &mut rx).await;
         registry
@@ -646,18 +794,30 @@ mod tests {
 
     // -- restore ---------------------------------------------------------
 
+    /// Seed the disk session store with a session whose `worktree_path`
+    /// is a real directory created inside the tempdir (so the existence
+    /// check in `restore` passes). Returns the store and the created
+    /// worktree path so the test can assert the spawner saw it.
+    async fn seed_saved_session(
+        store: &DiskSessionStore,
+        id: SessionId,
+        workspace_root: &Path,
+        label: &str,
+    ) -> PathBuf {
+        use app::SessionStore;
+        let worktree = unique_temp_dir(label);
+        let session = domain::Session::new(id, workspace_root.to_path_buf(), worktree.clone());
+        store.save(&session).await.unwrap();
+        worktree
+    }
+
     #[tokio::test]
-    async fn restore_falls_back_to_fresh_session_when_every_resume_fails() {
-        // A failing spawner simulates "agent binary missing": every
-        // resume attempt returns Err. `restore` must still hand back a
-        // registry, spawning a new fresh session if nothing resumed.
-        //
-        // The fallback path re-uses the same spawner, so we can't use
-        // `DuplexSpawner::failing()` here — it fails on every spawn,
-        // including the fallback. Instead we use a two-phase spawner
-        // that fails the resumed calls and succeeds for a fresh spawn.
-        let layout_path = unique_temp_dir("restore-fallback").join("workspaces.json");
-        let workspace_root = unique_temp_dir("ws-restore");
+    async fn restore_skips_session_whose_file_is_missing() {
+        // A layout row referring to an id with no `{id}.json` on disk
+        // is stale (previous run died before the first TurnComplete).
+        // `restore` should skip it silently and return an empty registry.
+        let layout_path = unique_temp_dir("restore-no-file").join("workspaces.json");
+        let workspace_root = unique_temp_dir("ws-restore-no-file");
         let stale_id = SessionId::new_v4();
         {
             let mut store = LayoutStore::load(layout_path.clone()).unwrap();
@@ -666,127 +826,203 @@ mod tests {
                 .unwrap();
         }
 
-        let store = LayoutStore::load(layout_path.clone()).unwrap();
-        let spawner = Arc::new(FailThenSucceedSpawner::new(1));
-        let mut handles_rx = spawner.rx();
+        let layout = LayoutStore::load(layout_path).unwrap();
+        // Empty session store — no `{id}.json` exists for stale_id.
+        let sessions_dir = unique_temp_dir("sessions-no-file");
+        let session_store = Arc::new(DiskSessionStore::new(&sessions_dir).unwrap());
+        let (spawner, mut rx) = DuplexSpawner::new();
         let spawn_config = AgentSpawnConfig {
             binary: PathBuf::from("/nonexistent/ox-agent"),
             workspace_root: workspace_root.clone(),
             model: "test/model".into(),
-            sessions_dir: PathBuf::from("/nonexistent/sessions"),
+            sessions_dir,
             resume: None,
+            session_id: None,
             env: vec![],
         };
 
-        let restore = tokio::spawn(async move {
-            SessionRegistry::restore(spawner, spawn_config, store, workspace_root.clone()).await
-        });
+        let registry = SessionRegistry::restore(
+            spawner,
+            spawn_config,
+            layout,
+            workspace_root,
+            Arc::new(agent_host::fake::NoopCloseRequestSink),
+            Arc::new(agent_host::fake::NoopFirstTurnSink),
+            session_store,
+        )
+        .await
+        .expect("restore ok");
 
-        // The failing attempt doesn't push handles. The fresh fallback
-        // does — we receive it and write Ready so `restore` resolves.
-        let mut handles = timeout(Duration::from_secs(2), handles_rx.recv())
-            .await
-            .expect("fallback spawner timed out")
-            .expect("channel dropped");
-        let fresh_id = SessionId::new_v4();
-        handles.send_ready(fresh_id).await;
-        // Keep handles alive so `kill_on_drop` doesn't fire on the
-        // fallback session before the test finishes.
-        let registry = timeout(Duration::from_secs(2), restore)
-            .await
-            .expect("restore timed out")
-            .expect("join failure")
-            .expect("restore returned Err");
-        let snap = registry.snapshot();
-        assert_eq!(snap.sessions.len(), 1);
-        assert_eq!(snap.sessions[0].session_id, fresh_id);
-        drop(handles);
-    }
-
-    /// Spawner that fails on the first `n` calls, then succeeds with
-    /// duplex pipes just like `DuplexSpawner`.
-    struct FailThenSucceedSpawner {
-        counter: std::sync::Mutex<usize>,
-        fail_count: usize,
-        tx: tokio::sync::mpsc::UnboundedSender<crate::test_support::AgentHandles>,
-        rx: std::sync::Mutex<
-            Option<tokio::sync::mpsc::UnboundedReceiver<crate::test_support::AgentHandles>>,
-        >,
-    }
-
-    impl FailThenSucceedSpawner {
-        fn new(fail_count: usize) -> Self {
-            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-            Self {
-                counter: std::sync::Mutex::new(0),
-                fail_count,
-                tx,
-                rx: std::sync::Mutex::new(Some(rx)),
-            }
-        }
-
-        fn rx(&self) -> tokio::sync::mpsc::UnboundedReceiver<crate::test_support::AgentHandles> {
-            self.rx.lock().unwrap().take().expect("rx already taken")
-        }
-    }
-
-    impl agent_host::AgentSpawner for FailThenSucceedSpawner {
-        fn spawn(
-            &self,
-            config: AgentSpawnConfig,
-        ) -> anyhow::Result<(agent_host::AgentClient, agent_host::AgentEventStream)> {
-            let mut n = self.counter.lock().unwrap();
-            if *n < self.fail_count {
-                *n += 1;
-                return Err(anyhow::anyhow!("simulated spawn failure #{}", *n));
-            }
-            *n += 1;
-            drop(n);
-            let (agent_writer, client_reader) = tokio::io::duplex(64 * 1024);
-            let (client_writer, agent_reader) = tokio::io::duplex(64 * 1024);
-            let (client, stream) = agent_host::AgentClient::new(
-                tokio::io::BufReader::new(client_reader),
-                client_writer,
-            );
-            let handles = crate::test_support::AgentHandles {
-                reader: tokio::io::BufReader::new(agent_reader),
-                writer: agent_writer,
-                config,
-            };
-            self.tx
-                .send(handles)
-                .map_err(|_| anyhow::anyhow!("rx dropped"))?;
-            Ok((client, stream))
-        }
+        // No session resumed → registry is empty and the spawner was
+        // never invoked (no handles arrived).
+        assert!(registry.is_empty());
+        assert!(rx.try_recv().is_err(), "spawner should not be called");
     }
 
     #[tokio::test]
-    async fn restore_errors_if_fallback_spawn_also_fails() {
-        // When every resume fails *and* the fresh-fallback spawn also
-        // fails, `restore` surfaces the error to the caller rather than
-        // silently pretending everything is fine.
-        let layout_path = unique_temp_dir("restore-all-fail").join("workspaces.json");
-        let workspace_root = unique_temp_dir("ws-restore-all-fail");
-        let stale_id = SessionId::new_v4();
+    async fn restore_skips_session_with_missing_worktree_directory() {
+        // Session file exists, but the `worktree_path` it points at has
+        // been removed on disk (user hand-cleaned, or a parallel `git
+        // worktree prune` happened). `restore` must treat this as a
+        // skippable row rather than trying to resume into a missing
+        // directory.
+        let layout_path = unique_temp_dir("restore-no-wt").join("workspaces.json");
+        let workspace_root = unique_temp_dir("ws-restore-no-wt");
+        let sessions_dir = unique_temp_dir("sessions-no-wt");
+        let session_store = Arc::new(DiskSessionStore::new(&sessions_dir).unwrap());
+        let id = SessionId::new_v4();
+
+        // Seed a session whose worktree_path is a non-existent directory.
         {
-            let mut store = LayoutStore::load(layout_path.clone()).unwrap();
-            store
-                .put(&workspace_root, Layout::new(vec![stale_id], vec![1.0]))
+            use app::SessionStore;
+            let fake_wt = std::env::temp_dir().join("does-not-exist-intentionally");
+            let session = domain::Session::new(id, workspace_root.clone(), fake_wt);
+            session_store.save(&session).await.unwrap();
+        }
+        {
+            let mut layout = LayoutStore::load(layout_path.clone()).unwrap();
+            layout
+                .put(&workspace_root, Layout::new(vec![id], vec![1.0]))
                 .unwrap();
         }
 
-        let store = LayoutStore::load(layout_path).unwrap();
-        let spawner = DuplexSpawner::failing();
-        let config = AgentSpawnConfig {
+        let layout = LayoutStore::load(layout_path).unwrap();
+        let (spawner, mut rx) = DuplexSpawner::new();
+        let spawn_config = AgentSpawnConfig {
             binary: PathBuf::from("/nonexistent/ox-agent"),
             workspace_root: workspace_root.clone(),
             model: "test/model".into(),
-            sessions_dir: PathBuf::from("/nonexistent/sessions"),
+            sessions_dir,
             resume: None,
+            session_id: None,
             env: vec![],
         };
-        let result = SessionRegistry::restore(spawner, config, store, workspace_root).await;
-        assert!(result.is_err(), "restore should error when fallback fails");
+
+        let registry = SessionRegistry::restore(
+            spawner,
+            spawn_config,
+            layout,
+            workspace_root,
+            Arc::new(agent_host::fake::NoopCloseRequestSink),
+            Arc::new(agent_host::fake::NoopFirstTurnSink),
+            session_store,
+        )
+        .await
+        .expect("restore ok");
+
+        assert!(registry.is_empty());
+        assert!(rx.try_recv().is_err(), "spawner should not be called");
+    }
+
+    #[tokio::test]
+    async fn restore_spawns_saved_session_using_its_worktree_path() {
+        // Happy path: saved session file points to an existing worktree
+        // directory. `restore` must spawn an agent whose config
+        // `workspace_root` equals the saved worktree path — that's the
+        // guarantee that makes resume land on the right branch.
+        let layout_path = unique_temp_dir("restore-happy").join("workspaces.json");
+        let workspace_root = unique_temp_dir("ws-restore-happy");
+        let sessions_dir = unique_temp_dir("sessions-happy");
+        let session_store = Arc::new(DiskSessionStore::new(&sessions_dir).unwrap());
+        let id = SessionId::new_v4();
+        let worktree = seed_saved_session(&session_store, id, &workspace_root, "wt-happy").await;
+        {
+            let mut layout = LayoutStore::load(layout_path.clone()).unwrap();
+            layout
+                .put(&workspace_root, Layout::new(vec![id], vec![1.0]))
+                .unwrap();
+        }
+
+        let layout = LayoutStore::load(layout_path).unwrap();
+        let (spawner, mut rx) = DuplexSpawner::new();
+        let spawn_config = AgentSpawnConfig {
+            binary: PathBuf::from("/nonexistent/ox-agent"),
+            workspace_root: workspace_root.clone(),
+            model: "test/model".into(),
+            sessions_dir,
+            resume: None,
+            session_id: None,
+            env: vec![],
+        };
+
+        let restore_fut = tokio::spawn(async move {
+            SessionRegistry::restore(
+                spawner,
+                spawn_config,
+                layout,
+                workspace_root.clone(),
+                Arc::new(agent_host::fake::NoopCloseRequestSink),
+                Arc::new(agent_host::fake::NoopFirstTurnSink),
+                session_store,
+            )
+            .await
+        });
+
+        let mut handles = timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("spawner timed out")
+            .expect("handles channel dropped");
+        // The spawner must have seen the saved worktree as the agent's
+        // workspace_root, and `resume: Some(id)` so the agent rehydrates
+        // the right session.
+        assert_eq!(handles.config.workspace_root, worktree);
+        assert_eq!(handles.config.resume, Some(id));
+        handles.send_ready(id).await;
+
+        let registry = timeout(Duration::from_secs(2), restore_fut)
+            .await
+            .expect("restore timed out")
+            .expect("join")
+            .expect("restore ok");
+        assert!(!registry.is_empty());
+        drop(handles);
+    }
+
+    #[tokio::test]
+    async fn restore_continues_after_per_session_spawn_failure() {
+        // Two rows in the saved layout. The spawner fails for every
+        // call — both rows are skipped, and `restore` still returns
+        // Ok with an empty registry. The caller (main.rs) decides
+        // whether to bootstrap a fresh session afterwards.
+        let layout_path = unique_temp_dir("restore-spawn-fail").join("workspaces.json");
+        let workspace_root = unique_temp_dir("ws-restore-spawn-fail");
+        let sessions_dir = unique_temp_dir("sessions-spawn-fail");
+        let session_store = Arc::new(DiskSessionStore::new(&sessions_dir).unwrap());
+        let a = SessionId::new_v4();
+        let b = SessionId::new_v4();
+        let _wt_a = seed_saved_session(&session_store, a, &workspace_root, "wt-fail-a").await;
+        let _wt_b = seed_saved_session(&session_store, b, &workspace_root, "wt-fail-b").await;
+        {
+            let mut layout = LayoutStore::load(layout_path.clone()).unwrap();
+            layout
+                .put(&workspace_root, Layout::new(vec![a, b], vec![0.5, 0.5]))
+                .unwrap();
+        }
+
+        let layout = LayoutStore::load(layout_path).unwrap();
+        let spawner = DuplexSpawner::failing();
+        let spawn_config = AgentSpawnConfig {
+            binary: PathBuf::from("/nonexistent/ox-agent"),
+            workspace_root: workspace_root.clone(),
+            model: "test/model".into(),
+            sessions_dir,
+            resume: None,
+            session_id: None,
+            env: vec![],
+        };
+
+        let registry = SessionRegistry::restore(
+            spawner,
+            spawn_config,
+            layout,
+            workspace_root,
+            Arc::new(agent_host::fake::NoopCloseRequestSink),
+            Arc::new(agent_host::fake::NoopFirstTurnSink),
+            session_store,
+        )
+        .await
+        .expect("restore should be resilient to spawn failures");
+        assert!(registry.is_empty());
     }
 
     // -- persist_current_layout ------------------------------------------
@@ -805,10 +1041,13 @@ mod tests {
                 model: "test/model".into(),
                 sessions_dir: PathBuf::from("/nonexistent/sessions"),
                 resume: None,
+                session_id: None,
                 env: vec![],
             },
             store,
             workspace_root.clone(),
+            Arc::new(agent_host::fake::NoopCloseRequestSink),
+            Arc::new(agent_host::fake::NoopFirstTurnSink),
         );
         let (_a, _ha) = create_session(registry.clone(), &mut rx).await;
         let (_b, _hb) = create_session(registry.clone(), &mut rx).await;

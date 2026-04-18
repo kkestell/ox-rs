@@ -40,3 +40,35 @@ Ox is a desktop AI coding assistant built in Rust. It uses a hexagonal (ports-an
 - Nothing is pre-existing. All builds and tests are green upstream. If something fails, your work caused it. Investigate and fix — never dismiss a failure as pre-existing.
 - Use `cargo add` for third-party dependencies -- never hand-edit `[dependencies]` in Cargo.toml. 
 - Commits must follow the 7 rules of great commit messages with NO Claude Code attribution.
+
+### Git workspace
+
+Ox only runs inside a git repository. On startup, `bin-web` calls
+`git.assert_repo(&workspace_root)` and aborts with a targeted error if the
+workspace is not a git repo (or has a detached HEAD). The repo's current
+branch at startup is captured as the workspace's **base branch** — the
+branch new session branches fork from and the branch `merge` folds them
+back into.
+
+Every session is scoped to its own git branch (`ox/<slug>-<short-uuid>`,
+slug filled in after the first turn) inside its own worktree at
+`~/.ox/workspaces/<workspace-slug>/worktrees/<short-uuid>/`. The agent
+subprocess runs with `--workspace-root` pointed at the **worktree**, not
+the base workspace, so tool edits are confined to the session's branch.
+Closing a session takes one of two paths, both orchestrated by
+`bin-web::lifecycle::SessionLifecycle`:
+
+- **Merge** (`POST /api/sessions/{id}/merge`) folds the session branch into
+  the base branch, removes the worktree, deletes the branch, and deletes
+  the session JSON. Abort-on-conflict: a dirty worktree, a dirty base
+  branch, or a conflicting merge leaves everything intact and surfaces a
+  409 to the caller.
+- **Abandon** (`POST /api/sessions/{id}/abandon`) discards the worktree,
+  branch, and session JSON without merging. Dirty worktrees require
+  `{"confirm": true}` — a bare POST returns a 409 that the UI turns into a
+  native confirmation dialog.
+
+Both paths are reachable from the UI (Merge / Abandon buttons) and from
+inside the agent (the `merge` / `abandon` tools in `app::lifecycle`, which
+trip an in-process `CloseSignal` that the driver drains at the end of the
+turn and relays to the host as a `RequestClose` frame).

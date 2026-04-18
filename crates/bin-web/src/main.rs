@@ -16,10 +16,13 @@
 //! 3. Kick the browser if the user wants it.
 
 mod assets;
+mod lifecycle;
 mod registry;
 mod routes;
 mod session;
+mod slug;
 mod sse;
+mod startup;
 mod state;
 #[cfg(test)]
 mod test_support;
@@ -28,14 +31,22 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
 
-use agent_host::{AgentSpawnConfig, LayoutStore, ProcessSpawner};
+use adapter_git::CliGit;
+use adapter_storage::DiskSessionStore;
+use agent_host::{
+    AgentSpawnConfig, CloseRequestSink, FirstTurnSink, Git, LayoutStore, ProcessSpawner,
+    SlugGenerator,
+};
 use anyhow::{Context, Result};
 use clap::Parser;
 use domain::SessionId;
 use tokio::net::TcpListener;
 
+use crate::lifecycle::SessionLifecycle;
 use crate::registry::SessionRegistry;
 use crate::routes::router;
+use crate::slug::CliSlugGenerator;
+use crate::startup::assert_workspace_ready;
 use crate::state::AppState;
 
 /// Default OpenRouter model for new sessions. Matches the default the
@@ -99,8 +110,21 @@ async fn run(cli: Cli) -> Result<()> {
     // the key without any user-facing flag.
     let workspace_root = std::env::current_dir().context("resolving current working directory")?;
 
+    // Startup gate: refuse to launch outside a git working copy. The
+    // worktree / merge flows built on top of `SessionLifecycle` assume
+    // these preconditions for every session, so the earlier they fail
+    // the less confusing the error becomes.
+    let git: Arc<dyn Git> = Arc::new(CliGit::new());
+    let workspace_ctx = assert_workspace_ready(git.as_ref(), &workspace_root).await?;
+
     let api_key = std::env::var("OPENROUTER_API_KEY")
         .context("OPENROUTER_API_KEY is not set — export it before launching ox")?;
+
+    // The slug generator needs the same OpenRouter credentials the
+    // agent does, plus a model id. We clone the key so the spawn_config
+    // can still move `api_key` into its env list below.
+    let slug_api_key = api_key.clone();
+    let slug_model = cli.model.clone();
 
     let agent_binary = resolve_agent_binary().context("locating the ox-agent binary")?;
 
@@ -134,10 +158,33 @@ async fn run(cli: Cli) -> Result<()> {
         model: cli.model.clone(),
         sessions_dir,
         resume: None,
+        session_id: None,
         env: vec![("OPENROUTER_API_KEY".into(), api_key)],
     };
 
     let spawner = Arc::new(ProcessSpawner);
+
+    // Two-phase init to break the registry↔lifecycle cycle:
+    //
+    //   1. Build the lifecycle with its `Weak<SessionRegistry>` empty.
+    //   2. Build the registry, handing it `lifecycle` as its close sink.
+    //   3. Call `lifecycle.set_registry(..)` so the coordinator can
+    //      reach the registry through a weak-ref.
+    //
+    // The session store is a concrete `Arc<DiskSessionStore>` because
+    // `SessionStore`'s RPIT makes it non-dyn-compatible; the coordinator
+    // owns the only production impl today.
+    let slug_generator: Arc<dyn SlugGenerator> =
+        Arc::new(CliSlugGenerator::new(slug_api_key, slug_model));
+    let session_store = Arc::new(
+        DiskSessionStore::new(&spawn_config.sessions_dir)
+            .context("creating the session store directory")?,
+    );
+    let lifecycle =
+        SessionLifecycle::new(git, slug_generator, session_store.clone(), workspace_ctx);
+    let close_sink: Arc<dyn CloseRequestSink> = lifecycle.clone();
+    let first_turn_sink: Arc<dyn FirstTurnSink> = lifecycle.clone();
+
     let registry = if let Some(id) = cli.resume {
         // `--resume <id>` bypasses the saved layout and opens exactly
         // one pane for that id. The rest of the saved workspace is
@@ -147,8 +194,10 @@ async fn run(cli: Cli) -> Result<()> {
             spawn_config.clone(),
             layout,
             workspace_root.clone(),
+            close_sink.clone(),
+            first_turn_sink.clone(),
         );
-        resume_single(&reg, id).await?;
+        resume_single(&reg, id, session_store.as_ref()).await?;
         reg
     } else {
         SessionRegistry::restore(
@@ -156,12 +205,41 @@ async fn run(cli: Cli) -> Result<()> {
             spawn_config.clone(),
             layout,
             workspace_root.clone(),
+            close_sink.clone(),
+            first_turn_sink.clone(),
+            session_store.clone(),
         )
         .await?
     };
 
+    // Phase 3: close the init cycle. After this, any lifecycle method
+    // that upgrades the weak-ref can reach the registry.
+    lifecycle.set_registry(Arc::downgrade(&registry));
+
+    // Bootstrap an initial session if nothing resumed — this is the
+    // "fresh launch" path, and the only layer that knows how to create
+    // a worktree is the lifecycle coordinator. Done after
+    // `set_registry` so `create_and_spawn` can reach back into the
+    // registry to insert the new session.
+    if registry.is_empty() {
+        match lifecycle.create_and_spawn().await {
+            Ok(id) => {
+                // Persist a one-pane layout so the next restart knows
+                // which id to resume. Any client PUT will overwrite.
+                let layout = agent_host::Layout::new(vec![id], vec![1.0]);
+                if let Err(err) = registry.put_layout(layout) {
+                    eprintln!("ox: failed to persist initial layout: {err:#}");
+                }
+            }
+            Err(err) => {
+                return Err(err.context("failed to start the initial session"));
+            }
+        }
+    }
+
     let state = AppState {
         registry: registry.clone(),
+        lifecycle: lifecycle.clone(),
     };
     let app = router(state);
 
@@ -224,13 +302,17 @@ fn resolve_agent_binary() -> Result<PathBuf> {
 }
 
 /// Restore a single named session. Used by `--resume <id>`.
-async fn resume_single(registry: &SessionRegistry, id: SessionId) -> Result<()> {
+async fn resume_single(
+    registry: &SessionRegistry,
+    id: SessionId,
+    session_store: &DiskSessionStore,
+) -> Result<()> {
     // `restore`'s fallback path produces a one-pane registry already;
     // we replicate that shape here by creating the resumed session and
     // persisting a minimal layout so a later plain `ox` launch finds
     // something to resume.
     let _new_id = registry
-        .create_resumed(id)
+        .create_resumed(id, session_store)
         .await
         .with_context(|| format!("resuming session {id}"))?;
     Ok(())

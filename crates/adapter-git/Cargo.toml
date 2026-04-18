@@ -1,0 +1,14 @@
+[package]
+name = "adapter-git"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+agent-host = { version = "0.1.0", path = "../agent-host" }
+anyhow = "1.0.102"
+async-trait = "0.1.89"
+tokio = { version = "1.52.1", features = ["process", "io-util", "fs"] }
+
+[dev-dependencies]
+tempfile = "3.27.0"
+tokio = { version = "1.52.1", features = ["macros", "rt"] }
