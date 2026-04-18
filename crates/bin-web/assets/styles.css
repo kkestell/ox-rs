@@ -121,69 +121,27 @@ button:disabled {
   gap: var(--gap);
 }
 
-.approval-panel {
-  position: absolute;
-  z-index: 5;
-  top: 46px;
-  left: var(--pad);
-  right: var(--pad);
-  max-height: 50vh;
-  display: flex;
-  flex-direction: column;
-  padding: var(--pad);
-  background: var(--bg-block);
-  border: 1px solid var(--border);
-  overflow: hidden;
-}
-
-.approval-list {
-  overflow-y: auto;
-}
-
-.approval-item {
+.tool-approval {
+  margin-top: var(--gap);
+  padding-top: var(--gap);
+  border-top: 1px dashed var(--border);
   display: flex;
   flex-direction: column;
   gap: var(--gap);
-  padding-top: var(--pad);
-  border-top: 1px solid var(--border);
+  font-family: var(--font-sans);
 }
 
-.approval-item:first-child {
-  padding-top: 0;
-  border-top: none;
-}
-
-.approval-name {
-  color: var(--role-tool);
-  font-family: var(--font-mono);
-  font-weight: 600;
-}
-
-.approval-reason {
+.tool-approval-reason {
+  color: var(--fg);
   overflow-wrap: anywhere;
 }
 
-.approval-item summary {
-  cursor: pointer;
-  color: var(--fg-muted);
-}
-
-.approval-item pre {
-  max-height: 180px;
-  overflow: auto;
-  padding: var(--pad);
-  background: var(--bg);
-  font-family: var(--font-mono);
-  white-space: pre-wrap;
-  overflow-wrap: anywhere;
-}
-
-.approval-actions {
+.tool-approval-actions {
   display: flex;
   gap: var(--gap);
 }
 
-.approval-actions button:first-child {
+.tool-approval-actions button.approve {
   background: var(--accent);
   color: #fff;
   border-color: var(--accent);

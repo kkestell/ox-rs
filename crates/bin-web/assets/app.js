@@ -172,7 +172,6 @@ function mountSession(id, model, size) {
     root: node,
     transcript: node.querySelector(".transcript"),
     banner: node.querySelector(".banner"),
-    approvalPanel: null,
     composer: node.querySelector(".composer"),
     textarea: node.querySelector("textarea"),
     cancelButton: node.querySelector(".cancel"),
@@ -259,16 +258,13 @@ function applyEvent(sess, event) {
       break;
     case "tool_approval_requested":
       for (const request of event.requests || []) {
-        sess.pendingApprovals.set(request.request_id, {
-          request,
-          resolving: false,
-        });
+        sess.pendingApprovals.set(request.request_id, request);
+        renderInlineApproval(sess, request);
       }
-      renderApprovalPanel(sess);
       break;
     case "tool_approval_resolved":
+      removeInlineApproval(sess, event.request_id);
       sess.pendingApprovals.delete(event.request_id);
-      renderApprovalPanel(sess);
       break;
     case "error":
       finishStreaming(sess);
@@ -280,72 +276,54 @@ function applyEvent(sess, event) {
   }
 }
 
-function renderApprovalPanel(sess) {
-  if (sess.pendingApprovals.size === 0) {
-    if (sess.approvalPanel) {
-      sess.approvalPanel.remove();
-      sess.approvalPanel = null;
-    }
+function renderInlineApproval(sess, request) {
+  const toolBlock = sess.toolBlocks.get(request.tool_call_id);
+  if (!toolBlock) {
+    showBanner(sess, `approval for unknown tool call ${request.tool_call_id}`);
     return;
   }
+  if (toolBlock.querySelector(":scope > .tool-approval")) return;
 
-  if (!sess.approvalPanel) {
-    sess.approvalPanel = document.createElement("div");
-    sess.approvalPanel.className = "approval-panel";
-    sess.root.appendChild(sess.approvalPanel);
-  }
-  sess.approvalPanel.textContent = "";
+  const wrap = document.createElement("div");
+  wrap.className = "tool-approval";
+  wrap.dataset.requestId = request.request_id;
 
-  const list = document.createElement("div");
-  list.className = "approval-list";
-  for (const item of sess.pendingApprovals.values()) {
-    list.appendChild(renderApprovalItem(sess, item));
-  }
-  sess.approvalPanel.appendChild(list);
-}
-
-function renderApprovalItem(sess, item) {
-  const { request, resolving } = item;
-  const row = document.createElement("div");
-  row.className = "approval-item";
-
-  const name = document.createElement("div");
-  name.className = "approval-name";
-  name.textContent = request.name;
   const reason = document.createElement("div");
-  reason.className = "approval-reason";
+  reason.className = "tool-approval-reason";
   reason.textContent = request.reason;
-  const details = document.createElement("details");
-  const summary = document.createElement("summary");
-  summary.textContent = "Arguments";
-  details.appendChild(summary);
-  const pre = document.createElement("pre");
-  pre.textContent = prettyJson(request.arguments);
-  details.appendChild(pre);
 
   const actions = document.createElement("div");
-  actions.className = "approval-actions";
+  actions.className = "tool-approval-actions";
   const approve = document.createElement("button");
   approve.type = "button";
+  approve.className = "approve";
   approve.textContent = "Approve";
-  approve.disabled = resolving;
   approve.addEventListener("click", () => resolveApproval(sess, request.request_id, true));
   const reject = document.createElement("button");
   reject.type = "button";
   reject.textContent = "Reject";
-  reject.disabled = resolving;
   reject.addEventListener("click", () => resolveApproval(sess, request.request_id, false));
   actions.append(approve, reject);
 
-  row.append(name, reason, details, actions);
-  return row;
+  wrap.append(reason, actions);
+  toolBlock.appendChild(wrap);
+  scrollToBottom(sess);
+}
+
+function removeInlineApproval(sess, requestId) {
+  const sel = `.tool-approval[data-request-id="${CSS.escape(requestId)}"]`;
+  const el = sess.root.querySelector(sel);
+  if (el) el.remove();
 }
 
 async function resolveApproval(sess, requestId, approved) {
-  const item = sess.pendingApprovals.get(requestId);
-  if (!item || item.resolving) return;
-  item.resolving = true;
-  renderApprovalPanel(sess);
+  const request = sess.pendingApprovals.get(requestId);
+  if (!request) return;
+  const wrap = sess.root.querySelector(
+    `.tool-approval[data-request-id="${CSS.escape(requestId)}"]`,
+  );
+  const buttons = wrap ? wrap.querySelectorAll("button") : [];
+  for (const btn of buttons) btn.disabled = true;
   let res;
   try {
     res = await fetch(`/api/sessions/${sess.id}/tool-approvals/${encodeURIComponent(requestId)}`, {
@@ -354,14 +332,12 @@ async function resolveApproval(sess, requestId, approved) {
       body: JSON.stringify({ approved }),
     });
   } catch (err) {
-    item.resolving = false;
-    renderApprovalPanel(sess);
+    for (const btn of buttons) btn.disabled = false;
     showBanner(sess, `approval failed: ${err}`);
     return;
   }
   if (res.status === 204) return;
-  item.resolving = false;
-  renderApprovalPanel(sess);
+  for (const btn of buttons) btn.disabled = false;
   if (res.status === 404 || res.status === 410) {
     markSessionEnded(sess);
     showBanner(sess, "session not found");
@@ -371,8 +347,10 @@ async function resolveApproval(sess, requestId, approved) {
 }
 
 function clearApprovals(sess) {
+  for (const requestId of sess.pendingApprovals.keys()) {
+    removeInlineApproval(sess, requestId);
+  }
   sess.pendingApprovals.clear();
-  renderApprovalPanel(sess);
 }
 
 function beginStreaming(sess) {
