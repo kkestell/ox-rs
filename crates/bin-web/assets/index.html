@@ -1,0 +1,34 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ox</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <header id="header">
+    <span id="workspace-path"></span>
+    <button id="new-session" type="button">New Session</button>
+  </header>
+  <main id="sessions"></main>
+  <template id="session-template">
+    <section class="session">
+      <div class="session-header">
+        <span class="session-id"></span>
+        <div class="session-actions">
+          <button class="cancel" type="button" hidden>Cancel</button>
+          <button class="close" type="button" aria-label="Close session">&times;</button>
+        </div>
+      </div>
+      <div class="transcript"></div>
+      <div class="banner" hidden></div>
+      <form class="composer">
+        <textarea placeholder="Type a message. Ctrl+Enter to send." rows="3"></textarea>
+        <button type="submit">Send</button>
+      </form>
+    </section>
+  </template>
+  <script src="/app.js" type="module"></script>
+</body>
+</html>

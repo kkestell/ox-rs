@@ -1,18 +1,22 @@
-//! Receive- and send-side state machine for one agent split.
+//! Per-session receive- and send-side state machine.
 //!
-//! `SplitState` is the plain in-memory state every split tracks; `apply_event`
-//! mirrors the deleted `agent_host::AgentSplit::handle_event` body verbatim,
-//! and `begin_send` is the send-side guard previously inlined in
-//! `WorkspaceState::send`. Both are kept free-standing so the state machine
-//! tests run with no GTK / glib in scope — `SplitObject` just forwards to
-//! these functions and reconciles its own UI properties afterward.
+//! `SessionRuntime` is the pure in-memory state each session tracks.
+//! `apply_event` feeds an [`AgentEvent`] through the state machine, and
+//! `begin_send` is the send-side double-dispatch guard used by the HTTP
+//! server's `POST /messages` handler and any other caller that wants to
+//! place a fresh user turn on the agent's stdin.
+//!
+//! The module deliberately has no dependency on the UI framework or the
+//! transport — it is plain Rust data and transition functions. Frontend
+//! code (GTK previously, axum today) forwards events through
+//! `apply_event` and makes its own rendering decisions from the snapshot.
 
-use agent_host::StreamAccumulator;
+use app::StreamAccumulator;
 use domain::{Message, SessionId};
 use protocol::AgentEvent;
 
 #[derive(Default)]
-pub struct SplitState {
+pub struct SessionRuntime {
     pub messages: Vec<Message>,
     pub streaming: Option<StreamAccumulator>,
     pub waiting: bool,
@@ -22,28 +26,29 @@ pub struct SplitState {
 }
 
 /// Outcome of [`begin_send`]. The caller flips properties only when `Send`
-/// is returned — `Skip` is the silent double-Enter guard from the previous
-/// `WorkspaceState::send`.
+/// is returned — `Skip` is the silent double-send guard used to prevent a
+/// second `SendMessage` from being dispatched while a turn is in flight.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ShouldSend {
     Send,
     Skip,
 }
 
-impl SplitState {
+impl SessionRuntime {
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Whether quit-confirmation should ask the user before tearing the
-    /// agent down. True if a turn is in flight or already streaming.
+    /// Whether a turn is in flight (either waiting on the first stream
+    /// event or already streaming). Used by callers that want to know
+    /// before dispatching a new send.
     pub fn is_turn_in_progress(&self) -> bool {
         self.waiting || self.streaming.is_some()
     }
 }
 
-/// Receive-side state transition. Pure; no GTK, no IPC, no I/O.
-pub fn apply_event(state: &mut SplitState, event: AgentEvent) {
+/// Receive-side state transition. Pure; no IPC, no I/O.
+pub fn apply_event(state: &mut SessionRuntime, event: AgentEvent) {
     match event {
         AgentEvent::Ready { session_id, .. } => {
             // Record the ID; do NOT touch messages/waiting/streaming. Replayed
@@ -89,16 +94,16 @@ pub fn apply_event(state: &mut SplitState, event: AgentEvent) {
             state.waiting = false;
         }
         // AgentEvent is `#[non_exhaustive]`; future variants must be a no-op
-        // rather than crash the GUI.
+        // rather than crash callers.
         _ => {}
     }
 }
 
 /// Send-side state flip. Returns `Skip` when a turn is already in flight
-/// (double-Enter guard); otherwise sets `waiting`, clears `error`, clears
-/// `cancelled`, and returns `Send`. The IPC dispatch happens in the GObject
-/// wrapper after this returns `Send`.
-pub fn begin_send(state: &mut SplitState) -> ShouldSend {
+/// (double-send guard); otherwise sets `waiting`, clears `error`, clears
+/// `cancelled`, and returns `Send`. The IPC dispatch happens in the caller
+/// after this returns `Send`.
+pub fn begin_send(state: &mut SessionRuntime) -> ShouldSend {
     if state.waiting {
         return ShouldSend::Skip;
     }
@@ -110,9 +115,8 @@ pub fn begin_send(state: &mut SplitState) -> ShouldSend {
 
 #[cfg(test)]
 mod tests {
-    //! State-machine tests, ported from the deleted
-    //! `agent_host::split::tests` plus a pair of new `begin_send` cases.
-    //! No GTK; runs with `cargo test -p bin-gtk` headless.
+    //! State-machine tests, originally ported from the deleted
+    //! `agent_host::split::tests`. No UI framework; runs headless.
 
     use std::path::PathBuf;
 
@@ -122,7 +126,7 @@ mod tests {
 
     #[test]
     fn ready_records_session_id_and_leaves_other_fields_untouched() {
-        let mut state = SplitState::new();
+        let mut state = SessionRuntime::new();
         let id = SessionId::new_v4();
         apply_event(
             &mut state,
@@ -140,7 +144,7 @@ mod tests {
 
     #[test]
     fn message_appended_extends_history_without_touching_streaming() {
-        let mut state = SplitState::new();
+        let mut state = SessionRuntime::new();
         apply_event(
             &mut state,
             AgentEvent::MessageAppended {
@@ -158,7 +162,7 @@ mod tests {
         // Realistic ordering: StreamDelta arrives, then the agent commits
         // the final message via MessageAppended. The accumulator must be
         // dropped so the renderer does not render the same tokens twice.
-        let mut state = SplitState::new();
+        let mut state = SessionRuntime::new();
         apply_event(
             &mut state,
             AgentEvent::StreamDelta {
@@ -182,7 +186,7 @@ mod tests {
 
     #[test]
     fn turn_complete_clears_waiting_and_streaming_and_error() {
-        let mut state = SplitState::new();
+        let mut state = SessionRuntime::new();
         state.waiting = true;
         state.error = Some("old".into());
         state.streaming = Some(StreamAccumulator::new());
@@ -194,7 +198,7 @@ mod tests {
 
     #[test]
     fn error_frame_records_message_and_clears_streaming() {
-        let mut state = SplitState::new();
+        let mut state = SessionRuntime::new();
         state.waiting = true;
         state.streaming = Some(StreamAccumulator::new());
         apply_event(
@@ -210,7 +214,7 @@ mod tests {
 
     #[test]
     fn stream_delta_seeds_accumulator_on_first_event() {
-        let mut state = SplitState::new();
+        let mut state = SessionRuntime::new();
         apply_event(
             &mut state,
             AgentEvent::StreamDelta {
@@ -250,7 +254,7 @@ mod tests {
 
     #[test]
     fn turn_cancelled_sets_cancelled_and_clears_waiting_and_streaming() {
-        let mut state = SplitState::new();
+        let mut state = SessionRuntime::new();
         state.waiting = true;
         state.streaming = Some(StreamAccumulator::new());
         apply_event(&mut state, AgentEvent::TurnCancelled);
@@ -262,7 +266,7 @@ mod tests {
 
     #[test]
     fn turn_cancelled_commits_streaming_content_as_message() {
-        let mut state = SplitState::new();
+        let mut state = SessionRuntime::new();
         state.waiting = true;
         apply_event(
             &mut state,
@@ -282,7 +286,7 @@ mod tests {
 
     #[test]
     fn turn_cancelled_with_no_streaming_appends_no_message() {
-        let mut state = SplitState::new();
+        let mut state = SessionRuntime::new();
         state.waiting = true;
         apply_event(&mut state, AgentEvent::TurnCancelled);
         assert!(state.messages.is_empty(), "no message should be appended");
@@ -293,7 +297,7 @@ mod tests {
     fn turn_cancelled_with_empty_accumulator_does_not_commit() {
         // StreamAccumulator::new() with no pushes yields an empty content
         // vec — the cancel handler must not append a zero-block message.
-        let mut state = SplitState::new();
+        let mut state = SessionRuntime::new();
         state.waiting = true;
         state.streaming = Some(StreamAccumulator::new());
         apply_event(&mut state, AgentEvent::TurnCancelled);
@@ -312,7 +316,7 @@ mod tests {
         // MessageAppended handler clears the streaming accumulator, so the
         // TurnCancelled handler should find no accumulator and not append
         // a duplicate message.
-        let mut state = SplitState::new();
+        let mut state = SessionRuntime::new();
         state.waiting = true;
         apply_event(
             &mut state,
@@ -349,7 +353,7 @@ mod tests {
 
     #[test]
     fn begin_send_skips_when_already_waiting() {
-        let mut state = SplitState::new();
+        let mut state = SessionRuntime::new();
         state.waiting = true;
         state.error = Some("preserved".into());
         state.cancelled = true;
@@ -363,7 +367,7 @@ mod tests {
 
     #[test]
     fn begin_send_flips_waiting_and_clears_error_and_cancelled_when_idle() {
-        let mut state = SplitState::new();
+        let mut state = SessionRuntime::new();
         state.error = Some("prev".into());
         state.cancelled = true;
         let outcome = begin_send(&mut state);

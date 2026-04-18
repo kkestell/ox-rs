@@ -1,9 +1,9 @@
-//! `AgentClient` — the GUI-side handle on a single `ox-agent` subprocess.
+//! `AgentClient` — the host-side handle on a single `ox-agent` subprocess.
 //!
 //! A client owns the command-send side of the IPC channel; its paired
 //! [`AgentEventStream`] owns the event-receive side. The halves are split
 //! so a drain task can `await` on the stream without contending with the
-//! shared `WorkspaceState` mutex the command sender lives behind.
+//! shared state the command sender lives behind.
 //!
 //! The split between [`AgentClient::new`] and [`AgentClient::spawn`] exists
 //! for testing: `new` takes any `AsyncBufRead` / `AsyncWrite` pair so unit
@@ -12,46 +12,16 @@
 //!
 //! The agent is killed on drop (`kill_on_drop(true)`) so dropping the
 //! `AgentClient` is the cancellation path: the subprocess always dies with
-//! the GUI, not the other way around.
+//! the host, not the other way around.
 
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use domain::SessionId;
 use protocol::{AgentCommand, AgentEvent, read_frame, write_frame};
-use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufRead, AsyncWrite, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::mpsc;
-use uuid::Uuid;
-
-/// Stable, UI-local identity for a split.
-///
-/// Generated GUI-side when an `AgentClient` is created. Never crosses the
-/// IPC boundary to `ox-agent` — splits are a GUI concept. Lives here rather
-/// than in `domain` because it is not persisted and does not round-trip
-/// through the wire protocol: domain identities are reserved for values
-/// that cross processes or storage.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct SplitId(pub Uuid);
-
-impl SplitId {
-    pub fn new() -> Self {
-        Self(Uuid::new_v4())
-    }
-}
-
-impl Default for SplitId {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl std::fmt::Display for SplitId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.0.fmt(f)
-    }
-}
 
 /// Config passed to [`AgentClient::spawn`]. Deliberately small — extra agent
 /// knobs belong in the agent's env, not in a twelve-field "options" struct.
@@ -78,15 +48,14 @@ pub struct AgentSpawnConfig {
 /// is `Sync`, so the state guard can hand out `&AgentClient` references
 /// across tasks without cloning the client.
 pub struct AgentClient {
-    id: SplitId,
     cmd_tx: mpsc::UnboundedSender<AgentCommand>,
     /// Handle to the child process, if this client was created by `spawn`.
     /// Dropped along with the client, which triggers `kill_on_drop`.
     _child: Option<Child>,
 }
 
-/// Receive-side handle. Owned by a drain task in the desktop binary — kept
-/// off the shared state mutex so `recv().await` never blocks a lock.
+/// Receive-side handle. Owned by a drain task in the host binary — kept
+/// off any shared state mutex so `recv().await` never blocks a lock.
 pub struct AgentEventStream {
     rx: mpsc::UnboundedReceiver<AgentEvent>,
 }
@@ -115,10 +84,16 @@ impl AgentClient {
     {
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<AgentCommand>();
         let (evt_tx, evt_rx) = mpsc::unbounded_channel::<AgentEvent>();
-        spawn_reader(reader, evt_tx.clone());
-        spawn_writer(writer, cmd_rx, evt_tx);
+        // Oneshot that closes when the reader task exits. The writer
+        // task selects on `cmd_rx.recv()` and this oneshot so that an
+        // EOF on the agent's stdout propagates to the writer side —
+        // without it, a dead agent would leave the writer parked on
+        // `cmd_rx.recv()` and its `evt_tx` clone would keep the event
+        // stream open forever, masking the agent's death from the pump.
+        let (reader_closed_tx, reader_closed_rx) = tokio::sync::oneshot::channel::<()>();
+        spawn_reader(reader, evt_tx.clone(), reader_closed_tx);
+        spawn_writer(writer, cmd_rx, evt_tx, reader_closed_rx);
         let client = Self {
-            id: SplitId::new(),
             cmd_tx,
             _child: None,
         };
@@ -130,8 +105,8 @@ impl AgentClient {
     /// stdio along with the event stream.
     ///
     /// `kill_on_drop(true)` ties the agent's lifetime to the client — the
-    /// moment the `AgentClient` is dropped (window closed, split removed,
-    /// etc.), the child is SIGKILL'd.
+    /// moment the `AgentClient` is dropped (session removed, server
+    /// shutdown, etc.), the child is SIGKILL'd.
     pub fn spawn(config: AgentSpawnConfig) -> Result<(Self, AgentEventStream)> {
         let mut cmd = Command::new(&config.binary);
         cmd.arg("--workspace-root")
@@ -166,11 +141,6 @@ impl AgentClient {
         Ok((client, stream))
     }
 
-    /// Stable identifier assigned when the client was built.
-    pub fn id(&self) -> SplitId {
-        self.id
-    }
-
     /// Send a command to the agent. Returns `Err` only if the writer task
     /// has already shut down (agent dead or the `AgentClient` is being torn
     /// down).
@@ -186,11 +156,18 @@ impl AgentClient {
 // `new`, which calls these helpers, so there's exactly one implementation of
 // each task body. No risk of drift between test and production code paths.
 
-fn spawn_reader<R>(mut reader: R, evt_tx: mpsc::UnboundedSender<AgentEvent>)
-where
+fn spawn_reader<R>(
+    mut reader: R,
+    evt_tx: mpsc::UnboundedSender<AgentEvent>,
+    reader_closed_tx: tokio::sync::oneshot::Sender<()>,
+) where
     R: AsyncBufRead + Send + Unpin + 'static,
 {
     tokio::spawn(async move {
+        // Moving the sender into the task means the oneshot closes
+        // the instant the task exits — success or panic — which the
+        // writer task observes via its `reader_closed` branch.
+        let _reader_closed_tx = reader_closed_tx;
         loop {
             match read_frame::<_, AgentEvent>(&mut reader).await {
                 Ok(Some(evt)) => {
@@ -218,16 +195,29 @@ fn spawn_writer<W>(
     mut writer: W,
     mut cmd_rx: mpsc::UnboundedReceiver<AgentCommand>,
     evt_tx: mpsc::UnboundedSender<AgentEvent>,
+    mut reader_closed: tokio::sync::oneshot::Receiver<()>,
 ) where
     W: AsyncWrite + Send + Unpin + 'static,
 {
     tokio::spawn(async move {
-        while let Some(cmd) = cmd_rx.recv().await {
-            if let Err(e) = write_frame(&mut writer, &cmd).await {
-                let _ = evt_tx.send(AgentEvent::Error {
-                    message: format!("agent write failed: {e:#}"),
-                });
-                break;
+        loop {
+            tokio::select! {
+                maybe_cmd = cmd_rx.recv() => {
+                    let Some(cmd) = maybe_cmd else { break };
+                    if let Err(e) = write_frame(&mut writer, &cmd).await {
+                        let _ = evt_tx.send(AgentEvent::Error {
+                            message: format!("agent write failed: {e:#}"),
+                        });
+                        break;
+                    }
+                }
+                // The oneshot resolves (with Err) the instant the
+                // reader task exits and drops its sender. That
+                // signals "the agent's stdout is gone" — there's no
+                // point continuing to buffer commands, so we break
+                // and let our `evt_tx` clone drop, which lets the
+                // event stream return `None` to the pump.
+                _ = &mut reader_closed => break,
             }
         }
     });
@@ -427,19 +417,5 @@ mod tests {
             }
             other => panic!("unexpected {other:?}"),
         }
-    }
-
-    #[test]
-    fn split_ids_are_unique_per_client() {
-        // Minimal sanity check that the `SplitId` assigned by `new` is
-        // fresh per client — we rely on this for routing in WorkspaceState.
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        let _guard = rt.enter();
-        let (c1, _s1, _aw1, _ar1) = make_client();
-        let (c2, _s2, _aw2, _ar2) = make_client();
-        assert_ne!(c1.id(), c2.id());
     }
 }

@@ -11,7 +11,6 @@ protocol = { version = "0.1.0", path = "../protocol" }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
 tokio = { version = "1.52.1", features = ["rt", "macros", "io-util", "sync", "process", "time"] }
-uuid = { version = "1.23.1", features = ["v4", "serde"] }
 
 [dev-dependencies]
 app = { path = "../app", features = ["test-support"] }
