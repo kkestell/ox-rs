@@ -37,7 +37,7 @@ use adapter_process::ProcessSpawner;
 use adapter_storage::{DiskLayoutRepository, DiskSessionStore};
 use agent_host::{
     AgentSpawnConfig, CloseRequestSink, FirstTurnSink, Git, LayoutRepository, SessionRecords,
-    SlugGenerator,
+    SlugGenerator, workspace_slug,
 };
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -138,7 +138,8 @@ async fn run(cli: Cli) -> Result<()> {
 
     let home = dirs::home_dir().context("resolving the user's home directory")?;
     let ox_dir = home.join(".ox");
-    let sessions_dir = ox_dir.join("sessions");
+    let slug = workspace_slug(&workspace_root);
+    let sessions_dir = ox_dir.join("workspaces").join(&slug).join("sessions");
     let layout_path = ox_dir.join("workspaces.json");
 
     let layout: Arc<dyn LayoutRepository> =
