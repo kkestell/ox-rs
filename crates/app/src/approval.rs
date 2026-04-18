@@ -1,8 +1,8 @@
-use std::future::Future;
 use std::path::{Component, Path, PathBuf};
 use std::pin::Pin;
 
 use anyhow::{Context, Result, bail};
+use futures::Stream;
 
 use crate::cancel::CancelToken;
 use crate::ports::FileSystem;
@@ -30,31 +30,36 @@ pub struct ToolApprovalDecision {
     pub approved: bool,
 }
 
+/// Delivers user approval decisions for tool calls.
+///
+/// The returned stream yields one `ToolApprovalDecision` per request, in
+/// whatever order decisions arrive (not request order). The runner consumes
+/// decisions incrementally so each approved tool starts executing the moment
+/// its decision lands, rather than waiting for the full batch to resolve.
 pub trait ToolApprover: Send + Sync {
-    fn approve<'a>(
-        &'a self,
+    fn approve(
+        &self,
         requests: Vec<ToolApprovalRequest>,
         cancel: CancelToken,
-    ) -> Pin<Box<dyn Future<Output = Result<Vec<ToolApprovalDecision>>> + Send + 'a>>;
+    ) -> Pin<Box<dyn Stream<Item = Result<ToolApprovalDecision>> + Send + '_>>;
 }
 
 pub struct NoApprovalRequired;
 
 impl ToolApprover for NoApprovalRequired {
-    fn approve<'a>(
-        &'a self,
+    fn approve(
+        &self,
         requests: Vec<ToolApprovalRequest>,
         _cancel: CancelToken,
-    ) -> Pin<Box<dyn Future<Output = Result<Vec<ToolApprovalDecision>>> + Send + 'a>> {
-        Box::pin(async move {
-            Ok(requests
-                .into_iter()
-                .map(|request| ToolApprovalDecision {
+    ) -> Pin<Box<dyn Stream<Item = Result<ToolApprovalDecision>> + Send + '_>> {
+        Box::pin(futures::stream::iter(requests.into_iter().map(
+            |request| {
+                Ok(ToolApprovalDecision {
                     request_id: request.request_id,
                     approved: true,
                 })
-                .collect())
-        })
+            },
+        )))
     }
 }
 

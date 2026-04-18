@@ -249,75 +249,103 @@ impl<L: LlmProvider, S: SessionStore> SessionRunner<L, S> {
                 return Ok(TurnOutcome::Cancelled);
             }
 
-            let approval_requests: Vec<_> = approval_plan
-                .iter()
-                .filter_map(|planned| match planned {
-                    PlannedToolCall::NeedsApproval { request, .. } => Some(request.clone()),
-                    _ => None,
-                })
-                .collect();
-            let mut decisions = HashMap::new();
-            if !approval_requests.is_empty() {
-                on_event(TurnEvent::ToolApprovalRequested {
-                    requests: approval_requests.clone(),
-                });
-                let resolved = approver.approve(approval_requests, cancel.clone()).await?;
-                for decision in resolved {
-                    on_event(TurnEvent::ToolApprovalResolved {
-                        request_id: decision.request_id.clone(),
-                        approved: decision.approved,
-                    });
-                    decisions.insert(decision.request_id, decision.approved);
-                }
-            }
+            // Split the plan into entries that need a user decision and
+            // entries that can be committed immediately (Ready tools + policy
+            // errors). Ready tools run in plan order. Approval-gated tools
+            // execute in *decision arrival order* so a user approving one
+            // doesn't block on a different tool still waiting for input.
+            let mut approval_requests: Vec<ToolApprovalRequest> = Vec::new();
+            let mut pending: HashMap<String, (String, String, String)> = HashMap::new();
 
             for planned in approval_plan {
                 if cancel.is_cancelled() {
                     return Ok(TurnOutcome::Cancelled);
                 }
-                let (id, name, arguments) = match planned {
+                match planned {
                     PlannedToolCall::Ready {
                         id,
                         name,
                         arguments,
-                    } => (id, name, arguments),
+                    } => {
+                        execute_and_commit(
+                            &self.tools,
+                            &self.store,
+                            session,
+                            &mut on_event,
+                            id,
+                            name,
+                            arguments,
+                        )
+                        .await?;
+                    }
+                    PlannedToolCall::PolicyError { id, error } => {
+                        commit_tool_result(
+                            &self.store,
+                            session,
+                            &mut on_event,
+                            Message::tool_result(id, error, true),
+                        )
+                        .await?;
+                    }
                     PlannedToolCall::NeedsApproval {
                         id,
                         name,
                         arguments,
                         request,
                     } => {
-                        if !decisions.get(&request.request_id).copied().unwrap_or(false) {
-                            let tool_msg = Message::tool_result(id, TOOL_REJECTED_MESSAGE, true);
-                            session.push_message(tool_msg);
-                            on_event(TurnEvent::MessageAppended(
-                                session.messages.last().expect("just pushed"),
-                            ));
-                            self.store.save(session).await?;
-                            continue;
-                        }
-                        (id, name, arguments)
+                        pending.insert(request.request_id.clone(), (id, name, arguments));
+                        approval_requests.push(request);
                     }
-                    PlannedToolCall::PolicyError { id, error } => {
-                        let tool_msg = Message::tool_result(id, error, true);
-                        session.push_message(tool_msg);
-                        on_event(TurnEvent::MessageAppended(
-                            session.messages.last().expect("just pushed"),
-                        ));
-                        self.store.save(session).await?;
+                }
+            }
+
+            if !approval_requests.is_empty() {
+                on_event(TurnEvent::ToolApprovalRequested {
+                    requests: approval_requests.clone(),
+                });
+                let mut stream = approver.approve(approval_requests, cancel.clone());
+                while let Some(decision) = stream.next().await {
+                    let decision = decision?;
+                    on_event(TurnEvent::ToolApprovalResolved {
+                        request_id: decision.request_id.clone(),
+                        approved: decision.approved,
+                    });
+                    let Some((id, name, arguments)) = pending.remove(&decision.request_id) else {
                         continue;
+                    };
+                    if cancel.is_cancelled() {
+                        return Ok(TurnOutcome::Cancelled);
                     }
-                };
-                let (content, is_error) = match self.tools.execute(&name, &arguments).await {
-                    Ok(out) => (out, false),
-                    Err(e) => (format!("{e:#}"), true),
-                };
-                let tool_msg = Message::tool_result(id, content, is_error);
-                session.push_message(tool_msg);
-                on_event(TurnEvent::MessageAppended(
-                    session.messages.last().expect("just pushed"),
-                ));
-                self.store.save(session).await?;
+                    if decision.approved {
+                        execute_and_commit(
+                            &self.tools,
+                            &self.store,
+                            session,
+                            &mut on_event,
+                            id,
+                            name,
+                            arguments,
+                        )
+                        .await?;
+                    } else {
+                        commit_tool_result(
+                            &self.store,
+                            session,
+                            &mut on_event,
+                            Message::tool_result(id, TOOL_REJECTED_MESSAGE, true),
+                        )
+                        .await?;
+                    }
+                }
+                drop(stream);
+
+                // If the approver ended the stream without decisions for
+                // every pending request — typically because cancellation
+                // fired — treat the turn as cancelled so no tool runs
+                // without an explicit user choice.
+                if !pending.is_empty() {
+                    return Ok(TurnOutcome::Cancelled);
+                }
             }
         }
 
@@ -377,6 +405,42 @@ enum PlannedToolCall {
         id: String,
         error: String,
     },
+}
+
+async fn execute_and_commit<S: SessionStore>(
+    tools: &ToolRegistry,
+    store: &S,
+    session: &mut Session,
+    on_event: &mut (impl FnMut(TurnEvent<'_>) + Send),
+    id: String,
+    name: String,
+    arguments: String,
+) -> Result<()> {
+    let (content, is_error) = match tools.execute(&name, &arguments).await {
+        Ok(out) => (out, false),
+        Err(e) => (format!("{e:#}"), true),
+    };
+    commit_tool_result(
+        store,
+        session,
+        on_event,
+        Message::tool_result(id, content, is_error),
+    )
+    .await
+}
+
+async fn commit_tool_result<S: SessionStore>(
+    store: &S,
+    session: &mut Session,
+    on_event: &mut (impl FnMut(TurnEvent<'_>) + Send),
+    tool_msg: Message,
+) -> Result<()> {
+    session.push_message(tool_msg);
+    on_event(TurnEvent::MessageAppended(
+        session.messages.last().expect("just pushed"),
+    ));
+    store.save(session).await?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -475,16 +539,17 @@ mod tests {
     }
 
     impl ToolApprover for ScriptedApprover {
-        fn approve<'a>(
-            &'a self,
+        fn approve(
+            &self,
             requests: Vec<ToolApprovalRequest>,
             _cancel: CancelToken,
-        ) -> Pin<Box<dyn Future<Output = Result<Vec<ToolApprovalDecision>>> + Send + 'a>> {
-            Box::pin(async move {
-                self.batches.lock().unwrap().push(requests.clone());
-                Ok(requests
-                    .into_iter()
-                    .map(|request| ToolApprovalDecision {
+        ) -> Pin<Box<dyn futures::Stream<Item = Result<ToolApprovalDecision>> + Send + '_>>
+        {
+            self.batches.lock().unwrap().push(requests.clone());
+            let decisions: Vec<_> = requests
+                .into_iter()
+                .map(|request| {
+                    Ok(ToolApprovalDecision {
                         approved: self
                             .decisions
                             .get(&request.request_id)
@@ -492,8 +557,9 @@ mod tests {
                             .unwrap_or(false),
                         request_id: request.request_id,
                     })
-                    .collect())
-            })
+                })
+                .collect();
+            Box::pin(futures::stream::iter(decisions))
         }
     }
 
@@ -1033,22 +1099,27 @@ mod tests {
             tx: mpsc::Sender<Vec<ToolApprovalRequest>>,
         }
         impl ToolApprover for BlockingApprover {
-            fn approve<'a>(
-                &'a self,
+            fn approve(
+                &self,
                 requests: Vec<ToolApprovalRequest>,
                 cancel: CancelToken,
-            ) -> Pin<Box<dyn Future<Output = Result<Vec<ToolApprovalDecision>>> + Send + 'a>>
+            ) -> Pin<Box<dyn futures::Stream<Item = Result<ToolApprovalDecision>> + Send + '_>>
             {
                 let tx = self.tx.clone();
-                Box::pin(async move {
-                    let _ = tx.send(requests).await;
-                    loop {
-                        if cancel.is_cancelled() {
-                            return Ok(Vec::new());
+                Box::pin(futures::stream::unfold(
+                    (tx, cancel, Some(requests)),
+                    |(tx, cancel, requests)| async move {
+                        if let Some(pending) = requests {
+                            let _ = tx.send(pending).await;
                         }
-                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-                    }
-                })
+                        loop {
+                            if cancel.is_cancelled() {
+                                return None;
+                            }
+                            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                        }
+                    },
+                ))
             }
         }
 

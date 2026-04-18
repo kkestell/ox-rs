@@ -24,7 +24,9 @@
 use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Result;
 use app::{
@@ -32,13 +34,15 @@ use app::{
     ToolApprovalRequest as AppToolApprovalRequest, ToolApprover, TurnEvent, TurnOutcome,
 };
 use domain::SessionId;
+use futures::{Stream, StreamExt};
+use futures::stream::FuturesUnordered;
 use protocol::{AgentCommand, AgentEvent, read_frame, write_frame};
 use tokio::io::{AsyncBufRead, AsyncWrite};
 use tokio::sync::{Mutex, mpsc, oneshot};
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 struct ApprovalBroker {
-    pending: Mutex<HashMap<String, oneshot::Sender<bool>>>,
+    pending: Arc<Mutex<HashMap<String, oneshot::Sender<bool>>>>,
 }
 
 impl ApprovalBroker {
@@ -50,49 +54,55 @@ impl ApprovalBroker {
 }
 
 impl ToolApprover for ApprovalBroker {
-    fn approve<'a>(
-        &'a self,
+    fn approve(
+        &self,
         requests: Vec<AppToolApprovalRequest>,
         cancel: CancelToken,
-    ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<Vec<ToolApprovalDecision>>> + Send + 'a>,
-    > {
-        Box::pin(async move {
+    ) -> Pin<Box<dyn Stream<Item = Result<ToolApprovalDecision>> + Send + '_>> {
+        let pending = self.pending.clone();
+        // Register oneshot senders, then yield decisions as each receiver
+        // resolves. FuturesUnordered drives all receivers concurrently so
+        // whichever the user approves first flows to the runner first.
+        Box::pin(futures::stream::once(async move {
             let mut receivers = Vec::with_capacity(requests.len());
             {
-                let mut pending = self.pending.lock().await;
+                let mut locked = pending.lock().await;
                 for request in requests {
                     let (tx, rx) = oneshot::channel();
-                    pending.insert(request.request_id.clone(), tx);
+                    locked.insert(request.request_id.clone(), tx);
                     receivers.push((request.request_id, rx));
                 }
             }
 
-            let mut decisions = Vec::with_capacity(receivers.len());
-            for (request_id, mut rx) in receivers {
-                loop {
-                    if cancel.is_cancelled() {
-                        self.pending.lock().await.remove(&request_id);
-                        decisions.push(ToolApprovalDecision {
-                            request_id,
-                            approved: false,
-                        });
-                        break;
-                    }
-                    tokio::select! {
-                        decision = &mut rx => {
-                            decisions.push(ToolApprovalDecision {
-                                request_id,
-                                approved: decision.unwrap_or(false),
-                            });
-                            break;
+            let futures: FuturesUnordered<_> = receivers
+                .into_iter()
+                .map(|(request_id, mut rx)| {
+                    let cancel = cancel.clone();
+                    let pending = pending.clone();
+                    async move {
+                        loop {
+                            if cancel.is_cancelled() {
+                                pending.lock().await.remove(&request_id);
+                                return Ok(ToolApprovalDecision {
+                                    request_id,
+                                    approved: false,
+                                });
+                            }
+                            tokio::select! {
+                                decision = &mut rx => {
+                                    return Ok(ToolApprovalDecision {
+                                        request_id,
+                                        approved: decision.unwrap_or(false),
+                                    });
+                                }
+                                _ = tokio::time::sleep(Duration::from_millis(25)) => {}
+                            }
                         }
-                        _ = tokio::time::sleep(std::time::Duration::from_millis(25)) => {}
                     }
-                }
-            }
-            Ok(decisions)
-        })
+                })
+                .collect();
+            futures
+        }).flatten())
     }
 }
 

@@ -9,6 +9,7 @@ test-support = []
 [dependencies]
 anyhow = "1.0.102"
 blake3 = "1.8.4"
+dirs = "6.0.0"
 domain = { version = "0.1.0", path = "../domain" }
 futures = "0.3.32"
 glob = "0.3.3"

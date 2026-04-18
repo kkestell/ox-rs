@@ -169,12 +169,21 @@ pub(crate) fn extract_tool_calls(msg: &domain::Message) -> Vec<(String, String, 
 }
 
 /// Resolve `file_path` relative to `workspace_root` if it's not absolute.
+/// Expands a leading `~/` to the user's home directory before the check.
 /// Used by every file tool so the LLM can pass either style.
 pub(crate) fn resolve_path(
     workspace_root: &std::path::Path,
     file_path: &str,
 ) -> std::path::PathBuf {
-    let p = std::path::Path::new(file_path);
+    let expanded = if let Some(rest) = file_path.strip_prefix("~/") {
+        match dirs::home_dir() {
+            Some(home) => return home.join(rest),
+            None => file_path.to_owned(),
+        }
+    } else {
+        file_path.to_owned()
+    };
+    let p = std::path::Path::new(&expanded);
     if p.is_absolute() {
         p.to_path_buf()
     } else {
@@ -248,5 +257,27 @@ mod tests {
         assert!(reg.is_empty());
         reg.register(Arc::new(FakeTool::new("t")) as Arc<dyn Tool>);
         assert!(!reg.is_empty());
+    }
+
+    #[test]
+    fn resolve_path_tilde_expands_to_home() {
+        let root = std::path::Path::new("/ws");
+        let resolved = resolve_path(root, "~/src/foo.txt");
+        let home = dirs::home_dir().expect("home dir");
+        assert_eq!(resolved, home.join("src/foo.txt"));
+    }
+
+    #[test]
+    fn resolve_path_tilde_relative_stays_under_root() {
+        let root = std::path::Path::new("/ws");
+        let resolved = resolve_path(root, "src/foo.txt");
+        assert_eq!(resolved, std::path::PathBuf::from("/ws/src/foo.txt"));
+    }
+
+    #[test]
+    fn resolve_path_absolute_stays_absolute() {
+        let root = std::path::Path::new("/ws");
+        let resolved = resolve_path(root, "/tmp/x.txt");
+        assert_eq!(resolved, std::path::PathBuf::from("/tmp/x.txt"));
     }
 }
