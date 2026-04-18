@@ -54,7 +54,7 @@ use agent_host::{
 };
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
-use domain::{CloseIntent, SessionId};
+use domain::{CloseIntent, Session, SessionId};
 
 use crate::registry::SessionRegistry;
 use crate::session::CloseStart;
@@ -224,9 +224,17 @@ impl SessionLifecycle {
                 )
             })?;
 
-        registry
-            .spawn_for_worktree(worktree_path, session_id, None)
+        let id = registry
+            .spawn_for_worktree(worktree_path.clone(), session_id, None)
+            .await?;
+
+        let session = Session::new(id, self.workspace.workspace_root.clone(), worktree_path);
+        self.session_store
+            .save(&session)
             .await
+            .with_context(|| format!("saving initial session record for {id}"))?;
+
+        Ok(id)
     }
 
     /// Merge `id`'s session branch back into the main workspace's base

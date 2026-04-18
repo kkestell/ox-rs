@@ -392,23 +392,6 @@ mod tests {
         (h.app, h.registry, h.rx)
     }
 
-    /// Persist a `Session` JSON for `id` so the lifecycle's merge/abandon
-    /// flow can look up its worktree path via `try_load`. In production
-    /// the agent writes this record on its first `TurnComplete`; in
-    /// tests the fake agent does nothing, so the harness seeds it by
-    /// hand with whatever worktree path the caller wants the flow to
-    /// operate on.
-    async fn seed_session_record(
-        store: &DiskSessionStore,
-        id: SessionId,
-        workspace_root: &std::path::Path,
-        worktree_path: PathBuf,
-    ) {
-        use app::SessionStore;
-        let session = domain::Session::new(id, workspace_root.to_path_buf(), worktree_path);
-        store.save(&session).await.expect("seed session");
-    }
-
     /// Drive `POST /api/sessions` end-to-end: the handler calls
     /// `lifecycle.create_and_spawn`, which pre-allocates a session id
     /// and passes it through to the spawn config. The test harness
@@ -475,10 +458,26 @@ mod tests {
 
     #[tokio::test]
     async fn create_session_returns_id_and_registers_it() {
-        let (app, registry, mut rx) = make_app().await;
-        let (status, id, _handles) = create_via_router(app.clone(), &mut rx).await;
+        let mut harness = make_harness().await;
+        let app = harness.app.clone();
+        let registry = harness.registry.clone();
+        let (status, id, handles) = create_via_router(app.clone(), &mut harness.rx).await;
         assert_eq!(status, StatusCode::OK);
         assert!(registry.get(id).is_some());
+
+        let saved = harness
+            .store
+            .try_load(id)
+            .await
+            .expect("load initial session record")
+            .expect("initial session record exists");
+        assert_eq!(saved.id, id);
+        assert_eq!(saved.workspace_root, harness.workspace_root);
+        assert_eq!(saved.worktree_path, handles.config.workspace_root);
+        assert!(
+            saved.messages.is_empty(),
+            "freshly-created sessions should not invent transcript history"
+        );
 
         // The snapshot following a create should include the session
         // even though no layout PUT has happened yet — the "extras"
@@ -745,13 +744,6 @@ mod tests {
     async fn seed_live_session(harness: &mut Harness) -> (SessionId, PathBuf, AgentHandles) {
         let (_, id, handles) = create_via_router(harness.app.clone(), &mut harness.rx).await;
         let worktree_path = handles.config.workspace_root.clone();
-        seed_session_record(
-            &harness.store,
-            id,
-            &harness.workspace_root,
-            worktree_path.clone(),
-        )
-        .await;
         // Use a recognisable branch name so assertions can verify the
         // correct branch was targeted end-to-end. FakeGit's default is
         // `"main"` which would collide with the workspace's base branch.
@@ -1522,17 +1514,15 @@ mod tests {
             registry,
             mut rx,
             git,
-            store,
-            workspace_root,
+            store: _store,
+            workspace_root: _workspace_root,
         } = make_harness().await;
         let (_, id, mut handles) = create_via_router(app.clone(), &mut rx).await;
 
         // The lifecycle's `create_and_spawn` already recorded an
-        // `AddWorktree` on the fake git; seed a session record so the
-        // merge's `try_load` can find a worktree path, and persist the
-        // same path the spawner config received so assertions match.
+        // `AddWorktree` on the fake git and saved the initial session
+        // record that merge will use to recover the worktree path.
         let worktree_path = handles.config.workspace_root.clone();
-        seed_session_record(&store, id, &workspace_root, worktree_path.clone()).await;
         // Script `current_branch` so the merge operates on a recognizable
         // session branch name the final assertion can look for.
         git.set_current_branch(worktree_path.clone(), "ox/abc12345");

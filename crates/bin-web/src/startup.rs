@@ -33,8 +33,8 @@ pub async fn assert_workspace_ready(
     })?;
     let base_branch = git.current_branch(workspace_root).await.with_context(|| {
         format!(
-            "ox needs a named branch checked out in {}. \
-             Run `git checkout <branch>` before launching.",
+            "ox needs a named branch with at least one commit checked out in {}. \
+             Run `git checkout <branch>` or create an initial commit before launching.",
             workspace_root.display()
         )
     })?;
@@ -146,6 +146,43 @@ mod tests {
         assert!(
             chain.contains("ox workspaces must be git repositories"),
             "missing user-facing hint: {chain}"
+        );
+    }
+
+    #[tokio::test]
+    async fn real_cli_git_rejects_unborn_repo() {
+        use adapter_git::CliGit;
+        use std::process::Stdio;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(tmp.path())
+            .args(["init", "-b", "main"])
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .stdin(Stdio::null())
+            .output()
+            .expect("spawn git init");
+        assert!(
+            output.status.success(),
+            "git init failed: {}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let git = CliGit::new();
+        let err = assert_workspace_ready(&git, tmp.path())
+            .await
+            .expect_err("unborn repo should be rejected");
+        let chain = format!("{err:#}");
+        assert!(
+            chain.contains("at least one commit"),
+            "missing startup hint: {chain}"
+        );
+        assert!(
+            chain.contains("initial commit"),
+            "missing initial commit hint: {chain}"
         );
     }
 }

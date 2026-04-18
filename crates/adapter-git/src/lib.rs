@@ -138,6 +138,17 @@ impl Git for CliGit {
                 workspace_root.display()
             );
         }
+        let head = run_git(
+            workspace_root,
+            &["rev-parse", "--verify", "--quiet", "HEAD"],
+        )
+        .await?;
+        if !head.status.success() {
+            bail!(
+                "branch {name} at {} has no commits; create an initial commit before launching ox",
+                workspace_root.display()
+            );
+        }
         Ok(name.to_owned())
     }
 
@@ -385,6 +396,11 @@ mod tests {
         root.to_path_buf()
     }
 
+    fn init_unborn_repo(root: &Path) -> PathBuf {
+        git_setup(root, &["init", "-b", "main"]);
+        root.to_path_buf()
+    }
+
     /// Make a second commit modifying `README.md`, used to force merge
     /// scenarios that diverge from the base branch.
     fn commit_change(root: &Path, message: &str, content: &str) {
@@ -465,6 +481,23 @@ mod tests {
             .expect_err("detached head should error");
         assert!(
             err.to_string().contains("detached"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn current_branch_errors_on_unborn_branch() {
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        init_unborn_repo(&repo);
+
+        let err = CliGit::new()
+            .current_branch(&repo)
+            .await
+            .expect_err("unborn branch should error");
+        assert!(
+            err.to_string().contains("has no commits"),
             "unexpected error: {err}"
         );
     }

@@ -180,6 +180,7 @@ function mountSession(id, model, size) {
     eventSource: null,
     accumulator: null,
     streamingEl: null,
+    toolBlocks: new Map(),
     turning: false,
     ended: false,
   };
@@ -292,8 +293,37 @@ function finishStreaming(sess) {
 function appendMessage(sess, message) {
   if (!message.content || message.content.length === 0) return;
   for (const block of message.content) {
-    sess.transcript.appendChild(renderBlock(block, message.role));
+    if (block.type === "tool_result") {
+      attachToolResult(sess, block);
+      continue;
+    }
+
+    const el = renderBlock(block, message.role);
+    if (block.type === "tool_call" && block.id) {
+      sess.toolBlocks.set(block.id, el);
+    }
+    sess.transcript.appendChild(el);
   }
+  scrollToBottom(sess);
+}
+
+function attachToolResult(sess, block) {
+  const toolBlock = sess.toolBlocks.get(block.tool_call_id);
+  if (!toolBlock) {
+    const msg = `protocol error: tool result without matching call (${block.tool_call_id})`;
+    console.error(`ox: ${msg}`, block);
+    showBanner(sess, msg);
+    return;
+  }
+
+  const existing = toolBlock.querySelector(":scope > .tool-result");
+  const result = renderToolResult(block);
+  if (existing) {
+    existing.replaceWith(result);
+  } else {
+    toolBlock.appendChild(result);
+  }
+  toolBlock.classList.toggle("error", block.is_error);
   scrollToBottom(sess);
 }
 
@@ -325,24 +355,13 @@ function renderBlock(block, role) {
     case "tool_call": {
       const wrap = document.createElement("div");
       wrap.className = "block tool";
+      if (block.id) wrap.dataset.toolCallId = block.id;
       const label = document.createElement("span");
       label.className = "tool-label";
       label.textContent = `→ ${block.name}`;
       wrap.appendChild(label);
       const pre = document.createElement("pre");
       pre.textContent = prettyJson(block.arguments);
-      wrap.appendChild(pre);
-      return wrap;
-    }
-    case "tool_result": {
-      const wrap = document.createElement("div");
-      wrap.className = `block ${block.is_error ? "error" : "tool"}`;
-      const label = document.createElement("span");
-      label.className = "tool-label";
-      label.textContent = block.is_error ? "← error" : "← result";
-      wrap.appendChild(label);
-      const pre = document.createElement("pre");
-      pre.textContent = block.content;
       wrap.appendChild(pre);
       return wrap;
     }
@@ -353,6 +372,19 @@ function renderBlock(block, role) {
       return div;
     }
   }
+}
+
+function renderToolResult(block) {
+  const wrap = document.createElement("div");
+  wrap.className = "tool-result";
+  const label = document.createElement("span");
+  label.className = "tool-label";
+  label.textContent = block.is_error ? "← error" : "← result";
+  wrap.appendChild(label);
+  const pre = document.createElement("pre");
+  pre.textContent = block.content;
+  wrap.appendChild(pre);
+  return wrap;
 }
 
 // Best-effort JSON prettify for tool arguments. Arguments may be unparseable
