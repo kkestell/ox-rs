@@ -18,7 +18,7 @@ The dependency exists because:
 
 **Resolution:** Moved `StreamAccumulator`, `Snapshot`, and `ToolDef` to `domain` alongside the `StreamEvent` / `Usage` types they build on. Dropped `app` from `agent-host`'s dependencies.
 
-### 1.2 Two session storage ports for the same concept
+### 1.2 Two session storage ports for the same concept ✅ FIXED
 
 Two separate traits model session persistence:
 
@@ -28,6 +28,8 @@ Two separate traits model session persistence:
 | `agent_host::SessionRecords` | `agent-host/src/session_records.rs:13` | `#[async_trait]` |
 
 `DiskSessionStore` implements both (`adapter-storage/src/lib.rs:133-145`). The `SessionRecords` impl just delegates to `SessionStore` methods. `SessionRecords` exists because `app::SessionStore` uses RPITIT, which can't be turned into a trait object — but the right fix is to make the trait object-safe (use `#[async_trait]` or boxed futures), not to define a second parallel trait.
+
+**Resolution:** Reshaped `app::SessionStore` to be dyn-compatible (RPITIT with explicit `Pin<Box<dyn Future + Send + '_>>` where needed) and renamed `load` to `try_load` returning `Result<Option<Session>>`. Deleted `SessionRecords` and its impl; all call sites now hold `Arc<dyn SessionStore>`.
 
 ### 1.3 Two `ToolApprovalRequest` types ✅ FIXED
 
@@ -56,7 +58,7 @@ This means consumers can `use app::StreamEvent` or `use domain::StreamEvent` int
 
 ## 2. Duplicated Code and Dual Implementations
 
-### 2.1 `async_trait` vs RPITIT inconsistency
+### 2.1 `async_trait` vs RPITIT inconsistency ✅ FIXED
 
 The codebase uses two different approaches for async trait methods:
 
@@ -64,6 +66,8 @@ The codebase uses two different approaches for async trait methods:
 - **`#[async_trait]`**: `agent_host::Git`, `agent_host::SessionRecords`, `agent_host::SlugGenerator`, `agent_host::AgentSpawner`, `agent_host::CloseRequestSink`, `agent_host::FirstTurnSink`
 
 This is why `SessionRecords` exists alongside `SessionStore` — RPITIT traits can't be object-safe in some patterns, so `async_trait` is used for the host-side traits that need `dyn`. The codebase should pick one strategy. Since edition 2024 + MSRV allows RPITIT in trait objects with `-> impl Future + Send`, or can use explicit boxing, `async_trait` is unnecessary overhead.
+
+**Resolution:** Converted every `agent-host` trait to RPITIT. Traits used behind `Arc<dyn _>` (`CloseRequestSink`, `FirstTurnSink`, `AgentSpawner`, `Git`, `SlugGenerator`) return `Pin<Box<dyn Future + Send + '_>>`; non-dyn traits return `impl Future + Send`. Dropped `async-trait` from `agent-host`'s dependencies.
 
 ### 2.2 `normalize_lexical` in `app::approval` is crate-local but broadly useful
 
@@ -84,7 +88,7 @@ This split is somewhat expected given the crate structure, but tests in `bin-web
 
 ## 3. Complex / Unusual Code
 
-### 3.1 Mega-files
+### 3.1 Mega-files ✅ FIXED
 
 | File | Lines | Contents |
 |---|---|---|
@@ -97,6 +101,16 @@ This split is somewhat expected given the crate structure, but tests in `bin-web
 | `app/src/stream.rs` | 865 | `StreamAccumulator`, `Snapshot`, 400+ lines of tests |
 
 The first three are the most concerning: they each bundle multiple responsibilities that would benefit from extraction into submodules. `use_cases.rs` in particular mixes the session runner, the tool-call loop, approval planning, and comprehensive tests all in a single flat file.
+
+**Resolution:** Every flagged file was split into per-concern submodules preserving git history via `git mv`:
+
+- `app/use_cases` → `runner.rs`, `tool_loop.rs`, `turn_event.rs`, `mod.rs`
+- `bin-web/routes` → `sessions.rs`, `messages.rs`, `layout.rs`, `static_assets.rs`, `mod.rs`
+- `bin-agent/driver` → `approval_broker.rs`, `reader.rs`, `turn.rs`, `mod.rs`
+- `bin-web/session` → `methods.rs`, `pump.rs`, `mod.rs`
+- `bin-web/registry` → `snapshot.rs`, `dispatch.rs`, `restore.rs`, `mod.rs`
+- `bin-web/lifecycle` → `close_guard.rs`, `sinks.rs`, `mod.rs`
+- `domain/stream` (post-move from 1.1) → `accumulator.rs`, `snapshot.rs`, `mod.rs`
 
 ### 3.2 `ApprovalBroker` polls with a 25ms sleep loop
 
@@ -129,7 +143,7 @@ pub fn clear_closing(state: &mut SessionRuntime)
 
 Every caller must pass `&mut SessionRuntime` explicitly. The comment says this is for "ownership model" reasons, but `&mut self` methods would be more natural and idiomatic. The free-function style forces callers to write `begin_send(&mut rt)` instead of `rt.begin_send()`.
 
-### 3.4 Three-phase init cycle between `SessionLifecycle` and `SessionRegistry`
+### 3.4 Three-phase init cycle between `SessionLifecycle` and `SessionRegistry` ✅ FIXED
 
 `bin-web/main.rs:215-224` documents a three-phase init to break a reference cycle:
 
@@ -139,9 +153,13 @@ Every caller must pass `&mut SessionRuntime` explicitly. The comment says this i
 
 The lifecycle accesses the registry through `Weak::upgrade()` at runtime, which can silently return `None` if the registry was dropped. This is architecturally fragile — any lifecycle method that needs the registry must handle the "registry gone" case, and there's no compile-time guarantee that `set_registry` was called before the first use.
 
-### 3.5 `DiskLayoutRepository` uses blocking `std::sync::Mutex` in async context
+**Resolution:** Replaced the `Weak<SessionRegistry>` callback with `tokio::sync::mpsc` channels. Sessions now hold `Arc<dyn CloseRequestSink>` backed by a `ChannelCloseSink` that pushes `CloseRequestMsg`/`FirstTurnMsg` onto unbounded channels; the composition root spawns consumer tasks that drain them and dispatch into `SessionLifecycle`. No more `Weak`, no more `set_registry`, init is single-phase.
+
+### 3.5 `DiskLayoutRepository` uses blocking `std::sync::Mutex` in async context ✅ FIXED
 
 `adapter-storage/src/lib.rs:3` uses `std::sync::Mutex` for the in-memory layout cache and calls `std::fs` (blocking I/O) for persistence. Meanwhile, `DiskSessionStore` in the same file uses `tokio::fs` (async I/O). The layout repo's `persist` method does synchronous file I/O while holding the mutex — this can block a tokio worker thread.
+
+**Resolution:** Swapped `std::sync::Mutex` for `tokio::sync::Mutex` and `std::fs::*` for `tokio::fs::*`. The mutex is held only around the in-memory cache update; disk writes happen outside the critical section so no `.await` straddles a lock.
 
 ### 3.6 `ActiveSession` has 13 fields behind 6 different synchronization primitives
 
@@ -177,16 +195,16 @@ The locking discipline comment at the top of the file is necessary because the l
 
 ## 4. Summary of Recommendations
 
-| Priority | Issue | Fix |
-|---|---|---|
-| High | `agent-host → app` dependency inversion | Move `StreamAccumulator` to `domain` or make `agent-host` a pure port crate |
-| High | Two `ToolApprovalRequest` types | Unify into one definition in `protocol` |
-| High | Two session storage ports | Make `app::SessionStore` object-safe and remove `SessionRecords` |
-| Medium | `async_trait` vs RPITIT inconsistency | Pick one strategy project-wide |
-| Medium | Mega-files (1835, 1788, 1494 lines) | Extract submodules |
-| Medium | Three-phase init cycle | Restructure to avoid the cycle, or use a builder that enforces ordering |
-| Medium | Blocking I/O in `DiskLayoutRepository` | Switch to `tokio::fs` |
-| Low | Free-function API on `SessionRuntime` | Convert to `&mut self` methods |
-| Low | 25ms polling in `ApprovalBroker` | Use a proper cancellation token |
-| Low | Dual import paths for `StreamEvent`/`Usage` | Remove the `app` re-export, import from `domain` directly |
-| Low | 9-parameter `spawn_pump` | Extract a `PumpContext` struct |
+| Priority | Issue | Fix | Status |
+|---|---|---|---|
+| High | `agent-host → app` dependency inversion | Move `StreamAccumulator` to `domain` or make `agent-host` a pure port crate | ✅ Fixed |
+| High | Two `ToolApprovalRequest` types | Unify into one definition in `protocol` | ✅ Fixed |
+| High | Two session storage ports | Make `app::SessionStore` object-safe and remove `SessionRecords` | ✅ Fixed |
+| Medium | `async_trait` vs RPITIT inconsistency | Pick one strategy project-wide | ✅ Fixed |
+| Medium | Mega-files (1835, 1788, 1494 lines) | Extract submodules | ✅ Fixed |
+| Medium | Three-phase init cycle | Restructure to avoid the cycle, or use a builder that enforces ordering | ✅ Fixed |
+| Medium | Blocking I/O in `DiskLayoutRepository` | Switch to `tokio::fs` | ✅ Fixed |
+| Low | Free-function API on `SessionRuntime` | Convert to `&mut self` methods | — |
+| Low | 25ms polling in `ApprovalBroker` | Use a proper cancellation token | — |
+| Low | Dual import paths for `StreamEvent`/`Usage` | Remove the `app` re-export, import from `domain` directly | — |
+| Low | 9-parameter `spawn_pump` | Extract a `PumpContext` struct | — |
