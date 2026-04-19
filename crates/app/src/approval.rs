@@ -3,6 +3,7 @@ use std::pin::Pin;
 
 use anyhow::{Context, Result, bail};
 use futures::Stream;
+pub use protocol::ToolApprovalRequest;
 
 use crate::cancel::CancelToken;
 use crate::ports::FileSystem;
@@ -13,15 +14,6 @@ pub const TOOL_REJECTED_MESSAGE: &str = "Tool call rejected by user";
 pub enum ApprovalRequirement {
     NotRequired,
     Required { reason: String },
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ToolApprovalRequest {
-    pub request_id: String,
-    pub tool_call_id: String,
-    pub name: String,
-    pub arguments: String,
-    pub reason: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

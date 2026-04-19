@@ -29,7 +29,7 @@ Two separate traits model session persistence:
 
 `DiskSessionStore` implements both (`adapter-storage/src/lib.rs:133-145`). The `SessionRecords` impl just delegates to `SessionStore` methods. `SessionRecords` exists because `app::SessionStore` uses RPITIT, which can't be turned into a trait object — but the right fix is to make the trait object-safe (use `#[async_trait]` or boxed futures), not to define a second parallel trait.
 
-### 1.3 Two `ToolApprovalRequest` types
+### 1.3 Two `ToolApprovalRequest` types ✅ FIXED
 
 Identical structs defined independently:
 
@@ -39,6 +39,8 @@ Identical structs defined independently:
 Both have the same five fields: `request_id`, `tool_call_id`, `name`, `arguments`, `reason`. The `bin-agent` driver manually converts between them field-by-field at `driver.rs:415-421`. This is a classic violation: the same concept exists in two crates because neither depends on the other, so a third definition was introduced instead of deciding where it truly belongs.
 
 **Fix:** Pick one canonical location (probably `protocol` since it's the wire type) and have `app` import or re-export it.
+
+**Resolution:** Made `protocol` the canonical home and had `app` depend on it and re-export the type. The field-by-field conversion in the driver is gone.
 
 ### 1.4 `app` re-exports `domain` types, creating dual import paths
 

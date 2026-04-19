@@ -171,6 +171,7 @@ dependencies = [
  "domain",
  "futures",
  "glob",
+ "protocol",
  "regex",
  "serde",
  "serde_json",

@@ -51,7 +51,7 @@ pub enum AgentCommand {
     },
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolApprovalRequest {
     pub request_id: String,
     pub tool_call_id: String,

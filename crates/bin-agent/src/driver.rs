@@ -410,16 +410,6 @@ where
                 let _ = tx.send(AgentEvent::MessageAppended { message: m.clone() });
             }
             TurnEvent::ToolApprovalRequested { requests } => {
-                let requests = requests
-                    .into_iter()
-                    .map(|request| protocol::ToolApprovalRequest {
-                        request_id: request.request_id,
-                        tool_call_id: request.tool_call_id,
-                        name: request.name,
-                        arguments: request.arguments,
-                        reason: request.reason,
-                    })
-                    .collect();
                 let _ = tx.send(AgentEvent::ToolApprovalRequested { requests });
             }
             TurnEvent::ToolApprovalResolved {
