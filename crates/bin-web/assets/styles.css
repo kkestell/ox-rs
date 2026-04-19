@@ -103,11 +103,18 @@ button:disabled {
 .session-header {
   display: flex;
   align-items: center;
-  justify-content: flex-end;
+  justify-content: space-between;
+  gap: var(--gap);
   padding: var(--pad);
   border-bottom: 1px solid var(--border);
   font-family: var(--font-mono);
   color: var(--fg-muted);
+}
+
+.session-slug {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .session-actions { display: flex; gap: var(--gap); }

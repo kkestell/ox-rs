@@ -16,7 +16,47 @@
 const state = {
   workspaceRoot: "",
   sessions: new Map(),
+  focusedSessionId: null,
+  spinnerPhase: 0,
 };
+
+// Window title — `<spinner> Ox - <slug>`. The spinner animates at 1Hz
+// while the focused pane's turn is running, and is omitted otherwise.
+// `<slug>` is the worktree directory's basename (pre-slug-rename it's
+// an 8-char hex id; post-rename it's `<slug>-<short>`).
+const SPINNER_FRAMES = ["⠂", "⠐"];
+
+function pathBasename(p) {
+  if (!p) return "";
+  const trimmed = String(p).replace(/[\/\\]+$/, "");
+  const idx = Math.max(trimmed.lastIndexOf("/"), trimmed.lastIndexOf("\\"));
+  return idx >= 0 ? trimmed.slice(idx + 1) : trimmed;
+}
+
+function focusedSession() {
+  const id = state.focusedSessionId;
+  return id ? state.sessions.get(id) || null : null;
+}
+
+function updateTitle() {
+  const sess = focusedSession();
+  const slug = sess?.slug || "";
+  const spinning = !!(sess && sess.turning && !sess.ended);
+  const prefix = spinning ? `${SPINNER_FRAMES[state.spinnerPhase % SPINNER_FRAMES.length]} ` : "";
+  const suffix = slug ? ` - ${slug}` : "";
+  document.title = `${prefix}Ox${suffix}`;
+}
+
+setInterval(() => {
+  state.spinnerPhase++;
+  updateTitle();
+}, 1000);
+
+function setFocusedSession(id) {
+  if (state.focusedSessionId === id) return;
+  state.focusedSessionId = id;
+  updateTitle();
+}
 
 // ---------------------------------------------------------------------------
 // StreamAccumulator — JS port of `crates/app/src/stream.rs::StreamAccumulator`
@@ -147,6 +187,7 @@ async function main() {
     mountSession(id, summary ? summary.model : "", size);
   }
   renderGutters();
+  updateTitle();
 
   document.getElementById("new-session").addEventListener("click", onNewSession);
 }
@@ -169,6 +210,7 @@ function mountSession(id, model, size) {
   const sess = {
     id,
     model,
+    slug: "",
     root: node,
     transcript: node.querySelector(".transcript"),
     banner: node.querySelector(".banner"),
@@ -177,6 +219,7 @@ function mountSession(id, model, size) {
     cancelButton: node.querySelector(".cancel"),
     mergeButton: node.querySelector(".merge"),
     abandonButton: node.querySelector(".abandon"),
+    slugEl: node.querySelector(".session-slug"),
     eventSource: null,
     accumulator: null,
     streamingEl: null,
@@ -202,9 +245,12 @@ function mountSession(id, model, size) {
   sess.cancelButton.addEventListener("click", () => cancelTurn(sess));
   sess.mergeButton.addEventListener("click", () => mergeSession(sess));
   sess.abandonButton.addEventListener("click", () => abandonSession(sess));
+  // Track the last pane that received focus — the window title follows it.
+  node.addEventListener("focusin", () => setFocusedSession(id));
 
   document.getElementById("sessions").appendChild(node);
   state.sessions.set(id, sess);
+  if (state.focusedSessionId === null) setFocusedSession(id);
 
   openStream(sess);
   return sess;
@@ -237,6 +283,20 @@ function openStream(sess) {
 
 function applyEvent(sess, event) {
   switch (event.type) {
+    case "ready": {
+      // `workspace_root` in the agent's frame is the session's worktree
+      // path. Its basename is `<short>` pre-slug-rename and
+      // `<slug>-<short>` post-rename; both are unique and human-readable
+      // enough for a window title. A slug-rename respawn fires a fresh
+      // Ready so the title and header follow the new name.
+      const nextSlug = pathBasename(event.workspace_root);
+      if (nextSlug !== sess.slug) {
+        sess.slug = nextSlug;
+        sess.slugEl.textContent = nextSlug;
+        if (state.focusedSessionId === sess.id) updateTitle();
+      }
+      break;
+    }
     case "message_appended":
       // A committed message supersedes the in-progress draft for this turn:
       // drop the draft, then render the authoritative content.
@@ -255,6 +315,7 @@ function applyEvent(sess, event) {
       clearBanner(sess);
       sess.turning = false;
       setComposerEnabled(sess, true);
+      if (state.focusedSessionId === sess.id) updateTitle();
       break;
     case "tool_approval_requested":
       for (const request of event.requests || []) {
@@ -272,6 +333,7 @@ function applyEvent(sess, event) {
       showBanner(sess, event.message);
       sess.turning = false;
       setComposerEnabled(sess, true);
+      if (state.focusedSessionId === sess.id) updateTitle();
       break;
   }
 }
@@ -504,6 +566,7 @@ async function sendMessage(sess) {
   sess.turning = true;
   setComposerEnabled(sess, false);
   clearBanner(sess);
+  if (state.focusedSessionId === sess.id) updateTitle();
   let res;
   try {
     res = await fetch(`/api/sessions/${sess.id}/messages`, {
@@ -515,6 +578,7 @@ async function sendMessage(sess) {
     sess.turning = false;
     setComposerEnabled(sess, true);
     showBanner(sess, `send failed: ${err}`);
+    if (state.focusedSessionId === sess.id) updateTitle();
     return;
   }
   if (res.status === 204) {
@@ -530,6 +594,7 @@ async function sendMessage(sess) {
     flashComposer(sess);
     sess.turning = false;
     setComposerEnabled(sess, true);
+    if (state.focusedSessionId === sess.id) updateTitle();
     return;
   }
   if (res.status === 410) {
@@ -547,6 +612,7 @@ async function sendMessage(sess) {
   sess.turning = false;
   setComposerEnabled(sess, true);
   showBanner(sess, `send failed: HTTP ${res.status}`);
+  if (state.focusedSessionId === sess.id) updateTitle();
 }
 
 async function cancelTurn(sess) {
@@ -713,6 +779,14 @@ function dismissPane(sess) {
     return ta && !ta.disabled;
   });
   if (next) next.querySelector("textarea").focus();
+  // If the dismissed pane held the title, shift focus to whichever
+  // pane we just focused (or the first remaining pane if none).
+  if (state.focusedSessionId === sess.id) {
+    const fallback = next || remaining[0];
+    const fallbackId = fallback ? fallback.dataset.sessionId : null;
+    state.focusedSessionId = fallbackId && state.sessions.has(fallbackId) ? fallbackId : null;
+    updateTitle();
+  }
 }
 
 function setCloseButtonsDisabled(sess, disabled) {
@@ -779,6 +853,7 @@ function markSessionEnded(sess) {
   sess.root.classList.add("ended");
   sess.textarea.disabled = true;
   sess.cancelButton.hidden = true;
+  if (state.focusedSessionId === sess.id) updateTitle();
   // Merge/Abandon stay enabled — the user still needs a way to finalize the
   // pane even if the agent exited. Merge/Abandon hitting 404 is the normal
   // dismiss path for an ended session whose server-side entry is already gone.
