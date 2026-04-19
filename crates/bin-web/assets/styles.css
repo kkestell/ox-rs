@@ -117,7 +117,14 @@ button:disabled {
   white-space: nowrap;
 }
 
-.session-actions { display: flex; gap: var(--gap); }
+.session-actions { display: flex; align-items: center; gap: var(--gap); }
+
+.usage-chip {
+  color: var(--fg-muted);
+  font-family: var(--font-mono);
+  font-size: 0.9em;
+  white-space: nowrap;
+}
 
 .transcript {
   flex: 1 1 auto;

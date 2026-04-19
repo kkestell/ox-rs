@@ -31,6 +31,7 @@ use agent_host::{
     AgentSpawnConfig, AgentSpawner, CloseRequestSink, FirstTurnSink, Layout, LayoutRepository,
 };
 use anyhow::{Context, Result, anyhow};
+use app::ModelCatalog;
 use domain::SessionId;
 
 use crate::session::ActiveSession;
@@ -49,6 +50,14 @@ pub struct SessionRegistry {
     spawn_config: AgentSpawnConfig,
     layout: Arc<dyn LayoutRepository>,
     workspace_root: PathBuf,
+    /// Per-session context-window lookup. Each spawn resolves the
+    /// session's model against the catalog and errors if the model is
+    /// missing — keeping resolution on the hot path (instead of once at
+    /// startup) lets future per-session model overrides fail loudly
+    /// rather than reusing a stale registry-scoped scalar. Surfaced to
+    /// the browser through `SessionSummary` as the denominator of the
+    /// context-usage chip.
+    catalog: Arc<dyn ModelCatalog>,
     /// Sink for `AgentEvent::RequestClose` frames the pump observes.
     /// Passed through to every `ActiveSession` at creation so the pump
     /// can route close intents to the lifecycle coordinator without a
@@ -70,6 +79,7 @@ impl SessionRegistry {
         spawn_config: AgentSpawnConfig,
         layout: Arc<dyn LayoutRepository>,
         workspace_root: PathBuf,
+        catalog: Arc<dyn ModelCatalog>,
         close_sink: Arc<dyn CloseRequestSink>,
         first_turn_sink: Arc<dyn FirstTurnSink>,
     ) -> Arc<Self> {
@@ -79,9 +89,23 @@ impl SessionRegistry {
             spawn_config,
             layout,
             workspace_root,
+            catalog,
             close_sink,
             first_turn_sink,
         })
+    }
+
+    /// Catalog reference so the snapshot layer can resolve per-session
+    /// denominators without reaching into registry internals.
+    pub(super) fn catalog(&self) -> &dyn ModelCatalog {
+        self.catalog.as_ref()
+    }
+
+    /// Default model this registry spawns sessions with. Used by the
+    /// snapshot layer to supply a denominator to the browser when the
+    /// workspace has no sessions yet.
+    pub(super) fn default_model(&self) -> &str {
+        &self.spawn_config.model
     }
 
     /// Drop the session from the registry. The `Arc<ActiveSession>`
@@ -185,6 +209,21 @@ impl SessionRegistry {
         // starts creating per-session worktrees.
         config.workspace_root = worktree_path;
         config.resume = resume;
+
+        // Per-session unknown-model rejection: if the catalog does not
+        // know the model this session would use, fail the spawn here
+        // with a pointed error rather than silently handing back a
+        // zero-token context window. An unknown model at this point
+        // means a bad `--model` flag or catalog drift — the caller (the
+        // HTTP handler or `main`) maps the error into a 502 / startup
+        // abort so the user fixes it instead of staring at a broken
+        // usage chip.
+        if self.catalog.context_window(&config.model).is_none() {
+            return Err(anyhow!(
+                "model {:?} is not present in the model catalog",
+                config.model,
+            ));
+        }
         // Pass the pre-allocated id through to the agent so the
         // on-disk `{id}.json`, the host-side worktree directory name,
         // and the `ox/<slug>` branch all share the same identifier.
@@ -279,7 +318,9 @@ mod tests {
     use tokio::time::timeout;
 
     use super::*;
-    use crate::test_support::{DuplexSpawner, empty_layout, test_registry, unique_temp_dir};
+    use crate::test_support::{
+        DuplexSpawner, empty_layout, test_catalog, test_registry, unique_temp_dir,
+    };
 
     /// Drive `registry.spawn_for_worktree` to completion by receiving the
     /// agent-side handles, writing `Ready(id)`, and awaiting the
@@ -571,6 +612,7 @@ mod tests {
             },
             Arc::new(store),
             workspace_root.clone(),
+            test_catalog(),
             Arc::new(agent_host::fake::NoopCloseRequestSink),
             Arc::new(agent_host::fake::NoopFirstTurnSink),
         );
@@ -665,6 +707,7 @@ mod tests {
             spawn_config,
             Arc::new(layout),
             workspace_root,
+            test_catalog(),
             Arc::new(agent_host::fake::NoopCloseRequestSink),
             Arc::new(agent_host::fake::NoopFirstTurnSink),
             session_store,
@@ -726,6 +769,7 @@ mod tests {
             spawn_config,
             Arc::new(layout),
             workspace_root,
+            test_catalog(),
             Arc::new(agent_host::fake::NoopCloseRequestSink),
             Arc::new(agent_host::fake::NoopFirstTurnSink),
             session_store,
@@ -777,6 +821,7 @@ mod tests {
                 spawn_config,
                 Arc::new(layout),
                 workspace_root.clone(),
+                test_catalog(),
                 Arc::new(agent_host::fake::NoopCloseRequestSink),
                 Arc::new(agent_host::fake::NoopFirstTurnSink),
                 session_store,
@@ -845,6 +890,7 @@ mod tests {
             spawn_config,
             Arc::new(layout),
             workspace_root,
+            test_catalog(),
             Arc::new(agent_host::fake::NoopCloseRequestSink),
             Arc::new(agent_host::fake::NoopFirstTurnSink),
             session_store,
@@ -877,6 +923,7 @@ mod tests {
             },
             Arc::new(store),
             workspace_root.clone(),
+            test_catalog(),
             Arc::new(agent_host::fake::NoopCloseRequestSink),
             Arc::new(agent_host::fake::NoopFirstTurnSink),
         );

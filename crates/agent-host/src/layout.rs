@@ -4,11 +4,6 @@
 //! and the horizontal fraction each pane occupied, so a later launch can
 //! rebuild the tiled UI. File-backed persistence is an outward adapter; this
 //! crate keeps only the pure data shape, normalization rules, and port.
-//!
-//! No `focused` field: focus is pure client-side UI state (the browser
-//! doesn't need the server to remember which tab it last clicked on).
-//! Files carrying an unknown `focused` field round-trip cleanly —
-//! unknown fields are ignored by serde.
 
 use std::future::Future;
 use std::path::Path;

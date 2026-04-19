@@ -32,15 +32,15 @@ use std::process::ExitCode;
 use std::sync::Arc;
 
 use adapter_git::CliGit;
-use adapter_llm::OpenRouterSlugGenerator;
+use adapter_llm::{OpenRouterCatalog, OpenRouterSlugGenerator};
 use adapter_process::ProcessSpawner;
 use adapter_storage::{DiskLayoutRepository, DiskSessionStore};
 use agent_host::{
     AgentSpawnConfig, CloseRequestSink, FirstTurnSink, Git, LayoutRepository, SlugGenerator,
     workspace_slug,
 };
-use anyhow::{Context, Result};
-use app::SessionStore;
+use anyhow::{Context, Result, anyhow};
+use app::{ModelCatalog, SessionStore};
 use clap::Parser;
 use domain::SessionId;
 use tokio::net::TcpListener;
@@ -54,13 +54,13 @@ use crate::startup::assert_workspace_ready;
 use crate::state::AppState;
 
 /// Default OpenRouter model for new sessions.
-const DEFAULT_MODEL: &str = "anthropic/claude-sonnet-4.5";
+const DEFAULT_MODEL: &str = "deepseek/deepseek-v3.2";
 
 /// Default port for the local HTTP server.
 const DEFAULT_PORT: u16 = 3737;
 
 #[derive(Parser, Debug)]
-#[command(name = "ox", about = "Local web UI for ox sessions")]
+#[command(name = "ox", about = "Local web UI for Ox sessions")]
 struct Cli {
     /// Resume a single session by id, bypassing the saved layout.
     #[arg(long)]
@@ -129,6 +129,35 @@ async fn run(cli: Cli) -> Result<()> {
 
     let api_key = std::env::var("OPENROUTER_API_KEY")
         .context("OPENROUTER_API_KEY is not set — export it before launching ox")?;
+
+    // Fetch the OpenRouter `/models` catalog now so the per-session
+    // context window is known by the time the browser paints. Failure
+    // here aborts startup with a pointed error: the usage chip is a
+    // load-bearing part of the UI, so running with a missing catalog
+    // would ship a broken feature rather than gracefully degrade. The
+    // base URL is deliberately fixed here — the rest of the OpenRouter
+    // adapter hardcodes it too, so there is no config knob to forget.
+    let http_client = reqwest::Client::new();
+    let catalog = OpenRouterCatalog::fetch(&http_client, "https://openrouter.ai/api/v1", &api_key)
+        .await
+        .with_context(|| {
+            "failed to fetch OpenRouter /models catalog from https://openrouter.ai/api/v1/models"
+                .to_string()
+        })?;
+
+    // Validate the default model up front. An unknown model at this
+    // point is a configuration error (bad --model flag, or catalog
+    // drift); fail fast so the user fixes it before sessions spawn.
+    // The registry re-checks at each spawn, but that path surfaces a
+    // 502 to an in-flight HTTP client instead of aborting cleanly at
+    // startup.
+    if catalog.context_window(&cli.model).is_none() {
+        return Err(anyhow!(
+            "model {:?} is not present in the OpenRouter catalog — pick a known model id with --model",
+            cli.model,
+        ));
+    }
+    let catalog: Arc<dyn ModelCatalog> = Arc::new(catalog);
 
     // The slug generator needs the same OpenRouter credentials the
     // agent does, plus a model id. We clone the key so the spawn_config
@@ -213,6 +242,7 @@ async fn run(cli: Cli) -> Result<()> {
             spawn_config.clone(),
             layout.clone(),
             workspace_root.clone(),
+            catalog.clone(),
             close_sink.clone(),
             first_turn_sink.clone(),
         );
@@ -224,6 +254,7 @@ async fn run(cli: Cli) -> Result<()> {
             spawn_config.clone(),
             layout,
             workspace_root.clone(),
+            catalog.clone(),
             close_sink.clone(),
             first_turn_sink.clone(),
             session_store_dyn.clone(),

@@ -43,6 +43,24 @@ pub trait SecretStore {
     fn get(&self, key: &str) -> Result<Option<String>>;
 }
 
+/// Read-only lookup of per-model metadata — specifically the token context
+/// window size — for UI display. Kept deliberately narrow: no other fields,
+/// no refresh, no async. The host builds this once at startup from whatever
+/// catalog its provider exposes (OpenRouter's `/models` endpoint today) and
+/// consults it whenever a session needs to know its denominator.
+///
+/// The trait lives here alongside the other driven ports even though the
+/// only current consumer is the web host. Future providers (Ollama, a
+/// direct-Anthropic adapter) will each need their own catalog, and a shared
+/// trait keeps the host wiring provider-agnostic.
+pub trait ModelCatalog: Send + Sync {
+    /// Returns the model's context window in tokens, or `None` if the
+    /// catalog has never heard of it. Callers that consider an unknown
+    /// model a fatal error should handle the `None` branch explicitly —
+    /// the trait refuses to invent a fallback.
+    fn context_window(&self, model: &str) -> Option<u32>;
+}
+
 pub trait FileSystem: Send + Sync {
     fn canonicalize(&self, path: &Path) -> impl Future<Output = Result<PathBuf>> + Send;
     fn read(&self, path: &Path) -> impl Future<Output = Result<String>> + Send;

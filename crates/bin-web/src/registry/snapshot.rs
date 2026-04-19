@@ -15,12 +15,27 @@ pub struct SnapshotJson {
     pub workspace_root: PathBuf,
     pub sessions: Vec<SessionSummary>,
     pub layout: Layout,
+    /// Registry-wide token context window. Duplicates the value on each
+    /// [`SessionSummary`] (they all share the same model today), but
+    /// surfaced at the top level so a fresh workspace with no sessions
+    /// can still populate the usage-chip denominator before the first
+    /// session is created. Resolved from the registry's catalog against
+    /// `spawn_config.model`; defaults to 0 if the catalog is silent
+    /// (shouldn't happen — main.rs validates at startup — but treated
+    /// as "unknown" here rather than panicking at snapshot time).
+    pub context_window: u32,
 }
 
 #[derive(Debug, Serialize)]
 pub struct SessionSummary {
     pub session_id: SessionId,
     pub model: String,
+    /// Token context window for this session's model, sourced from the
+    /// OpenRouter catalog. Resolved per-session at snapshot time so a
+    /// future per-session model override lands on the wire without any
+    /// further plumbing work. Rendered as the denominator of the
+    /// frontend's usage chip.
+    pub context_window: u32,
 }
 
 impl SessionRegistry {
@@ -35,6 +50,16 @@ impl SessionRegistry {
             }
         };
         let sessions = self.sessions.read().expect("sessions lock poisoned");
+        let default_model = self.default_model();
+        // Every session today uses `spawn_config.model`; resolving once
+        // here is equivalent to resolving per session and saves a
+        // catalog lookup per entry. If per-session models arrive later,
+        // this switches to per-session resolution without changing the
+        // wire payload.
+        let context_window = self
+            .catalog()
+            .context_window(default_model)
+            .unwrap_or(0);
 
         // Present sessions in layout order first, then append any
         // live sessions that aren't referenced by the layout (e.g.,
@@ -47,7 +72,8 @@ impl SessionRegistry {
                 let _ = session; // Summary doesn't need session-level state today.
                 ordered.push(SessionSummary {
                     session_id: *id,
-                    model: self.spawn_config.model.clone(),
+                    model: default_model.to_owned(),
+                    context_window,
                 });
                 seen.insert(*id);
             }
@@ -56,7 +82,8 @@ impl SessionRegistry {
             if !seen.contains(id) {
                 ordered.push(SessionSummary {
                     session_id: *id,
-                    model: self.spawn_config.model.clone(),
+                    model: default_model.to_owned(),
+                    context_window,
                 });
             }
         }
@@ -65,6 +92,7 @@ impl SessionRegistry {
             workspace_root: self.workspace_root.clone(),
             sessions: ordered,
             layout,
+            context_window,
         }
     }
 }

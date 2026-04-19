@@ -1,3 +1,4 @@
+mod catalog;
 mod slug;
 pub mod sse;
 pub mod wire;
@@ -17,6 +18,7 @@ pub struct OpenRouterProvider {
     model: String,
 }
 
+pub use catalog::{CatalogError, OpenRouterCatalog};
 pub use slug::OpenRouterSlugGenerator;
 
 impl OpenRouterProvider {

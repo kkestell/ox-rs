@@ -5,7 +5,7 @@ use agent_host::{
     AgentSpawnConfig, AgentSpawner, CloseRequestSink, FirstTurnSink, LayoutRepository,
 };
 use anyhow::{Context, Result, anyhow};
-use app::SessionStore;
+use app::{ModelCatalog, SessionStore};
 use domain::SessionId;
 
 use super::SessionRegistry;
@@ -26,11 +26,13 @@ impl SessionRegistry {
     /// If no session resumes, the registry is returned empty. The
     /// frontend will show the workspace with no panes until the user
     /// creates a session via `POST /api/sessions`.
+    #[allow(clippy::too_many_arguments)]
     pub async fn restore(
         spawner: Arc<dyn AgentSpawner>,
         spawn_config: AgentSpawnConfig,
         layout: Arc<dyn LayoutRepository>,
         workspace_root: PathBuf,
+        catalog: Arc<dyn ModelCatalog>,
         close_sink: Arc<dyn CloseRequestSink>,
         first_turn_sink: Arc<dyn FirstTurnSink>,
         session_store: Arc<dyn SessionStore>,
@@ -40,6 +42,7 @@ impl SessionRegistry {
             spawn_config,
             layout,
             workspace_root.clone(),
+            catalog,
             close_sink,
             first_turn_sink,
         );

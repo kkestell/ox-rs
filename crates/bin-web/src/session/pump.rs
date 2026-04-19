@@ -211,9 +211,11 @@ pub(super) fn spawn_pump(
 }
 
 fn messages_match(left: &domain::Message, right: &domain::Message) -> bool {
-    left.role == right.role
-        && left.content == right.content
-        && left.token_count == right.token_count
+    // Equality over `usage` uses `Option<Usage>` semantics: two
+    // `None`s match (initial / pre-finish state), two matching
+    // `Some`s match, and `None` vs `Some` correctly flags a mismatch
+    // where one side observed a `Finished` event and the other did not.
+    left.role == right.role && left.content == right.content && left.usage == right.usage
 }
 
 /// Walk `history` front-to-back and return the concatenated text of
@@ -239,4 +241,76 @@ fn extract_first_user_message(history: &[AgentEvent]) -> Option<String> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use domain::{Message, Usage};
+
+    fn text_message(role: Role, text: &str, usage: Option<Usage>) -> Message {
+        Message {
+            role,
+            content: vec![ContentBlock::Text {
+                text: text.to_owned(),
+            }],
+            usage,
+        }
+    }
+
+    #[test]
+    fn matches_when_both_usage_fields_are_none() {
+        // Two messages with no usage reported must compare equal.
+        // Guards the "initial / pre-finished" path the pump uses when
+        // replaying history: a resumed session's stored messages carry
+        // no usage until the first post-resume TurnComplete.
+        let a = text_message(Role::Assistant, "hi", None);
+        let b = text_message(Role::Assistant, "hi", None);
+        assert!(messages_match(&a, &b));
+    }
+
+    #[test]
+    fn mismatches_when_none_vs_some_even_if_some_is_default() {
+        // `Some(Usage::default())` encodes "Finished observed with all
+        // zero counts" — semantically distinct from `None` ("no Finished
+        // seen yet"). The pump's replay filter must treat the two as
+        // different so a re-landed message with a freshly reported
+        // zero-usage doesn't silently match the pre-finished placeholder.
+        let pre_finish = text_message(Role::Assistant, "hi", None);
+        let finished_zero = text_message(Role::Assistant, "hi", Some(Usage::default()));
+        assert!(!messages_match(&pre_finish, &finished_zero));
+        assert!(!messages_match(&finished_zero, &pre_finish));
+    }
+
+    #[test]
+    fn matches_when_both_usage_fields_are_some_default() {
+        // Symmetric to the None/None case: two messages that both
+        // recorded a zeroed `Finished` must compare equal.
+        let a = text_message(Role::Assistant, "hi", Some(Usage::default()));
+        let b = text_message(Role::Assistant, "hi", Some(Usage::default()));
+        assert!(messages_match(&a, &b));
+    }
+
+    #[test]
+    fn mismatches_when_some_usages_differ_in_counts() {
+        let a = text_message(
+            Role::Assistant,
+            "hi",
+            Some(Usage {
+                prompt_tokens: 10,
+                completion_tokens: 1,
+                reasoning_tokens: 0,
+            }),
+        );
+        let b = text_message(
+            Role::Assistant,
+            "hi",
+            Some(Usage {
+                prompt_tokens: 20,
+                completion_tokens: 1,
+                reasoning_tokens: 0,
+            }),
+        );
+        assert!(!messages_match(&a, &b));
+    }
 }

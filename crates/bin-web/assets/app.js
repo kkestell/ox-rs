@@ -18,6 +18,13 @@ const state = {
   sessions: new Map(),
   focusedSessionId: null,
   spinnerPhase: 0,
+  // Token context window for the workspace's configured model, taken
+  // from the first session summary at snapshot load. Freshly created
+  // sessions inherit this value so their usage chip has the same
+  // denominator as the sessions restored from disk. Until a session
+  // exists (first page load of an empty workspace), this stays 0 —
+  // `mountSession` tolerates that and simply hides the chip.
+  contextWindow: 0,
 };
 
 // Window title — `<spinner> Ox - <slug>`. The spinner animates at 1Hz
@@ -106,9 +113,6 @@ class StreamAccumulator {
       case "reasoning_signature":
         this.signature = event.signature;
         break;
-      case "finished":
-        // Usage is not rendered in V1; ignore.
-        break;
     }
   }
 
@@ -171,6 +175,12 @@ async function main() {
   // ids the server no longer knows about, and live sessions the layout
   // doesn't (e.g. a restore-fallback session created before any client
   // PUT landed).
+  // The snapshot publishes a registry-wide context window at the top
+  // level so a fresh workspace with no sessions can still populate the
+  // usage-chip denominator. Per-session `context_window` on
+  // `SessionSummary` duplicates this today but would be the natural
+  // place to grow per-session models later.
+  state.contextWindow = snapshot.context_window || 0;
   const byId = new Map(snapshot.sessions.map((s) => [s.session_id, s]));
   const order = [];
   for (const id of snapshot.layout.order) {
@@ -184,7 +194,12 @@ async function main() {
     const id = order[i];
     const summary = byId.get(id);
     const size = snapshot.layout.sizes[i];
-    mountSession(id, summary ? summary.model : "", size);
+    mountSession(
+      id,
+      summary ? summary.model : "",
+      summary ? summary.context_window : 0,
+      size,
+    );
   }
   renderGutters();
   updateTitle();
@@ -196,7 +211,11 @@ async function main() {
 // Per-session mount
 // ---------------------------------------------------------------------------
 
-function mountSession(id, model, size) {
+// Format a non-negative integer with locale thousands separators. Used
+// for both sides of the usage chip so 137280 reads as "137,280".
+const USAGE_FORMATTER = new Intl.NumberFormat("en-US");
+
+function mountSession(id, model, contextWindow, size) {
   const tpl = document.getElementById("session-template");
   const node = tpl.content.firstElementChild.cloneNode(true);
   node.dataset.sessionId = id;
@@ -210,6 +229,10 @@ function mountSession(id, model, size) {
   const sess = {
     id,
     model,
+    // Denominator of the usage chip. Sourced once from the registry
+    // snapshot — every session in a given workspace uses the same model
+    // today, so there is no per-session override.
+    contextWindow,
     slug: "",
     root: node,
     transcript: node.querySelector(".transcript"),
@@ -220,6 +243,7 @@ function mountSession(id, model, size) {
     mergeButton: node.querySelector(".merge"),
     abandonButton: node.querySelector(".abandon"),
     slugEl: node.querySelector(".session-slug"),
+    usageChipEl: node.querySelector(".usage-chip"),
     eventSource: null,
     accumulator: null,
     streamingEl: null,
@@ -251,6 +275,14 @@ function mountSession(id, model, size) {
   document.getElementById("sessions").appendChild(node);
   state.sessions.set(id, sess);
   if (state.focusedSessionId === null) setFocusedSession(id);
+
+  // Pre-first-turn chip: show `0 / <window> (0%)` the moment the pane
+  // mounts so the UI doesn't pop the chip into place after the first
+  // assistant message. The chip stays synced with the pane itself —
+  // the next `message_appended` with usage overwrites it. If the
+  // catalog wasn't available (contextWindow=0), `renderUsage` hides
+  // the chip rather than rendering nonsense.
+  renderUsage(sess, { prompt_tokens: 0 });
 
   openStream(sess);
   return sess;
@@ -299,9 +331,15 @@ function applyEvent(sess, event) {
     }
     case "message_appended":
       // A committed message supersedes the in-progress draft for this turn:
-      // drop the draft, then render the authoritative content.
+      // drop the draft, then render the authoritative content. The last
+      // `usage` seen wins — assistant messages carry it; user messages
+      // don't — which keeps the chip pinned to the freshest turn after
+      // the SSE history replay walks the transcript from oldest to newest.
       finishStreaming(sess);
       appendMessage(sess, event.message);
+      if (event.message && event.message.usage) {
+        renderUsage(sess, event.message.usage);
+      }
       break;
     case "stream_delta":
       if (!sess.accumulator) beginStreaming(sess);
@@ -336,6 +374,28 @@ function applyEvent(sess, event) {
       if (state.focusedSessionId === sess.id) updateTitle();
       break;
   }
+}
+
+/// Update the context-usage chip in the pane header.
+///
+/// Input is the `usage` block from the latest assistant message. We read
+/// `prompt_tokens` — the agent's view of the live context window going
+/// into the LLM call — and render it against the session's fixed
+/// `contextWindow`. Zero `contextWindow` (catalog lookup missed at
+/// startup, which shouldn't happen today) suppresses the chip rather
+/// than rendering a nonsense percentage.
+function renderUsage(sess, usage) {
+  const chip = sess.usageChipEl;
+  if (!chip) return;
+  const used = typeof usage.prompt_tokens === "number" ? usage.prompt_tokens : 0;
+  const total = sess.contextWindow;
+  if (!total || total <= 0) {
+    chip.hidden = true;
+    return;
+  }
+  const pct = Math.round((used / total) * 100);
+  chip.textContent = `${USAGE_FORMATTER.format(used)} / ${USAGE_FORMATTER.format(total)} (${pct}%)`;
+  chip.hidden = false;
 }
 
 function renderInlineApproval(sess, request) {
@@ -881,7 +941,7 @@ async function onNewSession() {
   // The new pane joins the row with an equal share so it's visible. The
   // user can drag gutters afterwards; drag-end will overwrite the layout.
   distributeEvenly();
-  mountSession(body.session_id, "", 1);
+  mountSession(body.session_id, "", state.contextWindow, 1);
   renderGutters();
   putLayout();
 }

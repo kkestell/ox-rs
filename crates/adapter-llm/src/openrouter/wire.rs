@@ -313,7 +313,7 @@ mod tests {
             content: vec![ContentBlock::Text {
                 text: "wrong".into(),
             }],
-            token_count: 0,
+            usage: None,
         };
         let err = wire_message(&msg).unwrap_err();
         assert!(

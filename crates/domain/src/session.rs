@@ -62,11 +62,6 @@ impl Session {
         }
     }
 
-    /// Returns the total token count across all messages in this session.
-    pub fn is_over_budget(&self, limit: usize) -> bool {
-        self.messages.iter().map(|m| m.token_count).sum::<usize>() > limit
-    }
-
     pub fn push_message(&mut self, message: Message) {
         self.messages.push(message);
     }
@@ -75,6 +70,7 @@ impl Session {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{ContentBlock, Role, stream::Usage};
 
     #[test]
     fn session_id_display_roundtrip() {
@@ -99,5 +95,49 @@ mod tests {
         assert_eq!(session.workspace_root, root);
         assert_eq!(session.worktree_path, worktree);
         assert!(session.messages.is_empty());
+    }
+
+    #[test]
+    fn session_roundtrips_messages_with_and_without_usage() {
+        // Session-level JSON must preserve each message's `Option<Usage>`
+        // so a post-restart snapshot populates the frontend's usage chip
+        // from the last assistant turn. Mix a user message (no usage),
+        // an assistant message with usage, and an assistant message
+        // without usage — all three patterns appear on disk.
+        let id = SessionId::new_v4();
+        let root = PathBuf::from("/tmp/ws");
+        let worktree = PathBuf::from("/tmp/ws/.ox/wt");
+        let mut session = Session::new(id, root, worktree);
+        session.push_message(Message::user("hi"));
+        session.push_message(Message {
+            role: Role::Assistant,
+            content: vec![ContentBlock::Text { text: "hello".into() }],
+            usage: Some(Usage {
+                prompt_tokens: 10,
+                completion_tokens: 2,
+                reasoning_tokens: 0,
+            }),
+        });
+        session.push_message(Message {
+            role: Role::Assistant,
+            content: vec![ContentBlock::Text {
+                text: "no usage reported".into(),
+            }],
+            usage: None,
+        });
+
+        let json = serde_json::to_string(&session).unwrap();
+        let back: Session = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.messages.len(), 3);
+        assert_eq!(back.messages[0].usage, None);
+        assert_eq!(
+            back.messages[1].usage,
+            Some(Usage {
+                prompt_tokens: 10,
+                completion_tokens: 2,
+                reasoning_tokens: 0,
+            })
+        );
+        assert_eq!(back.messages[2].usage, None);
     }
 }

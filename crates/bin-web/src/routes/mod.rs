@@ -137,8 +137,8 @@ mod tests {
     use crate::registry::SessionRegistry;
     use crate::state::AppState;
     use crate::test_support::{
-        AgentHandles, DuplexSpawner, empty_layout, test_lifecycle, test_lifecycle_for_workspace,
-        unique_temp_dir,
+        AgentHandles, DuplexSpawner, empty_layout, test_catalog, test_lifecycle,
+        test_lifecycle_for_workspace, unique_temp_dir,
     };
 
     use super::*;
@@ -189,6 +189,7 @@ mod tests {
             spawn_config,
             empty_layout().await,
             workspace_root.clone(),
+            test_catalog(),
             close_sink,
             std::sync::Arc::new(agent_host::fake::NoopFirstTurnSink),
         );
@@ -295,6 +296,43 @@ mod tests {
         let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert!(body["sessions"].as_array().unwrap().is_empty());
         assert!(body["layout"]["order"].as_array().unwrap().is_empty());
+        // Top-level `context_window` must be populated from the catalog
+        // even when no sessions exist yet — the frontend's usage-chip
+        // denominator needs it on first paint of a fresh workspace.
+        assert_eq!(
+            body["context_window"].as_u64(),
+            Some(u64::from(crate::test_support::TEST_CONTEXT_WINDOW)),
+        );
+    }
+
+    #[tokio::test]
+    async fn list_sessions_includes_context_window_on_each_session() {
+        // A freshly created session must surface its model's context
+        // window in the per-session summary so the frontend can render
+        // the usage chip before any assistant message arrives.
+        let mut harness = make_harness().await;
+        let app = harness.app.clone();
+        let (_status, id, _handles) = create_via_router(app.clone(), &mut harness.rx).await;
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/sessions")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body: serde_json::Value =
+            serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
+        let sessions = body["sessions"].as_array().unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0]["session_id"].as_str().unwrap(), id.to_string());
+        assert_eq!(
+            sessions[0]["context_window"].as_u64(),
+            Some(u64::from(crate::test_support::TEST_CONTEXT_WINDOW)),
+        );
+        assert_eq!(sessions[0]["model"].as_str(), Some("routes/test"));
     }
 
     // -- POST /api/sessions -----------------------------------------------
@@ -342,6 +380,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn spawn_rejects_unknown_model_before_spawning_agent() {
+        // If the spawn config names a model the catalog does not know,
+        // the registry's per-session catalog check must fail the spawn
+        // with an error — nothing should reach the spawner. An unknown
+        // model at this point means bad `--model` / catalog drift, and
+        // the usage chip would be wrong downstream.
+        let workspace_root = unique_temp_dir("routes-unknown-model");
+        let (spawner, mut rx) = DuplexSpawner::new();
+        let spawn_config = AgentSpawnConfig {
+            binary: std::path::PathBuf::from("/nonexistent/ox-agent"),
+            workspace_root: workspace_root.clone(),
+            model: "totally/unknown-model".into(),
+            sessions_dir: std::path::PathBuf::from("/nonexistent/sessions"),
+            resume: None,
+            session_id: None,
+            env: vec![],
+        };
+        let registry = SessionRegistry::new(
+            spawner,
+            spawn_config,
+            empty_layout().await,
+            workspace_root.clone(),
+            test_catalog(),
+            std::sync::Arc::new(agent_host::fake::NoopCloseRequestSink),
+            std::sync::Arc::new(agent_host::fake::NoopFirstTurnSink),
+        );
+
+        let result = registry
+            .spawn_for_worktree(workspace_root.clone(), SessionId::new_v4(), None)
+            .await;
+        let err = result.expect_err("unknown-model spawn must error");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("totally/unknown-model"),
+            "error message should name the rejected model, got {msg:?}"
+        );
+        // Spawner must not have been invoked.
+        assert!(
+            rx.try_recv().is_err(),
+            "spawner must not be called when the catalog rejects the model"
+        );
+    }
+
+    #[tokio::test]
     async fn create_session_returns_502_when_agent_spawn_fails() {
         let workspace_root = unique_temp_dir("routes-fail");
         let spawner = DuplexSpawner::failing();
@@ -359,6 +441,7 @@ mod tests {
             spawn_config,
             empty_layout().await,
             workspace_root,
+            test_catalog(),
             std::sync::Arc::new(agent_host::fake::NoopCloseRequestSink),
             std::sync::Arc::new(agent_host::fake::NoopFirstTurnSink),
         );

@@ -23,6 +23,7 @@ use agent_host::{
     fake::{FakeGit, FakeSlugGenerator, NoopCloseRequestSink, NoopFirstTurnSink},
 };
 use anyhow::{Result, anyhow};
+use app::{ModelCatalog, fake::FakeModelCatalog};
 use domain::SessionId;
 use protocol::{AgentCommand, AgentEvent, read_frame, write_frame};
 use tokio::io::{BufReader, DuplexStream, duplex};
@@ -30,6 +31,26 @@ use tokio::sync::mpsc;
 
 use crate::lifecycle::SessionLifecycle;
 use crate::registry::SessionRegistry;
+
+/// Arbitrary but realistic context window used by tests that don't
+/// care about the exact denominator. Matches common 200k-token models
+/// so any future sanity check that expects a "normal" context stays
+/// passing without having to thread a per-test value around.
+pub const TEST_CONTEXT_WINDOW: u32 = 200_000;
+
+/// Catalog seeded with the two model ids this crate's tests use as
+/// `spawn_config.model`: `"test/model"` (registry tests) and
+/// `"routes/test"` (route tests). Returns a fresh `Arc` per call so
+/// each harness owns its own. Wiring a catalog through avoids a
+/// scalar `context_window` field on the registry and lets the
+/// per-session unknown-model rejection path be exercised from tests.
+pub fn test_catalog() -> Arc<dyn ModelCatalog> {
+    Arc::new(
+        FakeModelCatalog::new()
+            .with("test/model", TEST_CONTEXT_WINDOW)
+            .with("routes/test", TEST_CONTEXT_WINDOW),
+    )
+}
 
 /// Handles the test side holds after a spawn: the bytes headed to the
 /// "agent" and the bytes the "agent" emitted. `config` records what
@@ -140,6 +161,7 @@ pub async fn test_registry(
         spawn_config,
         layout,
         workspace_root.clone(),
+        test_catalog(),
         Arc::new(NoopCloseRequestSink),
         Arc::new(NoopFirstTurnSink),
     );

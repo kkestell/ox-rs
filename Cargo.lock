@@ -326,6 +326,7 @@ dependencies = [
  "futures-util",
  "http-body-util",
  "protocol",
+ "reqwest",
  "serde",
  "serde_json",
  "tempfile",

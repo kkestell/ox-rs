@@ -107,7 +107,7 @@ mod tests {
     use crate::routes::router;
     use crate::state::AppState;
     use crate::test_support::{
-        AgentHandles, DuplexSpawner, empty_layout, test_lifecycle, unique_temp_dir,
+        AgentHandles, DuplexSpawner, empty_layout, test_catalog, test_lifecycle, unique_temp_dir,
     };
 
     async fn make_app() -> (
@@ -120,7 +120,7 @@ mod tests {
         let spawn_config = AgentSpawnConfig {
             binary: std::path::PathBuf::from("/nonexistent/ox-agent"),
             workspace_root: workspace_root.clone(),
-            model: "sse/test".into(),
+            model: "test/model".into(),
             sessions_dir: std::path::PathBuf::from("/nonexistent/sessions"),
             resume: None,
             session_id: None,
@@ -131,6 +131,7 @@ mod tests {
             spawn_config,
             empty_layout().await,
             workspace_root.clone(),
+            test_catalog(),
             std::sync::Arc::new(agent_host::fake::NoopCloseRequestSink),
             std::sync::Arc::new(agent_host::fake::NoopFirstTurnSink),
         );

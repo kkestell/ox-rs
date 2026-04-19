@@ -245,7 +245,7 @@ mod tests {
             },
         });
         let snap = state.streaming.as_ref().unwrap().snapshot();
-        assert_eq!(snap.token_count, 2);
+        assert_eq!(snap.usage.completion_tokens, 2);
         match &snap.content[0] {
             ContentBlock::Text { text } => assert_eq!(text, "hello world"),
             _ => panic!("expected Text block"),

@@ -29,6 +29,11 @@ pub struct StreamAccumulator {
     encrypted: Option<(String, String)>, // (data, format)
     tool_calls: BTreeMap<usize, ToolCallAccum>,
     usage: Usage,
+    /// True once a `Finished` event has been observed. Distinguishes an
+    /// untouched zero-usage accumulator (no `Finished` yet, so `None` at
+    /// message-build time) from a provider that legitimately reported
+    /// zero tokens (Finished seen with a zeroed Usage — `Some(Usage::default())`).
+    finished: bool,
     /// Lazily built block cache, invalidated on every `push`. Avoids
     /// rebuilding the block vec on every `snapshot()` call within a single
     /// frame when the GUI calls it multiple times between events.
@@ -44,6 +49,7 @@ impl Default for StreamAccumulator {
             encrypted: None,
             tool_calls: BTreeMap::new(),
             usage: Usage::default(),
+            finished: false,
             cached_blocks: OnceCell::new(),
         }
     }
@@ -85,6 +91,7 @@ impl StreamAccumulator {
             }
             StreamEvent::Finished { usage } => {
                 self.usage = usage;
+                self.finished = true;
             }
         }
     }
@@ -94,10 +101,21 @@ impl StreamAccumulator {
             .cached_blocks
             .take()
             .unwrap_or_else(|| self.assemble_blocks());
+        // Only attach usage if the accumulator actually saw a `Finished`
+        // event. A zeroed `Usage` could mean either "no tokens used" or
+        // "no usage reported" — `None` preserves that distinction for
+        // downstream consumers that treat missing usage specially (the
+        // context-window chip, for instance, leaves the previous value
+        // in place when a turn lands without usage).
+        let usage = if self.finished {
+            Some(self.usage)
+        } else {
+            None
+        };
         Message {
             role: Role::Assistant,
             content: blocks,
-            token_count: self.usage.completion_tokens as usize,
+            usage,
         }
     }
 
@@ -111,7 +129,7 @@ impl StreamAccumulator {
         let content = self.cached_blocks.get_or_init(|| self.assemble_blocks());
         Snapshot {
             content,
-            token_count: self.usage.completion_tokens as usize,
+            usage: self.usage,
         }
     }
 
@@ -184,7 +202,8 @@ mod tests {
         let msg = acc.into_message();
         assert_eq!(msg.role, Role::Assistant);
         assert_eq!(msg.text(), "Hello, world!");
-        assert_eq!(msg.token_count, 5);
+        assert_eq!(msg.usage.unwrap().completion_tokens, 5);
+        assert_eq!(msg.usage.unwrap().prompt_tokens, 10);
         assert!(msg.tool_calls().is_empty());
     }
 
@@ -417,7 +436,17 @@ mod tests {
         let msg = acc.into_message();
         assert_eq!(msg.role, Role::Assistant);
         assert!(msg.content.is_empty());
-        assert_eq!(msg.token_count, 0);
+        // Finished still surfaces usage even when the completion is
+        // empty — the provider explicitly reported prompt_tokens,
+        // which is semantically different from "no usage observed."
+        assert_eq!(
+            msg.usage,
+            Some(Usage {
+                prompt_tokens: 5,
+                completion_tokens: 0,
+                reasoning_tokens: 0,
+            })
+        );
     }
 
     #[test]
@@ -517,10 +546,13 @@ mod tests {
 
     fn assert_snapshot_matches_message(acc: StreamAccumulator) {
         let snap_content = acc.snapshot().content.to_vec();
-        let snap_token_count = acc.snapshot().token_count;
+        let snap_usage = acc.snapshot().usage;
         let msg = acc.into_message();
         assert_eq!(snap_content, msg.content);
-        assert_eq!(snap_token_count, msg.token_count);
+        // The snapshot always carries the raw `Usage`; a finished
+        // message wraps that same value in `Some`. Compare apples to
+        // apples by unwrapping the message-side option.
+        assert_eq!(Some(snap_usage), msg.usage);
     }
 
     #[test]
@@ -603,7 +635,7 @@ mod tests {
 
         {
             let snap = acc.snapshot();
-            assert_eq!(snap.token_count, 10);
+            assert_eq!(snap.usage.completion_tokens, 10);
             assert_eq!(snap.content.len(), 3);
             match &snap.content[0] {
                 ContentBlock::Text { text } => assert_eq!(text, "dispatching..."),
@@ -679,7 +711,9 @@ mod tests {
                 }
                 _ => panic!("expected ToolCall third"),
             }
-            assert_eq!(snap.token_count, 0);
+            // Usage struct is still default-zero mid-stream because
+            // the accumulator hasn't seen a `Finished` event yet.
+            assert_eq!(snap.usage, Usage::default());
         }
 
         acc.push(StreamEvent::ToolCallArgumentDelta {
@@ -700,7 +734,46 @@ mod tests {
         let acc = StreamAccumulator::new();
         let snap = acc.snapshot();
         assert!(snap.content.is_empty());
-        assert_eq!(snap.token_count, 0);
+        assert_eq!(snap.usage, Usage::default());
+    }
+
+    #[test]
+    fn snapshot_usage_does_not_distinguish_pre_finished_from_zero_finished() {
+        // Contract: `Snapshot.usage` is a raw `Usage` value and carries
+        // `Usage::default()` in two distinct situations — no `Finished`
+        // observed yet, and `Finished` observed with all-zero counts.
+        // The snapshot's usage field intentionally cannot distinguish
+        // them (lossy on purpose; the GUI is fine using the last
+        // non-default value). The `into_message` path, by contrast,
+        // preserves the difference via `Option<Usage>`: `None` vs
+        // `Some(Usage::default())`. This test pins both halves of that
+        // contract so a future refactor can't silently collapse them.
+
+        // Case A: pre-Finished — deltas only.
+        let mut pre = StreamAccumulator::new();
+        pre.push(StreamEvent::TextDelta {
+            delta: "midstream".into(),
+        });
+        let pre_usage = pre.snapshot().usage;
+
+        // Case B: Finished with zeroed Usage.
+        let mut post = StreamAccumulator::new();
+        post.push(StreamEvent::TextDelta {
+            delta: "midstream".into(),
+        });
+        post.push(StreamEvent::Finished {
+            usage: Usage::default(),
+        });
+        let post_usage = post.snapshot().usage;
+
+        // Snapshot view: indistinguishable.
+        assert_eq!(pre_usage, Usage::default());
+        assert_eq!(post_usage, Usage::default());
+        assert_eq!(pre_usage, post_usage);
+
+        // into_message path: distinguishable.
+        assert_eq!(pre.into_message().usage, None);
+        assert_eq!(post.into_message().usage, Some(Usage::default()));
     }
 
     #[test]

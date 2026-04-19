@@ -9,7 +9,7 @@ use domain::{Message, Session, SessionId, SessionSummary, StreamEvent, ToolDef, 
 use futures::stream::{self, Stream};
 
 use crate::LlmProvider;
-use crate::ports::{CommandOutput, FileSystem, SessionStore};
+use crate::ports::{CommandOutput, FileSystem, ModelCatalog, SessionStore};
 use crate::tools::Tool;
 
 /// A queued response: a sequence of stream events (success), a connection-time
@@ -248,6 +248,49 @@ impl SessionStore for FakeSessionStore {
             self.sessions.lock().unwrap().remove(&id);
             Ok(())
         })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// FakeModelCatalog
+// ---------------------------------------------------------------------------
+
+/// Test double for `ModelCatalog`. Backed by a `HashMap` so tests can
+/// seed specific model ids with specific context-window values and
+/// exercise both the happy path and the unknown-model branch.
+pub struct FakeModelCatalog {
+    entries: Mutex<HashMap<String, u32>>,
+}
+
+impl FakeModelCatalog {
+    pub fn new() -> Self {
+        Self {
+            entries: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Seed a single model. Returns `self` so tests can chain seeds.
+    pub fn with(self, model: impl Into<String>, context_window: u32) -> Self {
+        self.entries.lock().unwrap().insert(model.into(), context_window);
+        self
+    }
+
+    /// Seed after construction. Useful when the catalog needs to be
+    /// wrapped in `Arc<dyn ModelCatalog>` first.
+    pub fn insert(&self, model: impl Into<String>, context_window: u32) {
+        self.entries.lock().unwrap().insert(model.into(), context_window);
+    }
+}
+
+impl Default for FakeModelCatalog {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ModelCatalog for FakeModelCatalog {
+    fn context_window(&self, model: &str) -> Option<u32> {
+        self.entries.lock().unwrap().get(model).copied()
     }
 }
 
