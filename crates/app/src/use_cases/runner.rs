@@ -1,9 +1,8 @@
+use std::collections::HashMap;
 use std::path::PathBuf;
 
-use std::collections::HashMap;
-
 use anyhow::{Result, bail};
-use domain::{Message, Session, SessionId, StreamAccumulator, StreamEvent};
+use domain::{Message, Session, SessionId, StreamAccumulator};
 use futures::StreamExt;
 
 use crate::approval::{
@@ -13,36 +12,8 @@ use crate::approval::{
 use crate::cancel::CancelToken;
 use crate::ports::{LlmProvider, SessionStore};
 use crate::tools::{ToolRegistry, extract_tool_calls};
-
-/// Result of a completed turn — either it ran to natural completion or was
-/// cancelled cooperatively via a `CancelToken`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TurnOutcome {
-    Completed,
-    Cancelled,
-}
-
-/// Events surfaced to the caller during a turn.
-///
-/// `StreamDelta` forwards raw in-flight stream events (token/reasoning/tool-
-/// call argument chunks). `MessageAppended` fires for every message that is
-/// committed to the session — the initial user input, each intermediate
-/// assistant reply and tool-result in a multi-step tool loop, and the final
-/// assistant reply.
-///
-/// The callback sees a `MessageAppended` *after* the message has been pushed
-/// to `session.messages`, so UI layers can treat it as "this is now part of
-/// history." That keeps the live-streaming view (driven by `StreamDelta`s
-/// into a `StreamAccumulator`) and the committed view strictly separated:
-/// the accumulator renders in-progress state, and once the message is
-/// committed via `MessageAppended`, the accumulator is discarded.
-#[derive(Debug)]
-pub enum TurnEvent<'a> {
-    StreamDelta(&'a StreamEvent),
-    MessageAppended(&'a Message),
-    ToolApprovalRequested { requests: Vec<ToolApprovalRequest> },
-    ToolApprovalResolved { request_id: String, approved: bool },
-}
+use crate::use_cases::tool_loop::{PlannedToolCall, commit_tool_result, execute_and_commit};
+use crate::use_cases::{TurnEvent, TurnOutcome};
 
 /// Cap on tool-call loop iterations per turn.
 ///
@@ -395,67 +366,13 @@ impl<L: LlmProvider, S: SessionStore> SessionRunner<L, S> {
     }
 }
 
-enum PlannedToolCall {
-    Ready {
-        id: String,
-        name: String,
-        arguments: String,
-    },
-    NeedsApproval {
-        id: String,
-        name: String,
-        arguments: String,
-        request: ToolApprovalRequest,
-    },
-    PolicyError {
-        id: String,
-        error: String,
-    },
-}
-
-async fn execute_and_commit<S: SessionStore>(
-    tools: &ToolRegistry,
-    store: &S,
-    session: &mut Session,
-    on_event: &mut (impl FnMut(TurnEvent<'_>) + Send),
-    id: String,
-    name: String,
-    arguments: String,
-) -> Result<()> {
-    let (content, is_error) = match tools.execute(&name, &arguments).await {
-        Ok(out) => (out, false),
-        Err(e) => (format!("{e:#}"), true),
-    };
-    commit_tool_result(
-        store,
-        session,
-        on_event,
-        Message::tool_result(id, content, is_error),
-    )
-    .await
-}
-
-async fn commit_tool_result<S: SessionStore>(
-    store: &S,
-    session: &mut Session,
-    on_event: &mut (impl FnMut(TurnEvent<'_>) + Send),
-    tool_msg: Message,
-) -> Result<()> {
-    session.push_message(tool_msg);
-    on_event(TurnEvent::MessageAppended(
-        session.messages.last().expect("just pushed"),
-    ));
-    store.save(session).await?;
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use std::future::Future;
     use std::pin::Pin;
     use std::sync::{Arc, Mutex};
 
-    use domain::{ContentBlock, Role};
+    use domain::{ContentBlock, Role, StreamEvent};
 
     use super::*;
     use crate::approval::ToolApprovalDecision;
