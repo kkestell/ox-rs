@@ -1,7 +1,6 @@
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::time::Duration;
 
 use anyhow::Result;
 use app::{
@@ -48,26 +47,25 @@ impl ToolApprover for ApprovalBroker {
 
                 let futures: FuturesUnordered<_> = receivers
                     .into_iter()
-                    .map(|(request_id, mut rx)| {
+                    .map(|(request_id, rx)| {
                         let cancel = cancel.clone();
                         let pending = pending.clone();
                         async move {
-                            loop {
-                                if cancel.is_cancelled() {
+                            tokio::select! {
+                                decision = rx => Ok(ToolApprovalDecision {
+                                    request_id,
+                                    approved: decision.unwrap_or(false),
+                                }),
+                                _ = cancel.cancelled() => {
+                                    // Drop our sender slot so `resolve`
+                                    // calls arriving after cancel don't
+                                    // hit a dead entry — and so a later
+                                    // retry can re-register cleanly.
                                     pending.lock().await.remove(&request_id);
-                                    return Ok(ToolApprovalDecision {
+                                    Ok(ToolApprovalDecision {
                                         request_id,
                                         approved: false,
-                                    });
-                                }
-                                tokio::select! {
-                                    decision = &mut rx => {
-                                        return Ok(ToolApprovalDecision {
-                                            request_id,
-                                            approved: decision.unwrap_or(false),
-                                        });
-                                    }
-                                    _ = tokio::time::sleep(Duration::from_millis(25)) => {}
+                                    })
                                 }
                             }
                         }

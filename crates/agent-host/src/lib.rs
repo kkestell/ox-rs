@@ -25,9 +25,7 @@ pub use first_turn_sink::FirstTurnSink;
 pub use git::{Git, MergeOutcome, WorktreeStatus};
 pub use layout::{Layout, LayoutRepository, normalize_sizes};
 pub use paths::workspace_slug;
-pub use session_runtime::{
-    BeginClose, SessionRuntime, ShouldSend, apply_event, begin_close, begin_send, clear_closing,
-};
+pub use session_runtime::{BeginClose, SessionRuntime, ShouldSend};
 pub use slug_generator::SlugGenerator;
 pub use spawner::AgentSpawner;
 pub use workspace_context::WorkspaceContext;

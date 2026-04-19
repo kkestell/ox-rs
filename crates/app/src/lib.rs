@@ -20,8 +20,3 @@ pub use tools::{
     WriteFileTool,
 };
 pub use use_cases::{SessionRunner, TurnEvent, TurnOutcome};
-
-// `StreamEvent`, `Usage`, `StreamAccumulator`, `Snapshot`, and `ToolDef` live
-// in `domain` — they're serializable data shapes, not application behavior.
-// Re-exported here so existing `app::*` callers don't have to chase the move.
-pub use domain::{Snapshot, StreamAccumulator, StreamEvent, ToolDef, Usage};

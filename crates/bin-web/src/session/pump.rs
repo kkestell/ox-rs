@@ -1,35 +1,54 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use agent_host::{AgentEventStream, CloseRequestSink, FirstTurnSink, SessionRuntime, apply_event};
+use agent_host::{AgentEventStream, CloseRequestSink, FirstTurnSink, SessionRuntime};
 use domain::{ContentBlock, Role};
 use protocol::AgentEvent;
 use tokio::sync::broadcast;
 
 use super::ActiveSession;
 
+/// Bundle of shared state the pump task holds. Every field is owned by
+/// an `ActiveSession`; the pump reads and writes through these handles
+/// so restarts (`replace_agent`) can swap in a new stream while keeping
+/// history, runtime, subscribers, and sinks intact.
+pub(super) struct PumpContext {
+    pub(super) history: Arc<Mutex<Vec<AgentEvent>>>,
+    pub(super) tx: broadcast::Sender<AgentEvent>,
+    pub(super) runtime: Arc<Mutex<SessionRuntime>>,
+    pub(super) alive: Arc<AtomicBool>,
+    pub(super) session_weak: std::sync::Weak<ActiveSession>,
+    pub(super) ready_notify: Arc<tokio::sync::Notify>,
+    pub(super) first_turn_sink: Arc<dyn FirstTurnSink>,
+    pub(super) close_sink: Arc<dyn CloseRequestSink>,
+}
+
 /// Drive events from the agent's stream into history, the broadcast
 /// channel, and the runtime state machine. Runs until the stream
 /// closes or until the owning session is dropped and aborts us.
 ///
-/// Nine handles is a lot, but they all thread together as one unit and
-/// grouping them under a struct just renames the problem — the struct
-/// would have no other use and every callsite would populate every
-/// field. Keep them as named parameters for readability.
-#[allow(clippy::too_many_arguments)]
+/// `suppress_startup_replay` is the one per-spawn toggle — `true` when
+/// the pump is replacing a prior one via `replace_agent` (the new
+/// subprocess replays persisted history the caller has already
+/// published). Everything else rides in [`PumpContext`] because both
+/// the initial `start` and the `replace_agent` path build the pump from
+/// the same long-lived session handles.
 pub(super) fn spawn_pump(
     mut stream: AgentEventStream,
-    history: Arc<Mutex<Vec<AgentEvent>>>,
-    tx: broadcast::Sender<AgentEvent>,
-    runtime: Arc<Mutex<SessionRuntime>>,
-    alive: Arc<AtomicBool>,
-    session_weak: std::sync::Weak<ActiveSession>,
-    ready_notify: Arc<tokio::sync::Notify>,
-    first_turn_sink: Arc<dyn FirstTurnSink>,
-    close_sink: Arc<dyn CloseRequestSink>,
+    ctx: PumpContext,
     suppress_startup_replay: bool,
 ) -> tokio::task::AbortHandle {
     let join = tokio::spawn(async move {
+        let PumpContext {
+            history,
+            tx,
+            runtime,
+            alive,
+            session_weak,
+            ready_notify,
+            first_turn_sink,
+            close_sink,
+        } = ctx;
         let mut filtering_startup_replay = suppress_startup_replay;
         let mut replay_message_index = 0usize;
         loop {
@@ -129,7 +148,7 @@ pub(super) fn spawn_pump(
             // its own lock. Held briefly, never across an await.
             {
                 let mut rt = runtime.lock().expect("session runtime mutex poisoned");
-                apply_event(&mut rt, evt);
+                rt.apply_event(evt);
             }
 
             // Slug-rename hook: on the first `TurnComplete` observed

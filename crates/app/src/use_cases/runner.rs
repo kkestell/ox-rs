@@ -375,11 +375,11 @@ mod tests {
     use domain::{ContentBlock, Role, StreamEvent};
 
     use super::*;
+    use crate::Tool;
     use crate::approval::ToolApprovalDecision;
     use crate::cancel::CancelToken;
     use crate::fake::{FakeLlmProvider, FakeSessionStore, FakeTool, tool_registry_with};
-    use crate::{Tool, ToolDef};
-    use domain::Usage;
+    use domain::{ToolDef, Usage};
 
     fn make_runner(
         llm: FakeLlmProvider,

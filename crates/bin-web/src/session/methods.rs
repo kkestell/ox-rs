@@ -3,13 +3,13 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use agent_host::{
     AgentClient, AgentEventStream, BeginClose, CloseRequestSink, FirstTurnSink, SessionRuntime,
-    ShouldSend, begin_close, begin_send, clear_closing,
+    ShouldSend,
 };
 use domain::SessionId;
 use protocol::AgentCommand;
 use tokio::sync::broadcast;
 
-use super::pump::spawn_pump;
+use super::pump::{PumpContext, spawn_pump};
 use super::{ActiveSession, BROADCAST_CAPACITY, CloseStart, SendOutcome};
 
 impl ActiveSession {
@@ -46,14 +46,16 @@ impl ActiveSession {
         Arc::new_cyclic(|weak| {
             let pump = spawn_pump(
                 stream,
-                history.clone(),
-                tx.clone(),
-                runtime.clone(),
-                alive.clone(),
-                weak.clone(),
-                ready_notify.clone(),
-                first_turn_sink.clone(),
-                close_sink.clone(),
+                PumpContext {
+                    history: history.clone(),
+                    tx: tx.clone(),
+                    runtime: runtime.clone(),
+                    alive: alive.clone(),
+                    session_weak: weak.clone(),
+                    ready_notify: ready_notify.clone(),
+                    first_turn_sink: first_turn_sink.clone(),
+                    close_sink: close_sink.clone(),
+                },
                 false,
             );
             Self {
@@ -164,7 +166,7 @@ impl ActiveSession {
         }
         {
             let mut rt = self.runtime.lock().expect("session runtime mutex poisoned");
-            match begin_send(&mut rt) {
+            match rt.begin_send() {
                 ShouldSend::Skip => return SendOutcome::AlreadyTurning,
                 ShouldSend::Closing => return SendOutcome::Closing,
                 ShouldSend::Send => {}
@@ -230,7 +232,7 @@ impl ActiveSession {
     /// `send_message` calls are rejected before they can enqueue a command.
     pub fn begin_close(&self) -> CloseStart {
         let mut rt = self.runtime.lock().expect("session runtime mutex poisoned");
-        match begin_close(&mut rt) {
+        match rt.begin_close() {
             BeginClose::Closing => CloseStart::Closing,
             BeginClose::TurnInProgress => CloseStart::TurnInProgress,
             BeginClose::AlreadyClosing => CloseStart::AlreadyClosing,
@@ -240,7 +242,7 @@ impl ActiveSession {
     /// Release the closing marker after a rejected close preflight.
     pub fn clear_closing(&self) {
         let mut rt = self.runtime.lock().expect("session runtime mutex poisoned");
-        clear_closing(&mut rt);
+        rt.clear_closing();
     }
 
     /// Swap the agent subprocess without tearing down the session.
@@ -292,14 +294,16 @@ impl ActiveSession {
 
         let new_pump = spawn_pump(
             new_stream,
-            self.history.clone(),
-            self.tx.clone(),
-            self.runtime.clone(),
-            self.alive.clone(),
-            Arc::downgrade(self),
-            self.ready_notify.clone(),
-            self.first_turn_sink.clone(),
-            self.close_sink.clone(),
+            PumpContext {
+                history: self.history.clone(),
+                tx: self.tx.clone(),
+                runtime: self.runtime.clone(),
+                alive: self.alive.clone(),
+                session_weak: Arc::downgrade(self),
+                ready_notify: self.ready_notify.clone(),
+                first_turn_sink: self.first_turn_sink.clone(),
+                close_sink: self.close_sink.clone(),
+            },
             true,
         );
         *self.pump.lock().expect("session pump mutex poisoned") = new_pump;

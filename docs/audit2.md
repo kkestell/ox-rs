@@ -44,7 +44,7 @@ Both have the same five fields: `request_id`, `tool_call_id`, `name`, `arguments
 
 **Resolution:** Made `protocol` the canonical home and had `app` depend on it and re-export the type. The field-by-field conversion in the driver is gone.
 
-### 1.4 `app` re-exports `domain` types, creating dual import paths
+### 1.4 `app` re-exports `domain` types, creating dual import paths ✅ FIXED
 
 `app/src/lib.rs:29` re-exports `StreamEvent` and `Usage` from `domain`:
 
@@ -112,7 +112,7 @@ The first three are the most concerning: they each bundle multiple responsibilit
 - `bin-web/lifecycle` → `close_guard.rs`, `sinks.rs`, `mod.rs`
 - `domain/stream` (post-move from 1.1) → `accumulator.rs`, `snapshot.rs`, `mod.rs`
 
-### 3.2 `ApprovalBroker` polls with a 25ms sleep loop
+### 3.2 `ApprovalBroker` polls with a 25ms sleep loop ✅ FIXED
 
 `bin-agent/src/driver.rs:64-88` implements cancellation checking in the approval broker by sleeping for 25ms in a loop:
 
@@ -130,7 +130,7 @@ loop {
 
 This is unusual. The idiomatic approach would be to use a `tokio::sync::watch` or `CancellationToken` from `tokio_util` that integrates directly with `select!` without a polling interval. The current approach wastes scheduler slots every 25ms per pending approval.
 
-### 3.3 `SessionRuntime` uses free functions instead of methods
+### 3.3 `SessionRuntime` uses free functions instead of methods ✅ FIXED
 
 `agent-host/src/session_runtime.rs` exposes its API as free functions:
 
@@ -187,7 +187,7 @@ The locking discipline comment at the top of the file is necessary because the l
 
 `bin-web/src/lifecycle.rs:462-489` — The `CloseGuard<'a>` borrows `&'a Mutex<HashMap<SessionId, CloseState>>` from the lifecycle's `self.closing` field. This means the guard holds a borrow of the lifecycle through the mutex, not through the lifecycle itself. This works but is an unusual pattern — typically the guard would borrow `&'a SessionLifecycle` directly.
 
-### 3.9 Nine-parameter `spawn_pump` function
+### 3.9 Nine-parameter `spawn_pump` function ✅ FIXED
 
 `bin-web/src/session.rs:435` — The `spawn_pump` function takes 9 parameters. The comment says "grouping them under a struct just renames the problem," but a `PumpContext` struct would at least give names to the parameter positions and make call sites self-documenting.
 
@@ -204,7 +204,7 @@ The locking discipline comment at the top of the file is necessary because the l
 | Medium | Mega-files (1835, 1788, 1494 lines) | Extract submodules | ✅ Fixed |
 | Medium | Three-phase init cycle | Restructure to avoid the cycle, or use a builder that enforces ordering | ✅ Fixed |
 | Medium | Blocking I/O in `DiskLayoutRepository` | Switch to `tokio::fs` | ✅ Fixed |
-| Low | Free-function API on `SessionRuntime` | Convert to `&mut self` methods | — |
-| Low | 25ms polling in `ApprovalBroker` | Use a proper cancellation token | — |
-| Low | Dual import paths for `StreamEvent`/`Usage` | Remove the `app` re-export, import from `domain` directly | — |
-| Low | 9-parameter `spawn_pump` | Extract a `PumpContext` struct | — |
+| Low | Free-function API on `SessionRuntime` | Convert to `&mut self` methods | ✅ Fixed |
+| Low | 25ms polling in `ApprovalBroker` | Use a proper cancellation token | ✅ Fixed |
+| Low | Dual import paths for `StreamEvent`/`Usage` | Remove the `app` re-export, import from `domain` directly | ✅ Fixed |
+| Low | 9-parameter `spawn_pump` | Extract a `PumpContext` struct | ✅ Fixed |
