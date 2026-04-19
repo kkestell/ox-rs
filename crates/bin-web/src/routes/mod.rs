@@ -43,10 +43,7 @@ pub fn router(state: AppState) -> Router {
             "/api/sessions/{id}/abandon",
             post(sessions::abandon_session),
         )
-        .route(
-            "/api/sessions/{id}/messages",
-            post(messages::post_message),
-        )
+        .route("/api/sessions/{id}/messages", post(messages::post_message))
         .route("/api/sessions/{id}/cancel", post(messages::post_cancel))
         .route(
             "/api/sessions/{id}/tool-approvals/{request_id}",
@@ -183,9 +180,8 @@ mod tests {
             session_id: None,
             env: vec![],
         };
-        let (close_tx, mut close_rx) = tokio::sync::mpsc::unbounded_channel::<
-            crate::lifecycle::CloseRequestMsg,
-        >();
+        let (close_tx, mut close_rx) =
+            tokio::sync::mpsc::unbounded_channel::<crate::lifecycle::CloseRequestMsg>();
         let close_sink: std::sync::Arc<dyn agent_host::CloseRequestSink> =
             std::sync::Arc::new(crate::lifecycle::ChannelCloseSink::new(close_tx));
         let registry = SessionRegistry::new(

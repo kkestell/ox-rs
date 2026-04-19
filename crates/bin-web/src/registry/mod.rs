@@ -553,7 +553,9 @@ mod tests {
         // A PUT-then-reload cycle must round-trip order and (normalized)
         // sizes so a restart picks up the same pane tiling.
         let layout_path = unique_temp_dir("persist").join("workspaces.json");
-        let store = DiskLayoutRepository::load(layout_path.clone()).await.unwrap();
+        let store = DiskLayoutRepository::load(layout_path.clone())
+            .await
+            .unwrap();
         let workspace_root = unique_temp_dir("ws-persist");
         let (spawner, mut rx) = DuplexSpawner::new();
         let registry = SessionRegistry::new(
@@ -857,7 +859,9 @@ mod tests {
     #[tokio::test]
     async fn persist_current_layout_writes_equal_sizes() {
         let layout_path = unique_temp_dir("persist-current").join("workspaces.json");
-        let store = DiskLayoutRepository::load(layout_path.clone()).await.unwrap();
+        let store = DiskLayoutRepository::load(layout_path.clone())
+            .await
+            .unwrap();
         let workspace_root = unique_temp_dir("ws-persist-current");
         let (spawner, mut rx) = DuplexSpawner::new();
         let registry = SessionRegistry::new(

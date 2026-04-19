@@ -145,8 +145,8 @@ async fn run(cli: Cli) -> Result<()> {
     let sessions_dir = ox_dir.join("workspaces").join(&slug).join("sessions");
     let layout_path = ox_dir.join("workspaces.json");
 
-    let layout: Arc<dyn LayoutRepository> =
-        Arc::new(match DiskLayoutRepository::load(layout_path.clone()).await {
+    let layout: Arc<dyn LayoutRepository> = Arc::new(
+        match DiskLayoutRepository::load(layout_path.clone()).await {
             Ok(l) => l,
             Err(err) => {
                 // A corrupt layout file should not prevent the server from
@@ -164,7 +164,8 @@ async fn run(cli: Cli) -> Result<()> {
                     .await
                     .context("reloading layout after corrupt-file fallback")?
             }
-        });
+        },
+    );
 
     let spawn_config = AgentSpawnConfig {
         binary: agent_binary,
@@ -191,8 +192,12 @@ async fn run(cli: Cli) -> Result<()> {
             .context("creating the session store directory")?,
     );
     let session_store_dyn: Arc<dyn SessionStore> = session_store.clone();
-    let lifecycle =
-        SessionLifecycle::new(git, slug_generator, session_store_dyn.clone(), workspace_ctx);
+    let lifecycle = SessionLifecycle::new(
+        git,
+        slug_generator,
+        session_store_dyn.clone(),
+        workspace_ctx,
+    );
 
     let (close_tx, close_rx) = tokio::sync::mpsc::unbounded_channel::<CloseRequestMsg>();
     let (first_turn_tx, first_turn_rx) = tokio::sync::mpsc::unbounded_channel::<FirstTurnMsg>();

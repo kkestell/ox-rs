@@ -36,10 +36,7 @@ pub trait SessionStore: Send + Sync + 'static {
     /// Remove a session's on-disk record. Missing sessions are treated as
     /// success so callers can invoke `delete` idempotently during merge /
     /// abandon flows without having to race a concurrent removal.
-    fn delete(
-        &self,
-        id: SessionId,
-    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>>;
+    fn delete(&self, id: SessionId) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>>;
 }
 
 pub trait SecretStore {

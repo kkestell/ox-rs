@@ -1,7 +1,9 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use agent_host::{AgentSpawnConfig, AgentSpawner, CloseRequestSink, FirstTurnSink, LayoutRepository};
+use agent_host::{
+    AgentSpawnConfig, AgentSpawner, CloseRequestSink, FirstTurnSink, LayoutRepository,
+};
 use anyhow::{Context, Result, anyhow};
 use app::SessionStore;
 use domain::SessionId;

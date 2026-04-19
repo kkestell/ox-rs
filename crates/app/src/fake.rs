@@ -240,10 +240,7 @@ impl SessionStore for FakeSessionStore {
         })
     }
 
-    fn delete(
-        &self,
-        id: SessionId,
-    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>> {
+    fn delete(&self, id: SessionId) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>> {
         Box::pin(async move {
             // Mirrors `DiskSessionStore::delete`: removing a missing id is a
             // success so tests can exercise idempotent delete paths without

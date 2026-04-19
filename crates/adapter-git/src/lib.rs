@@ -276,8 +276,7 @@ impl Git for CliGit {
             // preserves the session branch as a distinct ancestor so the
             // history tells the "this was an ox session" story. Conflicts
             // still surface as a non-zero exit.
-            let merge =
-                run_git(workspace_root, &["merge", "--no-edit", "--no-ff", branch]).await?;
+            let merge = run_git(workspace_root, &["merge", "--no-edit", "--no-ff", branch]).await?;
             if merge.status.success() {
                 return Ok(MergeOutcome::Merged);
             }

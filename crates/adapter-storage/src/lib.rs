@@ -37,9 +37,8 @@ impl DiskLayoutRepository {
                 });
             }
             Err(err) => {
-                return Err(err).with_context(|| {
-                    format!("reading workspace layout file {}", path.display())
-                });
+                return Err(err)
+                    .with_context(|| format!("reading workspace layout file {}", path.display()));
             }
         };
         let data: LayoutFile = serde_json::from_str(&text)
@@ -225,10 +224,7 @@ impl app::SessionStore for DiskSessionStore {
         })
     }
 
-    fn delete(
-        &self,
-        id: SessionId,
-    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>> {
+    fn delete(&self, id: SessionId) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>> {
         Box::pin(async move {
             let path = self.session_path(id);
             // `NotFound` is treated as success so the merge / abandon flows
