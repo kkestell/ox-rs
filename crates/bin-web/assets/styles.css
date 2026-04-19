@@ -199,6 +199,48 @@ button:disabled {
   margin-top: var(--gap);
 }
 
+/*
+ * `todo_write` renders its arguments as a compact glyph-prefixed list
+ * rather than the usual JSON <pre>. Grid gives us a tidy aligned column of
+ * status glyphs without having to reach for absolute positioning or ASCII
+ * padding. Tint the in-progress glyph with the accent so a skim of the
+ * transcript lands the eye on the current step.
+ */
+.block.tool .todo-list {
+  margin: var(--pad) 0 0;
+  padding: 0;
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.block.tool .todo-list li {
+  display: grid;
+  grid-template-columns: 1.25em auto;
+  gap: var(--gap);
+  align-items: baseline;
+  font-family: var(--font-mono);
+}
+
+.block.tool .todo-list .todo-glyph {
+  color: var(--fg-muted);
+  text-align: center;
+}
+
+.block.tool .todo-list li[data-status="in_progress"] .todo-glyph {
+  color: var(--accent);
+}
+
+.block.tool .todo-list li[data-status="completed"] .todo-glyph {
+  color: var(--role-assistant);
+}
+
+.block.tool .todo-list li[data-status="completed"] .todo-content {
+  color: var(--fg-muted);
+  text-decoration: line-through;
+}
+
 .banner {
   padding: var(--pad);
   background: var(--bg-error);

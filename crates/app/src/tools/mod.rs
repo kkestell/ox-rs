@@ -34,6 +34,7 @@ pub mod grep;
 pub mod hashlines;
 pub mod read_file;
 pub(crate) mod spill;
+pub mod todo_write;
 pub mod write_file;
 
 pub use bash::BashTool;
@@ -41,6 +42,7 @@ pub use edit_file::EditFileTool;
 pub use glob::GlobTool;
 pub use grep::GrepTool;
 pub use read_file::ReadFileTool;
+pub use todo_write::TodoWriteTool;
 pub use write_file::WriteFileTool;
 
 /// A callable function the LLM can invoke during a turn.

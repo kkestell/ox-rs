@@ -16,7 +16,7 @@ use std::process::ExitCode;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use app::tools::{BashTool, EditFileTool, ReadFileTool, WriteFileTool};
+use app::tools::{BashTool, EditFileTool, ReadFileTool, TodoWriteTool, WriteFileTool};
 use app::{
     AbandonTool, CloseSignal, GlobTool, GrepTool, MergeTool, SecretStore, SessionRunner, Tool,
     ToolRegistry,
@@ -332,6 +332,11 @@ async fn run(cli: AgentCli) -> Result<()> {
     tools.register(
         Arc::new(BashTool::new(shell, fs.clone(), cli.workspace_root.clone())) as Arc<dyn Tool>,
     );
+
+    // `todo_write` is stateless and has no dependencies — it sits with the
+    // content-manipulation tools because, like them, it's a user-facing
+    // per-turn action rather than a lifecycle control.
+    tools.register(Arc::new(TodoWriteTool) as Arc<dyn Tool>);
 
     // Both lifecycle tools and the driver share one `CloseSignal` — the
     // tools set it, the driver drains it after each terminal frame and

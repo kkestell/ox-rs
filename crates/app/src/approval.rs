@@ -52,14 +52,12 @@ impl ToolApprover for NoApprovalRequired {
         requests: Vec<ToolApprovalRequest>,
         _cancel: CancelToken,
     ) -> Pin<Box<dyn Stream<Item = Result<ToolApprovalDecision>> + Send + '_>> {
-        Box::pin(futures::stream::iter(requests.into_iter().map(
-            |request| {
-                Ok(ToolApprovalDecision {
-                    request_id: request.request_id,
-                    approved: true,
-                })
-            },
-        )))
+        Box::pin(futures::stream::iter(requests.into_iter().map(|request| {
+            Ok(ToolApprovalDecision {
+                request_id: request.request_id,
+                approved: true,
+            })
+        })))
     }
 }
 

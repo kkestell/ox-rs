@@ -468,6 +468,15 @@ function attachToolResult(sess, block) {
     return;
   }
 
+  // `todo_write`'s success ack is "Todo list updated (N items)." — no new
+  // information on top of the rendered list above it. Suppress it here so
+  // the transcript stays visually clean. Errors still fall through so the
+  // user (and the LLM on re-entry) see what went wrong.
+  if (toolBlock.dataset.toolName === "todo_write" && !block.is_error) {
+    scrollToBottom(sess);
+    return;
+  }
+
   const existing = toolBlock.querySelector(":scope > .tool-result");
   const result = renderToolResult(block);
   if (existing) {
@@ -508,13 +517,27 @@ function renderBlock(block, role) {
       const wrap = document.createElement("div");
       wrap.className = "block tool";
       if (block.id) wrap.dataset.toolCallId = block.id;
+      // Stash the tool name on the DOM node so `attachToolResult` can make
+      // per-tool decisions (e.g. suppressing the redundant `todo_write`
+      // success ack) without threading extra state through the session.
+      wrap.dataset.toolName = block.name || "";
       const label = document.createElement("span");
       label.className = "tool-label";
       label.textContent = `→ ${block.name}`;
       wrap.appendChild(label);
-      const pre = document.createElement("pre");
-      pre.textContent = prettyJson(block.arguments);
-      wrap.appendChild(pre);
+
+      // Per-tool custom rendering. The fallback is the pretty-JSON <pre>
+      // block used by every other tool. `renderTodoList` returns `null`
+      // when the arguments don't parse yet (e.g. mid-stream partial JSON),
+      // so the fallback also covers the streaming transitional state.
+      const custom = block.name === "todo_write" ? renderTodoList(block.arguments) : null;
+      if (custom) {
+        wrap.appendChild(custom);
+      } else {
+        const pre = document.createElement("pre");
+        pre.textContent = prettyJson(block.arguments);
+        wrap.appendChild(pre);
+      }
       return wrap;
     }
     default: {
@@ -548,6 +571,54 @@ function prettyJson(s) {
     return JSON.stringify(JSON.parse(s), null, 2);
   } catch {
     return s;
+  }
+}
+
+// Render a `todo_write` tool-call's arguments as a glyph-prefixed list.
+// Returns `null` when the arguments aren't yet a complete, well-shaped
+// payload — in that case the caller falls back to the raw-JSON <pre>. This
+// keeps live streaming visually stable: the transitional state shows the
+// raw JSON, then flips to the pretty list once the final brace arrives.
+function renderTodoList(argsString) {
+  if (!argsString) return null;
+  let parsed;
+  try {
+    parsed = JSON.parse(argsString);
+  } catch {
+    return null;
+  }
+  const todos = parsed && Array.isArray(parsed.todos) ? parsed.todos : null;
+  if (!todos) return null;
+
+  const ul = document.createElement("ul");
+  ul.className = "todo-list";
+  for (const item of todos) {
+    const li = document.createElement("li");
+    const status = item && typeof item.status === "string" ? item.status : "";
+    const content = item && typeof item.content === "string" ? item.content : "";
+    // `data-status` drives CSS so completed items can strike-through and
+    // in-progress items can tint without touching the JS each time the
+    // status set changes.
+    li.dataset.status = status;
+    const glyph = document.createElement("span");
+    glyph.className = "todo-glyph";
+    glyph.textContent = todoGlyph(status);
+    const text = document.createElement("span");
+    text.className = "todo-content";
+    text.textContent = content;
+    li.appendChild(glyph);
+    li.appendChild(text);
+    ul.appendChild(li);
+  }
+  return ul;
+}
+
+function todoGlyph(status) {
+  switch (status) {
+    case "completed": return "✓";
+    case "in_progress": return "●";
+    case "pending": return "○";
+    default: return "·";
   }
 }
 

@@ -18,7 +18,8 @@ pub use lifecycle::{AbandonTool, CloseSignal, MergeTool};
 pub use ports::*;
 pub use stream::{Snapshot, StreamAccumulator, ToolDef};
 pub use tools::{
-    EditFileTool, GlobTool, GrepTool, ReadFileTool, Tool, ToolRegistry, WriteFileTool,
+    EditFileTool, GlobTool, GrepTool, ReadFileTool, TodoWriteTool, Tool, ToolRegistry,
+    WriteFileTool,
 };
 pub use use_cases::{SessionRunner, TurnEvent, TurnOutcome};
 

@@ -34,8 +34,8 @@ use app::{
     ToolApprovalRequest as AppToolApprovalRequest, ToolApprover, TurnEvent, TurnOutcome,
 };
 use domain::SessionId;
-use futures::{Stream, StreamExt};
 use futures::stream::FuturesUnordered;
+use futures::{Stream, StreamExt};
 use protocol::{AgentCommand, AgentEvent, read_frame, write_frame};
 use tokio::io::{AsyncBufRead, AsyncWrite};
 use tokio::sync::{Mutex, mpsc, oneshot};
@@ -63,46 +63,49 @@ impl ToolApprover for ApprovalBroker {
         // Register oneshot senders, then yield decisions as each receiver
         // resolves. FuturesUnordered drives all receivers concurrently so
         // whichever the user approves first flows to the runner first.
-        Box::pin(futures::stream::once(async move {
-            let mut receivers = Vec::with_capacity(requests.len());
-            {
-                let mut locked = pending.lock().await;
-                for request in requests {
-                    let (tx, rx) = oneshot::channel();
-                    locked.insert(request.request_id.clone(), tx);
-                    receivers.push((request.request_id, rx));
+        Box::pin(
+            futures::stream::once(async move {
+                let mut receivers = Vec::with_capacity(requests.len());
+                {
+                    let mut locked = pending.lock().await;
+                    for request in requests {
+                        let (tx, rx) = oneshot::channel();
+                        locked.insert(request.request_id.clone(), tx);
+                        receivers.push((request.request_id, rx));
+                    }
                 }
-            }
 
-            let futures: FuturesUnordered<_> = receivers
-                .into_iter()
-                .map(|(request_id, mut rx)| {
-                    let cancel = cancel.clone();
-                    let pending = pending.clone();
-                    async move {
-                        loop {
-                            if cancel.is_cancelled() {
-                                pending.lock().await.remove(&request_id);
-                                return Ok(ToolApprovalDecision {
-                                    request_id,
-                                    approved: false,
-                                });
-                            }
-                            tokio::select! {
-                                decision = &mut rx => {
+                let futures: FuturesUnordered<_> = receivers
+                    .into_iter()
+                    .map(|(request_id, mut rx)| {
+                        let cancel = cancel.clone();
+                        let pending = pending.clone();
+                        async move {
+                            loop {
+                                if cancel.is_cancelled() {
+                                    pending.lock().await.remove(&request_id);
                                     return Ok(ToolApprovalDecision {
                                         request_id,
-                                        approved: decision.unwrap_or(false),
+                                        approved: false,
                                     });
                                 }
-                                _ = tokio::time::sleep(Duration::from_millis(25)) => {}
+                                tokio::select! {
+                                    decision = &mut rx => {
+                                        return Ok(ToolApprovalDecision {
+                                            request_id,
+                                            approved: decision.unwrap_or(false),
+                                        });
+                                    }
+                                    _ = tokio::time::sleep(Duration::from_millis(25)) => {}
+                                }
                             }
                         }
-                    }
-                })
-                .collect();
-            futures
-        }).flatten())
+                    })
+                    .collect();
+                futures
+            })
+            .flatten(),
+        )
     }
 }
 
@@ -1316,7 +1319,9 @@ mod tests {
         llm.push_tool_call("call_1", "needs_approval", "{}");
         llm.push_text("recovered");
 
-        let tool = Arc::new(app::fake::FakeTool::new_requiring_approval("needs_approval")) as Arc<dyn Tool>;
+        let tool = Arc::new(app::fake::FakeTool::new_requiring_approval(
+            "needs_approval",
+        )) as Arc<dyn Tool>;
         let tools = tool_registry_with(vec![tool]);
 
         let (mut cmd_tx, mut evt_rx, handle) =
