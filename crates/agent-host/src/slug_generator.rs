@@ -14,12 +14,15 @@
 //! slug rename is a nice-to-have; it must never block session
 //! progress.
 
-use async_trait::async_trait;
+use std::future::Future;
+use std::pin::Pin;
 
-#[async_trait]
 pub trait SlugGenerator: Send + Sync + 'static {
     /// Produce a kebab-case slug from `first_message`, or `None` if the
     /// message can't be slugified for any reason. Implementations must
     /// enforce their own timeout — the caller doesn't supply one.
-    async fn generate(&self, first_message: &str) -> Option<String>;
+    fn generate(
+        &self,
+        first_message: &str,
+    ) -> Pin<Box<dyn Future<Output = Option<String>> + Send + '_>>;
 }

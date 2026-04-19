@@ -14,11 +14,12 @@
 //! the module is always compiled for this crate's own unit tests).
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::Mutex;
 
 use anyhow::{Result, bail};
-use async_trait::async_trait;
 use domain::{CloseIntent, SessionId};
 
 use crate::close_request_sink::CloseRequestSink;
@@ -160,114 +161,158 @@ impl FakeGit {
     }
 }
 
-#[async_trait]
 impl Git for FakeGit {
-    async fn assert_repo(&self, workspace_root: &Path) -> Result<()> {
-        self.record(GitCall::AssertRepo(workspace_root.to_path_buf()));
-        if self
-            .state
-            .lock()
-            .unwrap()
-            .non_repo
-            .iter()
-            .any(|p| p == workspace_root)
-        {
-            bail!(
-                "FakeGit: {} is not a git repository",
-                workspace_root.display()
-            );
-        }
-        Ok(())
+    fn assert_repo<'a>(
+        &'a self,
+        workspace_root: &'a Path,
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
+        Box::pin(async move {
+            self.record(GitCall::AssertRepo(workspace_root.to_path_buf()));
+            if self
+                .state
+                .lock()
+                .unwrap()
+                .non_repo
+                .iter()
+                .any(|p| p == workspace_root)
+            {
+                bail!(
+                    "FakeGit: {} is not a git repository",
+                    workspace_root.display()
+                );
+            }
+            Ok(())
+        })
     }
 
-    async fn current_branch(&self, workspace_root: &Path) -> Result<String> {
-        self.record(GitCall::CurrentBranch(workspace_root.to_path_buf()));
-        let state = self.state.lock().unwrap();
-        if state.detached.iter().any(|p| p == workspace_root) {
-            bail!("FakeGit: HEAD at {} is detached", workspace_root.display());
-        }
-        Ok(state
-            .branches
-            .get(workspace_root)
-            .cloned()
-            .unwrap_or_else(|| "main".to_owned()))
+    fn current_branch<'a>(
+        &'a self,
+        workspace_root: &'a Path,
+    ) -> Pin<Box<dyn Future<Output = Result<String>> + Send + 'a>> {
+        Box::pin(async move {
+            self.record(GitCall::CurrentBranch(workspace_root.to_path_buf()));
+            let state = self.state.lock().unwrap();
+            if state.detached.iter().any(|p| p == workspace_root) {
+                bail!("FakeGit: HEAD at {} is detached", workspace_root.display());
+            }
+            Ok(state
+                .branches
+                .get(workspace_root)
+                .cloned()
+                .unwrap_or_else(|| "main".to_owned()))
+        })
     }
 
-    async fn add_worktree(
-        &self,
-        workspace_root: &Path,
-        worktree_path: &Path,
-        branch: &str,
-        base_branch: &str,
-    ) -> Result<()> {
-        self.record(GitCall::AddWorktree {
-            workspace_root: workspace_root.to_path_buf(),
-            worktree_path: worktree_path.to_path_buf(),
-            branch: branch.to_owned(),
-            base_branch: base_branch.to_owned(),
-        });
-        Ok(())
+    fn add_worktree<'a>(
+        &'a self,
+        workspace_root: &'a Path,
+        worktree_path: &'a Path,
+        branch: &'a str,
+        base_branch: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
+        Box::pin(async move {
+            self.record(GitCall::AddWorktree {
+                workspace_root: workspace_root.to_path_buf(),
+                worktree_path: worktree_path.to_path_buf(),
+                branch: branch.to_owned(),
+                base_branch: base_branch.to_owned(),
+            });
+            Ok(())
+        })
     }
 
-    async fn status(&self, worktree_path: &Path) -> Result<WorktreeStatus> {
-        self.record(GitCall::Status(worktree_path.to_path_buf()));
-        Ok(self
-            .state
-            .lock()
-            .unwrap()
-            .statuses
-            .get(worktree_path)
-            .copied()
-            .unwrap_or(WorktreeStatus::Clean))
+    fn status<'a>(
+        &'a self,
+        worktree_path: &'a Path,
+    ) -> Pin<Box<dyn Future<Output = Result<WorktreeStatus>> + Send + 'a>> {
+        Box::pin(async move {
+            self.record(GitCall::Status(worktree_path.to_path_buf()));
+            Ok(self
+                .state
+                .lock()
+                .unwrap()
+                .statuses
+                .get(worktree_path)
+                .copied()
+                .unwrap_or(WorktreeStatus::Clean))
+        })
     }
 
-    async fn rename_branch(&self, workspace_root: &Path, old: &str, new: &str) -> Result<()> {
-        self.record(GitCall::RenameBranch {
-            workspace_root: workspace_root.to_path_buf(),
-            old: old.to_owned(),
-            new: new.to_owned(),
-        });
-        Ok(())
+    fn rename_branch<'a>(
+        &'a self,
+        workspace_root: &'a Path,
+        old: &'a str,
+        new: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
+        Box::pin(async move {
+            self.record(GitCall::RenameBranch {
+                workspace_root: workspace_root.to_path_buf(),
+                old: old.to_owned(),
+                new: new.to_owned(),
+            });
+            Ok(())
+        })
     }
 
-    async fn move_worktree(
-        &self,
-        workspace_root: &Path,
-        old_path: &Path,
-        new_path: &Path,
-    ) -> Result<()> {
-        self.record(GitCall::MoveWorktree {
-            workspace_root: workspace_root.to_path_buf(),
-            old_path: old_path.to_path_buf(),
-            new_path: new_path.to_path_buf(),
-        });
-        Ok(())
+    fn move_worktree<'a>(
+        &'a self,
+        workspace_root: &'a Path,
+        old_path: &'a Path,
+        new_path: &'a Path,
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
+        Box::pin(async move {
+            self.record(GitCall::MoveWorktree {
+                workspace_root: workspace_root.to_path_buf(),
+                old_path: old_path.to_path_buf(),
+                new_path: new_path.to_path_buf(),
+            });
+            Ok(())
+        })
     }
 
-    async fn merge(&self, workspace_root: &Path, branch: &str) -> Result<MergeOutcome> {
-        self.record(GitCall::Merge {
-            workspace_root: workspace_root.to_path_buf(),
-            branch: branch.to_owned(),
-        });
-        let mut state = self.state.lock().unwrap();
-        Ok(state.merge_outcomes.pop().unwrap_or(MergeOutcome::Merged))
+    fn merge<'a>(
+        &'a self,
+        workspace_root: &'a Path,
+        branch: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<MergeOutcome>> + Send + 'a>> {
+        Box::pin(async move {
+            self.record(GitCall::Merge {
+                workspace_root: workspace_root.to_path_buf(),
+                branch: branch.to_owned(),
+            });
+            let mut state = self.state.lock().unwrap();
+            Ok(state.merge_outcomes.pop().unwrap_or(MergeOutcome::Merged))
+        })
     }
 
-    async fn remove_worktree(&self, workspace_root: &Path, worktree_path: &Path) -> Result<()> {
-        self.record(GitCall::RemoveWorktree {
-            workspace_root: workspace_root.to_path_buf(),
-            worktree_path: worktree_path.to_path_buf(),
-        });
-        Ok(())
+    fn remove_worktree<'a>(
+        &'a self,
+        workspace_root: &'a Path,
+        worktree_path: &'a Path,
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
+        Box::pin(async move {
+            self.record(GitCall::RemoveWorktree {
+                workspace_root: workspace_root.to_path_buf(),
+                worktree_path: worktree_path.to_path_buf(),
+            });
+            Ok(())
+        })
     }
 
-    async fn delete_branch(&self, workspace_root: &Path, branch: &str, force: bool) -> Result<()> {
-        self.record(GitCall::DeleteBranch {
-            workspace_root: workspace_root.to_path_buf(),
-            branch: branch.to_owned(),
-            force,
-        });
-        Ok(())
+    fn delete_branch<'a>(
+        &'a self,
+        workspace_root: &'a Path,
+        branch: &'a str,
+        force: bool,
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
+        Box::pin(async move {
+            self.record(GitCall::DeleteBranch {
+                workspace_root: workspace_root.to_path_buf(),
+                branch: branch.to_owned(),
+                force,
+            });
+            Ok(())
+        })
     }
 }
 
@@ -314,16 +359,21 @@ impl FakeSlugGenerator {
     }
 }
 
-#[async_trait]
 impl SlugGenerator for FakeSlugGenerator {
-    async fn generate(&self, first_message: &str) -> Option<String> {
-        self.calls.lock().unwrap().push(first_message.to_owned());
-        self.responses
-            .lock()
-            .unwrap()
-            .get(first_message)
-            .cloned()
-            .unwrap_or(None)
+    fn generate(
+        &self,
+        first_message: &str,
+    ) -> Pin<Box<dyn Future<Output = Option<String>> + Send + '_>> {
+        let first_message = first_message.to_owned();
+        Box::pin(async move {
+            self.calls.lock().unwrap().push(first_message.clone());
+            self.responses
+                .lock()
+                .unwrap()
+                .get(&first_message)
+                .cloned()
+                .unwrap_or(None)
+        })
     }
 }
 
@@ -356,10 +406,15 @@ impl FakeCloseRequestSink {
     }
 }
 
-#[async_trait]
 impl CloseRequestSink for FakeCloseRequestSink {
-    async fn request_close(&self, id: SessionId, intent: CloseIntent) {
-        self.calls.lock().unwrap().push((id, intent));
+    fn request_close(
+        &self,
+        id: SessionId,
+        intent: CloseIntent,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        Box::pin(async move {
+            self.calls.lock().unwrap().push((id, intent));
+        })
     }
 }
 
@@ -369,10 +424,13 @@ impl CloseRequestSink for FakeCloseRequestSink {
 /// *some* implementation in the meantime.
 pub struct NoopCloseRequestSink;
 
-#[async_trait]
 impl CloseRequestSink for NoopCloseRequestSink {
-    async fn request_close(&self, _id: SessionId, _intent: CloseIntent) {
-        // Intentionally empty.
+    fn request_close(
+        &self,
+        _id: SessionId,
+        _intent: CloseIntent,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        Box::pin(async move {})
     }
 }
 
@@ -405,10 +463,15 @@ impl FakeFirstTurnSink {
     }
 }
 
-#[async_trait]
 impl FirstTurnSink for FakeFirstTurnSink {
-    async fn on_first_turn_complete(&self, id: SessionId, first_message: String) {
-        self.calls.lock().unwrap().push((id, first_message));
+    fn on_first_turn_complete(
+        &self,
+        id: SessionId,
+        first_message: String,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        Box::pin(async move {
+            self.calls.lock().unwrap().push((id, first_message));
+        })
     }
 }
 
@@ -417,10 +480,13 @@ impl FirstTurnSink for FakeFirstTurnSink {
 /// points that predate the production wiring.
 pub struct NoopFirstTurnSink;
 
-#[async_trait]
 impl FirstTurnSink for NoopFirstTurnSink {
-    async fn on_first_turn_complete(&self, _id: SessionId, _first_message: String) {
-        // Intentionally empty.
+    fn on_first_turn_complete(
+        &self,
+        _id: SessionId,
+        _first_message: String,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        Box::pin(async move {})
     }
 }
 

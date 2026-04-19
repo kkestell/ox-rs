@@ -15,7 +15,6 @@ adapter-storage = { version = "0.1.0", path = "../adapter-storage" }
 agent-host = { version = "0.1.0", path = "../agent-host" }
 anyhow = "1.0.102"
 app = { version = "0.1.0", path = "../app" }
-async-trait = "0.1.89"
 axum = "0.8.9"
 clap = { version = "4.6.1", features = ["derive"] }
 dirs = "6.0.0"

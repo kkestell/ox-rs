@@ -16,12 +16,13 @@
 //! misconfigured credential helper cannot freeze the server waiting for
 //! a username/password on the terminal.
 
+use std::future::Future;
 use std::path::Path;
+use std::pin::Pin;
 use std::process::ExitStatus;
 
 use agent_host::{Git, MergeOutcome, WorktreeStatus};
 use anyhow::{Context, Result, anyhow, bail};
-use async_trait::async_trait;
 use tokio::process::Command;
 
 /// Stateless handle — all per-call state lives in arguments. Constructed
@@ -87,212 +88,258 @@ async fn run_git_checked(cwd: &Path, args: &[&str]) -> Result<Captured> {
     Ok(cap)
 }
 
-#[async_trait]
 impl Git for CliGit {
-    async fn assert_repo(&self, workspace_root: &Path) -> Result<()> {
-        // `rev-parse --is-inside-work-tree` prints `true` when run inside
-        // a checked-out work tree and errors otherwise — exactly the
-        // signal we want. `--show-toplevel` would also work but fails
-        // *silently* with an empty stdout in bare repos, which confuses
-        // the error message.
-        let cap = run_git(workspace_root, &["rev-parse", "--is-inside-work-tree"]).await?;
-        if !cap.status.success() {
-            bail!(
-                "{} is not a git repository ({})",
-                workspace_root.display(),
-                cap.stderr.trim()
-            );
-        }
-        if cap.stdout.trim() != "true" {
-            bail!(
-                "{} is a git directory but not a working copy",
-                workspace_root.display()
-            );
-        }
-        // `symbolic-ref HEAD` fails when HEAD is detached. Surface that
-        // as a distinct error so the startup gate can steer the user to
-        // `git checkout <branch>` instead of `git init`.
-        let head = run_git(workspace_root, &["symbolic-ref", "-q", "HEAD"]).await?;
-        if !head.status.success() {
-            bail!(
-                "HEAD at {} is detached — check out a branch before launching ox",
-                workspace_root.display()
-            );
-        }
-        Ok(())
+    fn assert_repo<'a>(
+        &'a self,
+        workspace_root: &'a Path,
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
+        Box::pin(async move {
+            // `rev-parse --is-inside-work-tree` prints `true` when run inside
+            // a checked-out work tree and errors otherwise — exactly the
+            // signal we want. `--show-toplevel` would also work but fails
+            // *silently* with an empty stdout in bare repos, which confuses
+            // the error message.
+            let cap = run_git(workspace_root, &["rev-parse", "--is-inside-work-tree"]).await?;
+            if !cap.status.success() {
+                bail!(
+                    "{} is not a git repository ({})",
+                    workspace_root.display(),
+                    cap.stderr.trim()
+                );
+            }
+            if cap.stdout.trim() != "true" {
+                bail!(
+                    "{} is a git directory but not a working copy",
+                    workspace_root.display()
+                );
+            }
+            // `symbolic-ref HEAD` fails when HEAD is detached. Surface that
+            // as a distinct error so the startup gate can steer the user to
+            // `git checkout <branch>` instead of `git init`.
+            let head = run_git(workspace_root, &["symbolic-ref", "-q", "HEAD"]).await?;
+            if !head.status.success() {
+                bail!(
+                    "HEAD at {} is detached — check out a branch before launching ox",
+                    workspace_root.display()
+                );
+            }
+            Ok(())
+        })
     }
 
-    async fn current_branch(&self, workspace_root: &Path) -> Result<String> {
-        let cap = run_git(workspace_root, &["symbolic-ref", "--short", "-q", "HEAD"]).await?;
-        if !cap.status.success() {
-            bail!(
-                "HEAD at {} is detached: {}",
-                workspace_root.display(),
-                cap.stderr.trim()
-            );
-        }
-        let name = cap.stdout.trim();
-        if name.is_empty() {
-            bail!(
-                "git reported an empty branch name at {}",
-                workspace_root.display()
-            );
-        }
-        let head = run_git(
-            workspace_root,
-            &["rev-parse", "--verify", "--quiet", "HEAD"],
-        )
-        .await?;
-        if !head.status.success() {
-            bail!(
-                "branch {name} at {} has no commits; create an initial commit before launching ox",
-                workspace_root.display()
-            );
-        }
-        Ok(name.to_owned())
+    fn current_branch<'a>(
+        &'a self,
+        workspace_root: &'a Path,
+    ) -> Pin<Box<dyn Future<Output = Result<String>> + Send + 'a>> {
+        Box::pin(async move {
+            let cap = run_git(workspace_root, &["symbolic-ref", "--short", "-q", "HEAD"]).await?;
+            if !cap.status.success() {
+                bail!(
+                    "HEAD at {} is detached: {}",
+                    workspace_root.display(),
+                    cap.stderr.trim()
+                );
+            }
+            let name = cap.stdout.trim();
+            if name.is_empty() {
+                bail!(
+                    "git reported an empty branch name at {}",
+                    workspace_root.display()
+                );
+            }
+            let head = run_git(
+                workspace_root,
+                &["rev-parse", "--verify", "--quiet", "HEAD"],
+            )
+            .await?;
+            if !head.status.success() {
+                bail!(
+                    "branch {name} at {} has no commits; create an initial commit before launching ox",
+                    workspace_root.display()
+                );
+            }
+            Ok(name.to_owned())
+        })
     }
 
-    async fn add_worktree(
-        &self,
-        workspace_root: &Path,
-        worktree_path: &Path,
-        branch: &str,
-        base_branch: &str,
-    ) -> Result<()> {
-        // `git worktree add` requires the parent directory to exist;
-        // create it here so callers don't have to mirror the adapter's
-        // layout assumptions.
-        if let Some(parent) = worktree_path.parent() {
-            tokio::fs::create_dir_all(parent).await.with_context(|| {
-                format!(
-                    "creating parent directory for worktree {}",
+    fn add_worktree<'a>(
+        &'a self,
+        workspace_root: &'a Path,
+        worktree_path: &'a Path,
+        branch: &'a str,
+        base_branch: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
+        Box::pin(async move {
+            // `git worktree add` requires the parent directory to exist;
+            // create it here so callers don't have to mirror the adapter's
+            // layout assumptions.
+            if let Some(parent) = worktree_path.parent() {
+                tokio::fs::create_dir_all(parent).await.with_context(|| {
+                    format!(
+                        "creating parent directory for worktree {}",
+                        worktree_path.display()
+                    )
+                })?;
+            }
+            let worktree_str = worktree_path.to_str().ok_or_else(|| {
+                anyhow!(
+                    "worktree path {} is not valid UTF-8",
                     worktree_path.display()
                 )
             })?;
-        }
-        let worktree_str = worktree_path.to_str().ok_or_else(|| {
-            anyhow!(
-                "worktree path {} is not valid UTF-8",
-                worktree_path.display()
+            run_git_checked(
+                workspace_root,
+                &["worktree", "add", "-b", branch, worktree_str, base_branch],
             )
-        })?;
-        run_git_checked(
-            workspace_root,
-            &["worktree", "add", "-b", branch, worktree_str, base_branch],
-        )
-        .await?;
-        Ok(())
+            .await?;
+            Ok(())
+        })
     }
 
-    async fn status(&self, worktree_path: &Path) -> Result<WorktreeStatus> {
-        // `--porcelain=v1` emits one line per change; any output means
-        // there's something uncommitted. Untracked files count — we
-        // don't want to drop a "temporary" file the user is editing.
-        let cap = run_git_checked(worktree_path, &["status", "--porcelain"]).await?;
-        if cap.stdout.trim().is_empty() {
-            Ok(WorktreeStatus::Clean)
-        } else {
-            Ok(WorktreeStatus::Dirty)
-        }
+    fn status<'a>(
+        &'a self,
+        worktree_path: &'a Path,
+    ) -> Pin<Box<dyn Future<Output = Result<WorktreeStatus>> + Send + 'a>> {
+        Box::pin(async move {
+            // `--porcelain=v1` emits one line per change; any output means
+            // there's something uncommitted. Untracked files count — we
+            // don't want to drop a "temporary" file the user is editing.
+            let cap = run_git_checked(worktree_path, &["status", "--porcelain"]).await?;
+            if cap.stdout.trim().is_empty() {
+                Ok(WorktreeStatus::Clean)
+            } else {
+                Ok(WorktreeStatus::Dirty)
+            }
+        })
     }
 
-    async fn rename_branch(&self, workspace_root: &Path, old: &str, new: &str) -> Result<()> {
-        run_git_checked(workspace_root, &["branch", "-m", old, new]).await?;
-        Ok(())
+    fn rename_branch<'a>(
+        &'a self,
+        workspace_root: &'a Path,
+        old: &'a str,
+        new: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
+        Box::pin(async move {
+            run_git_checked(workspace_root, &["branch", "-m", old, new]).await?;
+            Ok(())
+        })
     }
 
-    async fn move_worktree(
-        &self,
-        workspace_root: &Path,
-        old_path: &Path,
-        new_path: &Path,
-    ) -> Result<()> {
-        let old_str = old_path.to_str().ok_or_else(|| {
-            anyhow!(
-                "old worktree path {} is not valid UTF-8",
-                old_path.display()
-            )
-        })?;
-        let new_str = new_path.to_str().ok_or_else(|| {
-            anyhow!(
-                "new worktree path {} is not valid UTF-8",
-                new_path.display()
-            )
-        })?;
-        // Same parent-dir concern as `add_worktree` — `git worktree move`
-        // will not create intermediate directories.
-        if let Some(parent) = new_path.parent() {
-            tokio::fs::create_dir_all(parent).await.with_context(|| {
-                format!(
-                    "creating parent directory for worktree move target {}",
+    fn move_worktree<'a>(
+        &'a self,
+        workspace_root: &'a Path,
+        old_path: &'a Path,
+        new_path: &'a Path,
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
+        Box::pin(async move {
+            let old_str = old_path.to_str().ok_or_else(|| {
+                anyhow!(
+                    "old worktree path {} is not valid UTF-8",
+                    old_path.display()
+                )
+            })?;
+            let new_str = new_path.to_str().ok_or_else(|| {
+                anyhow!(
+                    "new worktree path {} is not valid UTF-8",
                     new_path.display()
                 )
             })?;
-        }
-        run_git_checked(workspace_root, &["worktree", "move", old_str, new_str]).await?;
-        Ok(())
+            // Same parent-dir concern as `add_worktree` — `git worktree move`
+            // will not create intermediate directories.
+            if let Some(parent) = new_path.parent() {
+                tokio::fs::create_dir_all(parent).await.with_context(|| {
+                    format!(
+                        "creating parent directory for worktree move target {}",
+                        new_path.display()
+                    )
+                })?;
+            }
+            run_git_checked(workspace_root, &["worktree", "move", old_str, new_str]).await?;
+            Ok(())
+        })
     }
 
-    async fn merge(&self, workspace_root: &Path, branch: &str) -> Result<MergeOutcome> {
-        // Guard: the main checkout must be clean. `git merge` would
-        // happily churn through unrelated work and leave the user with a
-        // mess to untangle.
-        let main_status = self.status(workspace_root).await?;
-        if main_status == WorktreeStatus::Dirty {
-            return Ok(MergeOutcome::MainDirty);
-        }
-        // `--no-edit` keeps the merge non-interactive; `--no-ff`
-        // preserves the session branch as a distinct ancestor so the
-        // history tells the "this was an ox session" story. Conflicts
-        // still surface as a non-zero exit.
-        let merge = run_git(workspace_root, &["merge", "--no-edit", "--no-ff", branch]).await?;
-        if merge.status.success() {
-            return Ok(MergeOutcome::Merged);
-        }
-        // A non-zero exit with MERGE_HEAD present means a conflict —
-        // abort so main is left clean. Any other non-zero exit is a hard
-        // error (missing branch, broken ref, etc.) and bubbles up.
-        let merge_head = run_git(workspace_root, &["rev-parse", "--verify", "MERGE_HEAD"]).await?;
-        if merge_head.status.success() {
-            let _ = run_git(workspace_root, &["merge", "--abort"]).await?;
-            return Ok(MergeOutcome::Conflicts);
-        }
-        bail!(
-            "git merge {} failed in {}: {}",
-            branch,
-            workspace_root.display(),
-            merge.stderr.trim()
-        );
+    fn merge<'a>(
+        &'a self,
+        workspace_root: &'a Path,
+        branch: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<MergeOutcome>> + Send + 'a>> {
+        Box::pin(async move {
+            // Guard: the main checkout must be clean. `git merge` would
+            // happily churn through unrelated work and leave the user with a
+            // mess to untangle.
+            let main_status = self.status(workspace_root).await?;
+            if main_status == WorktreeStatus::Dirty {
+                return Ok(MergeOutcome::MainDirty);
+            }
+            // `--no-edit` keeps the merge non-interactive; `--no-ff`
+            // preserves the session branch as a distinct ancestor so the
+            // history tells the "this was an ox session" story. Conflicts
+            // still surface as a non-zero exit.
+            let merge =
+                run_git(workspace_root, &["merge", "--no-edit", "--no-ff", branch]).await?;
+            if merge.status.success() {
+                return Ok(MergeOutcome::Merged);
+            }
+            // A non-zero exit with MERGE_HEAD present means a conflict —
+            // abort so main is left clean. Any other non-zero exit is a hard
+            // error (missing branch, broken ref, etc.) and bubbles up.
+            let merge_head =
+                run_git(workspace_root, &["rev-parse", "--verify", "MERGE_HEAD"]).await?;
+            if merge_head.status.success() {
+                let _ = run_git(workspace_root, &["merge", "--abort"]).await?;
+                return Ok(MergeOutcome::Conflicts);
+            }
+            bail!(
+                "git merge {} failed in {}: {}",
+                branch,
+                workspace_root.display(),
+                merge.stderr.trim()
+            );
+        })
     }
 
-    async fn remove_worktree(&self, workspace_root: &Path, worktree_path: &Path) -> Result<()> {
-        // Tolerate a missing worktree dir — abandon can race with the
-        // user deleting the directory by hand, and the coordinator
-        // shouldn't error on an already-clean state.
-        if !worktree_path.exists() {
-            // Still prune the administrative bookkeeping; git otherwise
-            // keeps a stale entry in `git worktree list`.
-            let _ = run_git(workspace_root, &["worktree", "prune"]).await?;
-            return Ok(());
-        }
-        let worktree_str = worktree_path.to_str().ok_or_else(|| {
-            anyhow!(
-                "worktree path {} is not valid UTF-8",
-                worktree_path.display()
+    fn remove_worktree<'a>(
+        &'a self,
+        workspace_root: &'a Path,
+        worktree_path: &'a Path,
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
+        Box::pin(async move {
+            // Tolerate a missing worktree dir — abandon can race with the
+            // user deleting the directory by hand, and the coordinator
+            // shouldn't error on an already-clean state.
+            if !worktree_path.exists() {
+                // Still prune the administrative bookkeeping; git otherwise
+                // keeps a stale entry in `git worktree list`.
+                let _ = run_git(workspace_root, &["worktree", "prune"]).await?;
+                return Ok(());
+            }
+            let worktree_str = worktree_path.to_str().ok_or_else(|| {
+                anyhow!(
+                    "worktree path {} is not valid UTF-8",
+                    worktree_path.display()
+                )
+            })?;
+            run_git_checked(
+                workspace_root,
+                &["worktree", "remove", "--force", worktree_str],
             )
-        })?;
-        run_git_checked(
-            workspace_root,
-            &["worktree", "remove", "--force", worktree_str],
-        )
-        .await?;
-        Ok(())
+            .await?;
+            Ok(())
+        })
     }
 
-    async fn delete_branch(&self, workspace_root: &Path, branch: &str, force: bool) -> Result<()> {
-        let flag = if force { "-D" } else { "-d" };
-        run_git_checked(workspace_root, &["branch", flag, branch]).await?;
-        Ok(())
+    fn delete_branch<'a>(
+        &'a self,
+        workspace_root: &'a Path,
+        branch: &'a str,
+        force: bool,
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
+        Box::pin(async move {
+            let flag = if force { "-D" } else { "-d" };
+            run_git_checked(workspace_root, &["branch", flag, branch]).await?;
+            Ok(())
+        })
     }
 }
 

@@ -20,7 +20,6 @@ version = "0.1.0"
 dependencies = [
  "agent-host",
  "anyhow",
- "async-trait",
  "tempfile",
  "tokio",
 ]
@@ -32,7 +31,6 @@ dependencies = [
  "agent-host",
  "anyhow",
  "app",
- "async-trait",
  "domain",
  "futures",
  "reqwest",
@@ -322,7 +320,6 @@ dependencies = [
  "agent-host",
  "anyhow",
  "app",
- "async-trait",
  "axum",
  "clap",
  "dirs",

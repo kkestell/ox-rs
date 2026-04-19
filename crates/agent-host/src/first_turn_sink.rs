@@ -20,10 +20,11 @@
 //! `fake::NoopFirstTurnSink` when a session's first-turn hook is
 //! simply out-of-scope for the test.
 
-use async_trait::async_trait;
+use std::future::Future;
+use std::pin::Pin;
+
 use domain::SessionId;
 
-#[async_trait]
 pub trait FirstTurnSink: Send + Sync + 'static {
     /// Called by the pump on the first `TurnComplete` observed while
     /// the session is fresh. The pump fires this at most once per
@@ -35,5 +36,9 @@ pub trait FirstTurnSink: Send + Sync + 'static {
     /// Must not block — implementations should punt any slow work
     /// (LLM call, git operations, agent respawn) onto their own task
     /// so the pump can keep draining frames.
-    async fn on_first_turn_complete(&self, id: SessionId, first_message: String);
+    fn on_first_turn_complete(
+        &self,
+        id: SessionId,
+        first_message: String,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + '_>>;
 }

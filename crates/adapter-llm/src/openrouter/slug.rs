@@ -4,10 +4,11 @@
 //! This is provider-specific infrastructure, but intentionally separate from
 //! the streaming chat provider because slugging is a non-streaming JSON call.
 
+use std::future::Future;
+use std::pin::Pin;
 use std::time::Duration;
 
 use agent_host::SlugGenerator;
-use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
 const SLUG_TIMEOUT: Duration = Duration::from_secs(10);
@@ -29,24 +30,29 @@ impl OpenRouterSlugGenerator {
     }
 }
 
-#[async_trait]
 impl SlugGenerator for OpenRouterSlugGenerator {
-    async fn generate(&self, first_message: &str) -> Option<String> {
-        match tokio::time::timeout(SLUG_TIMEOUT, self.request(first_message)).await {
-            Ok(Ok(Some(slug))) => Some(slug),
-            Ok(Ok(None)) => None,
-            Ok(Err(err)) => {
-                eprintln!("ox: slug generator request failed: {err:#}");
-                None
+    fn generate(
+        &self,
+        first_message: &str,
+    ) -> Pin<Box<dyn Future<Output = Option<String>> + Send + '_>> {
+        let first_message = first_message.to_owned();
+        Box::pin(async move {
+            match tokio::time::timeout(SLUG_TIMEOUT, self.request(&first_message)).await {
+                Ok(Ok(Some(slug))) => Some(slug),
+                Ok(Ok(None)) => None,
+                Ok(Err(err)) => {
+                    eprintln!("ox: slug generator request failed: {err:#}");
+                    None
+                }
+                Err(_) => {
+                    eprintln!(
+                        "ox: slug generator timed out after {}s",
+                        SLUG_TIMEOUT.as_secs()
+                    );
+                    None
+                }
             }
-            Err(_) => {
-                eprintln!(
-                    "ox: slug generator timed out after {}s",
-                    SLUG_TIMEOUT.as_secs()
-                );
-                None
-            }
-        }
+        })
     }
 }
 

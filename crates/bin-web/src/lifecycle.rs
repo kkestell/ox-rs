@@ -45,7 +45,9 @@
 //! only condition).
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use agent_host::{
@@ -53,7 +55,6 @@ use agent_host::{
     WorkspaceContext, WorktreeStatus, workspace_slug,
 };
 use anyhow::{Context, Result, anyhow};
-use async_trait::async_trait;
 use domain::{CloseIntent, Session, SessionId};
 
 use crate::registry::SessionRegistry;
@@ -516,37 +517,42 @@ fn short_prefix(id: SessionId) -> String {
 /// agent sent `RequestClose` just as a concurrent HTTP merge/abandon
 /// tore the session down. Log and return without broadcasting
 /// (there's no session channel to broadcast on).
-#[async_trait]
 impl CloseRequestSink for SessionLifecycle {
-    async fn request_close(&self, id: SessionId, intent: CloseIntent) {
-        let result = match intent {
-            CloseIntent::Merge => self.merge(id).await,
-            CloseIntent::Abandon { confirm } => self.abandon(id, confirm).await,
-        };
+    fn request_close(
+        &self,
+        id: SessionId,
+        intent: CloseIntent,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        Box::pin(async move {
+            let result = match intent {
+                CloseIntent::Merge => self.merge(id).await,
+                CloseIntent::Abandon { confirm } => self.abandon(id, confirm).await,
+            };
 
-        let Err(rejection) = result else {
-            return;
-        };
+            let Err(rejection) = result else {
+                return;
+            };
 
-        let (intent_label, reason) = match intent {
-            CloseIntent::Merge => ("merge", rejection_message(&rejection)),
-            CloseIntent::Abandon { .. } => ("abandon", rejection_message(&rejection)),
-        };
-        let message = format!("{intent_label} refused: {reason}");
+            let (intent_label, reason) = match intent {
+                CloseIntent::Merge => ("merge", rejection_message(&rejection)),
+                CloseIntent::Abandon { .. } => ("abandon", rejection_message(&rejection)),
+            };
+            let message = format!("{intent_label} refused: {reason}");
 
-        // `NotFound` means the registry dropped the session already;
-        // there is no broadcast channel to reach. Just log and return.
-        if matches!(rejection, MergeRejection::NotFound) {
-            eprintln!("ox: close for session {id} skipped: {message}");
-            return;
-        }
+            // `NotFound` means the registry dropped the session already;
+            // there is no broadcast channel to reach. Just log and return.
+            if matches!(rejection, MergeRejection::NotFound) {
+                eprintln!("ox: close for session {id} skipped: {message}");
+                return;
+            }
 
-        if let Some(registry) = self.registry()
-            && let Some(session) = registry.get(id)
-        {
-            session.broadcast_error(message.clone());
-        }
-        eprintln!("ox: {message} (session {id})");
+            if let Some(registry) = self.registry()
+                && let Some(session) = registry.get(id)
+            {
+                session.broadcast_error(message.clone());
+            }
+            eprintln!("ox: {message} (session {id})");
+        })
     }
 }
 
@@ -581,119 +587,126 @@ fn rejection_message(rej: &MergeRejection) -> String {
 /// fires at most once per `ActiveSession`. On a process restart, the
 /// resumed session starts with `fresh=false`, so the pump's guard
 /// prevents a re-fire without any work here.
-#[async_trait]
 impl FirstTurnSink for SessionLifecycle {
-    async fn on_first_turn_complete(&self, id: SessionId, first_message: String) {
-        let slug = match self.slug_generator.generate(&first_message).await {
-            Some(s) => s,
-            None => {
-                // Generator timed out / returned invalid shape / errored.
-                // Keep the short-UUID name.
-                return;
-            }
-        };
+    fn on_first_turn_complete(
+        &self,
+        id: SessionId,
+        first_message: String,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        Box::pin(async move {
+            let slug = match self.slug_generator.generate(&first_message).await {
+                Some(s) => s,
+                None => {
+                    // Generator timed out / returned invalid shape / errored.
+                    // Keep the short-UUID name.
+                    return;
+                }
+            };
 
-        let short = short_prefix(id);
-        let old_branch = format!("ox/{short}");
-        let new_branch = format!("ox/{slug}-{short}");
+            let short = short_prefix(id);
+            let old_branch = format!("ox/{short}");
+            let new_branch = format!("ox/{slug}-{short}");
 
-        // Load the session to find its current worktree path. The agent
-        // saves the session JSON on every TurnComplete, so by the time
-        // the hook fires the file must exist — but we still treat
-        // missing-file as a skippable failure rather than a panic.
-        let session = match self.session_store.try_load(id).await {
-            Ok(Some(s)) => s,
-            Ok(None) => {
-                eprintln!("ox: slug rename skipped for session {id}: no session file on disk");
-                return;
-            }
-            Err(err) => {
-                eprintln!("ox: slug rename: failed to load session {id}: {err:#}");
-                return;
-            }
-        };
-        let old_worktree_path = session.worktree_path.clone();
-        // The new worktree sits in the same parent directory (the
-        // per-workspace `worktrees/` folder); only the leaf name changes
-        // from `<short>` to `<slug>-<short>`.
-        let new_worktree_path = match old_worktree_path.parent() {
-            Some(parent) => parent.join(format!("{slug}-{short}")),
-            None => {
-                eprintln!(
-                    "ox: slug rename: worktree path {} has no parent; skipping",
-                    old_worktree_path.display()
-                );
-                return;
-            }
-        };
+            // Load the session to find its current worktree path. The agent
+            // saves the session JSON on every TurnComplete, so by the time
+            // the hook fires the file must exist — but we still treat
+            // missing-file as a skippable failure rather than a panic.
+            let session = match self.session_store.try_load(id).await {
+                Ok(Some(s)) => s,
+                Ok(None) => {
+                    eprintln!(
+                        "ox: slug rename skipped for session {id}: no session file on disk"
+                    );
+                    return;
+                }
+                Err(err) => {
+                    eprintln!("ox: slug rename: failed to load session {id}: {err:#}");
+                    return;
+                }
+            };
+            let old_worktree_path = session.worktree_path.clone();
+            // The new worktree sits in the same parent directory (the
+            // per-workspace `worktrees/` folder); only the leaf name changes
+            // from `<short>` to `<slug>-<short>`.
+            let new_worktree_path = match old_worktree_path.parent() {
+                Some(parent) => parent.join(format!("{slug}-{short}")),
+                None => {
+                    eprintln!(
+                        "ox: slug rename: worktree path {} has no parent; skipping",
+                        old_worktree_path.display()
+                    );
+                    return;
+                }
+            };
 
-        if let Err(err) = self
-            .git
-            .rename_branch(&self.workspace.workspace_root, &old_branch, &new_branch)
-            .await
-        {
-            eprintln!(
-                "ox: slug rename: renaming branch {old_branch} → {new_branch} failed: {err:#}"
-            );
-            return;
-        }
-
-        if let Err(err) = self
-            .git
-            .move_worktree(
-                &self.workspace.workspace_root,
-                &old_worktree_path,
-                &new_worktree_path,
-            )
-            .await
-        {
-            eprintln!(
-                "ox: slug rename: moving worktree {} → {} failed: {err:#}",
-                old_worktree_path.display(),
-                new_worktree_path.display()
-            );
-            // Best-effort rollback of the branch rename so the on-disk
-            // state stays consistent with the session JSON. A failed
-            // rollback is only logged — the session is still usable on
-            // its original short-UUID path.
-            if let Err(rb_err) = self
+            if let Err(err) = self
                 .git
-                .rename_branch(&self.workspace.workspace_root, &new_branch, &old_branch)
+                .rename_branch(&self.workspace.workspace_root, &old_branch, &new_branch)
                 .await
             {
                 eprintln!(
-                    "ox: slug rename: branch rollback {new_branch} → {old_branch} failed: {rb_err:#}"
+                    "ox: slug rename: renaming branch {old_branch} → {new_branch} failed: {err:#}"
                 );
+                return;
             }
-            return;
-        }
 
-        let mut updated = session;
-        updated.worktree_path = new_worktree_path.clone();
-        if let Err(err) = self.session_store.save(&updated).await {
-            eprintln!("ox: slug rename: saving updated session JSON failed: {err:#}");
-            // At this point the branch+worktree moved but the JSON
-            // still points at the old path. A restart would skip this
-            // session's resume because `old_worktree_path` no longer
-            // exists on disk, stranding it until manual cleanup. We
-            // don't attempt a double-rollback; the user can rerun the
-            // session from the renamed branch by hand.
-            return;
-        }
+            if let Err(err) = self
+                .git
+                .move_worktree(
+                    &self.workspace.workspace_root,
+                    &old_worktree_path,
+                    &new_worktree_path,
+                )
+                .await
+            {
+                eprintln!(
+                    "ox: slug rename: moving worktree {} → {} failed: {err:#}",
+                    old_worktree_path.display(),
+                    new_worktree_path.display()
+                );
+                // Best-effort rollback of the branch rename so the on-disk
+                // state stays consistent with the session JSON. A failed
+                // rollback is only logged — the session is still usable on
+                // its original short-UUID path.
+                if let Err(rb_err) = self
+                    .git
+                    .rename_branch(&self.workspace.workspace_root, &new_branch, &old_branch)
+                    .await
+                {
+                    eprintln!(
+                        "ox: slug rename: branch rollback {new_branch} → {old_branch} failed: {rb_err:#}"
+                    );
+                }
+                return;
+            }
 
-        let Some(registry) = self.registry() else {
-            // Registry has been dropped (shutdown in flight). The JSON
-            // is already updated so a future launch will pick up the
-            // new path.
-            return;
-        };
+            let mut updated = session;
+            updated.worktree_path = new_worktree_path.clone();
+            if let Err(err) = self.session_store.save(&updated).await {
+                eprintln!("ox: slug rename: saving updated session JSON failed: {err:#}");
+                // At this point the branch+worktree moved but the JSON
+                // still points at the old path. A restart would skip this
+                // session's resume because `old_worktree_path` no longer
+                // exists on disk, stranding it until manual cleanup. We
+                // don't attempt a double-rollback; the user can rerun the
+                // session from the renamed branch by hand.
+                return;
+            }
 
-        if let Err(err) = registry
-            .spawn_new_agent_for_existing(id, new_worktree_path)
-            .await
-        {
-            eprintln!("ox: slug rename: respawning agent for session {id} failed: {err:#}");
-        }
+            let Some(registry) = self.registry() else {
+                // Registry has been dropped (shutdown in flight). The JSON
+                // is already updated so a future launch will pick up the
+                // new path.
+                return;
+            };
+
+            if let Err(err) = registry
+                .spawn_new_agent_for_existing(id, new_worktree_path)
+                .await
+            {
+                eprintln!("ox: slug rename: respawning agent for session {id} failed: {err:#}");
+            }
+        })
     }
 }
 

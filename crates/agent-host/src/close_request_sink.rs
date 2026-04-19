@@ -16,15 +16,20 @@
 //! only the trait; the implementations live at the layer that owns
 //! them.
 
-use async_trait::async_trait;
+use std::future::Future;
+use std::pin::Pin;
+
 use domain::{CloseIntent, SessionId};
 
-#[async_trait]
 pub trait CloseRequestSink: Send + Sync + 'static {
     /// Handle a close request for `id`. Must not block the caller —
     /// implementations should spawn any slow work (git merge,
     /// filesystem work) onto their own tasks. Returning from this call
     /// does not imply the close has finished, only that the sink has
     /// accepted the request.
-    async fn request_close(&self, id: SessionId, intent: CloseIntent);
+    fn request_close(
+        &self,
+        id: SessionId,
+        intent: CloseIntent,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + '_>>;
 }
