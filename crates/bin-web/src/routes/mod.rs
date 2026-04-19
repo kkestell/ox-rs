@@ -1,48 +1,59 @@
 //! Axum route wiring.
 //!
-//! All HTTP endpoints the frontend consumes. One module per concern
-//! isn't warranted — the full set is short and reading them side-by-
-//! side makes the request/response shapes obvious.
+//! Handlers are split per concern:
+//!
+//! - [`static_assets`] — `/`, `/app.js`, `/styles.css`
+//! - [`sessions`] — list/create/merge/abandon
+//! - [`messages`] — send/cancel/tool-approval
+//! - [`layout`] — layout persistence
 //!
 //! The router is built from an `AppState` containing the shared
 //! `Arc<SessionRegistry>` so every handler operates on the same
 //! live map of sessions.
 
+use axum::Json;
 use axum::Router;
-use axum::body::Body;
-use axum::extract::{Path, State};
-use axum::http::{StatusCode, header};
+use axum::extract::DefaultBodyLimit;
+use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
-use axum::{Json, extract::DefaultBodyLimit};
-use domain::SessionId;
-use protocol::AgentCommand;
-use serde::Deserialize;
 
-use crate::assets;
 use crate::lifecycle::MergeRejection;
-use crate::registry::CommandDispatch;
 use crate::sse;
 use crate::state::AppState;
+
+mod layout;
+mod messages;
+mod sessions;
+mod static_assets;
 
 /// Build the router. `state` is cloned into axum once; every handler
 /// receives it via the `State` extractor.
 pub fn router(state: AppState) -> Router {
     Router::new()
-        .route("/", get(index_html))
-        .route("/app.js", get(app_js))
-        .route("/styles.css", get(styles_css))
-        .route("/api/sessions", get(list_sessions).post(create_session))
-        .route("/api/sessions/{id}/merge", post(merge_session))
-        .route("/api/sessions/{id}/abandon", post(abandon_session))
-        .route("/api/sessions/{id}/messages", post(post_message))
-        .route("/api/sessions/{id}/cancel", post(post_cancel))
+        .route("/", get(static_assets::index_html))
+        .route("/app.js", get(static_assets::app_js))
+        .route("/styles.css", get(static_assets::styles_css))
+        .route(
+            "/api/sessions",
+            get(sessions::list_sessions).post(sessions::create_session),
+        )
+        .route("/api/sessions/{id}/merge", post(sessions::merge_session))
+        .route(
+            "/api/sessions/{id}/abandon",
+            post(sessions::abandon_session),
+        )
+        .route(
+            "/api/sessions/{id}/messages",
+            post(messages::post_message),
+        )
+        .route("/api/sessions/{id}/cancel", post(messages::post_cancel))
         .route(
             "/api/sessions/{id}/tool-approvals/{request_id}",
-            post(post_tool_approval),
+            post(messages::post_tool_approval),
         )
         .route("/api/sessions/{id}/events", get(sse::sse_handler))
-        .route("/api/layout", put(put_layout))
+        .route("/api/layout", put(layout::put_layout))
         // Large tool outputs can push `MessageAppended` payloads into
         // the multi-megabyte range. Axum's default body limit is 2MB
         // — the `/messages` body is just the user's input so the
@@ -53,116 +64,10 @@ pub fn router(state: AppState) -> Router {
         .with_state(state)
 }
 
-// -- static assets -----------------------------------------------------------
-
-async fn index_html() -> Response {
-    Response::builder()
-        .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
-        .header(header::CACHE_CONTROL, "no-store")
-        .body(Body::from(assets::INDEX_HTML))
-        .expect("building index response")
-}
-
-async fn app_js() -> Response {
-    Response::builder()
-        .header(
-            header::CONTENT_TYPE,
-            "application/javascript; charset=utf-8",
-        )
-        .header(header::CACHE_CONTROL, "no-store")
-        .body(Body::from(assets::APP_JS))
-        .expect("building app.js response")
-}
-
-async fn styles_css() -> Response {
-    Response::builder()
-        .header(header::CONTENT_TYPE, "text/css; charset=utf-8")
-        .header(header::CACHE_CONTROL, "no-store")
-        .body(Body::from(assets::STYLES_CSS))
-        .expect("building styles.css response")
-}
-
-// -- /api/sessions -----------------------------------------------------------
-
-async fn list_sessions(State(state): State<AppState>) -> Response {
-    let snapshot = state.registry.snapshot().await;
-    Json(snapshot).into_response()
-}
-
-async fn create_session(State(state): State<AppState>) -> Response {
-    // Route through the lifecycle coordinator so every fresh session
-    // gets its own git worktree + branch. The registry's legacy
-    // `create()` is still available for the `--resume` CLI path and
-    // fallback tests, but user-initiated creation always goes through
-    // the lifecycle from now on.
-    match state.lifecycle.create_and_spawn(&state.registry).await {
-        Ok(session_id) => Json(CreatedSession { session_id }).into_response(),
-        Err(err) => {
-            eprintln!("ox: create_session failed: {err:#}");
-            (
-                StatusCode::BAD_GATEWAY,
-                format!("failed to start agent: {err}"),
-            )
-                .into_response()
-        }
-    }
-}
-
-/// POST /api/sessions/{id}/merge
-///
-/// Merge the session branch back into the main workspace's base branch
-/// and tear down the session. Status code mapping mirrors the plan:
-///
-/// - `204 No Content` — merge + teardown succeeded, session is gone.
-/// - `404 Not Found` — no session with that id.
-/// - `409 Conflict` — structured `{"reason": "..."}` body; the frontend
-///   uses `reason` to choose which dialog to surface:
-///   `already_closing`, `turn_in_progress`, `worktree_dirty`,
-///   `main_dirty`, or `merge_conflict`.
-/// - `500 Internal Server Error` — git subprocess or disk failure; the
-///   server-side log carries details. The client has no useful action
-///   beyond retrying.
-async fn merge_session(State(state): State<AppState>, Path(id): Path<SessionId>) -> Response {
-    match state.lifecycle.merge(id, &state.registry).await {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
-        Err(rej) => merge_rejection_response(rej, /* is_abandon */ false),
-    }
-}
-
-#[derive(Deserialize, Default)]
-struct AbandonBody {
-    /// `true` means the caller has already confirmed they are willing to
-    /// discard uncommitted work. `#[serde(default)]` so the body is
-    /// optional — a bare `POST /abandon` with no body means "abandon
-    /// only if clean."
-    #[serde(default)]
-    confirm: bool,
-}
-
-/// POST /api/sessions/{id}/abandon
-///
-/// Discard the session's worktree + branch without merging. Shares the
-/// status-code ladder with `merge_session`, with one carve-out: the
-/// `WorktreeDirty` rejection returns a richer body
-/// (`{"reason": "uncommitted_changes", "requires_confirmation": true}`)
-/// so the frontend can show a confirm dialog and retry with
-/// `{"confirm": true}`. A body-less POST is treated as `confirm=false`.
-async fn abandon_session(
-    State(state): State<AppState>,
-    Path(id): Path<SessionId>,
-    body: Option<Json<AbandonBody>>,
-) -> Response {
-    let AbandonBody { confirm } = body.map(|Json(b)| b).unwrap_or_default();
-    match state.lifecycle.abandon(id, confirm, &state.registry).await {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
-        Err(rej) => merge_rejection_response(rej, /* is_abandon */ true),
-    }
-}
-
-/// Shared translator from `MergeRejection` to an HTTP response. `is_abandon`
-/// swaps the `WorktreeDirty` body for the richer "needs confirmation"
-/// shape the abandon UI expects.
-fn merge_rejection_response(rej: MergeRejection, is_abandon: bool) -> Response {
+/// Shared translator from `MergeRejection` to an HTTP response.
+/// `is_abandon` swaps the `WorktreeDirty` body for the richer
+/// "needs confirmation" shape the abandon UI expects.
+pub(super) fn merge_rejection_response(rej: MergeRejection, is_abandon: bool) -> Response {
     match rej {
         MergeRejection::NotFound => StatusCode::NOT_FOUND.into_response(),
         MergeRejection::AlreadyClosing => (
@@ -201,110 +106,6 @@ fn merge_rejection_response(rej: MergeRejection, is_abandon: bool) -> Response {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("session close failed: {msg}"),
-            )
-                .into_response()
-        }
-    }
-}
-
-#[derive(serde::Serialize)]
-struct CreatedSession {
-    session_id: SessionId,
-}
-
-// -- /api/sessions/:id/messages --------------------------------------------
-
-#[derive(Deserialize)]
-struct SendMessageBody {
-    input: String,
-}
-
-async fn post_message(
-    State(state): State<AppState>,
-    Path(id): Path<SessionId>,
-    Json(body): Json<SendMessageBody>,
-) -> Response {
-    if body.input.trim().is_empty() {
-        return (StatusCode::BAD_REQUEST, "input required").into_response();
-    }
-    match state
-        .registry
-        .send_command(id, AgentCommand::SendMessage { input: body.input })
-        .await
-    {
-        CommandDispatch::Ok => StatusCode::NO_CONTENT.into_response(),
-        CommandDispatch::NotFound => StatusCode::NOT_FOUND.into_response(),
-        CommandDispatch::Dead => StatusCode::GONE.into_response(),
-        CommandDispatch::AlreadyTurning => (
-            StatusCode::CONFLICT,
-            Json(serde_json::json!({"reason": "already_turning"})),
-        )
-            .into_response(),
-        CommandDispatch::Closing => (
-            StatusCode::CONFLICT,
-            Json(serde_json::json!({"reason": "closing"})),
-        )
-            .into_response(),
-    }
-}
-
-async fn post_cancel(State(state): State<AppState>, Path(id): Path<SessionId>) -> Response {
-    match state.registry.send_command(id, AgentCommand::Cancel).await {
-        CommandDispatch::Ok => StatusCode::NO_CONTENT.into_response(),
-        CommandDispatch::NotFound => StatusCode::NOT_FOUND.into_response(),
-        // Cancel is idempotent even against a dead agent — the plan
-        // calls out "204 otherwise." Treat `Dead` and `AlreadyTurning`
-        // the same way.
-        _ => StatusCode::NO_CONTENT.into_response(),
-    }
-}
-
-#[derive(Deserialize)]
-struct ToolApprovalBody {
-    approved: bool,
-}
-
-async fn post_tool_approval(
-    State(state): State<AppState>,
-    Path((id, request_id)): Path<(SessionId, String)>,
-    Json(body): Json<ToolApprovalBody>,
-) -> Response {
-    match state
-        .registry
-        .resolve_tool_approval(id, request_id, body.approved)
-        .await
-    {
-        CommandDispatch::Ok => StatusCode::NO_CONTENT.into_response(),
-        CommandDispatch::NotFound => StatusCode::NOT_FOUND.into_response(),
-        CommandDispatch::Dead => StatusCode::GONE.into_response(),
-        CommandDispatch::AlreadyTurning => StatusCode::NO_CONTENT.into_response(),
-        CommandDispatch::Closing => (
-            StatusCode::CONFLICT,
-            Json(serde_json::json!({"reason": "closing"})),
-        )
-            .into_response(),
-    }
-}
-
-// -- /api/layout ------------------------------------------------------------
-
-#[derive(Deserialize)]
-struct LayoutBody {
-    #[serde(default)]
-    order: Vec<SessionId>,
-    #[serde(default)]
-    sizes: Vec<f32>,
-}
-
-async fn put_layout(State(state): State<AppState>, Json(body): Json<LayoutBody>) -> Response {
-    let layout = agent_host::Layout::new(body.order, body.sizes);
-    match state.registry.put_layout(layout).await {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
-        Err(err) => {
-            eprintln!("ox: put_layout failed: {err:#}");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("layout persist failed: {err}"),
             )
                 .into_response()
         }
