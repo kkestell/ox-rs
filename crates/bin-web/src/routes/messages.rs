@@ -9,6 +9,8 @@ use serde::Deserialize;
 use crate::registry::CommandDispatch;
 use crate::state::AppState;
 
+use super::json_error;
+
 #[derive(Deserialize)]
 pub(super) struct SendMessageBody {
     input: String,
@@ -20,7 +22,7 @@ pub(super) async fn post_message(
     Json(body): Json<SendMessageBody>,
 ) -> Response {
     if body.input.trim().is_empty() {
-        return (StatusCode::BAD_REQUEST, "input required").into_response();
+        return json_error(StatusCode::BAD_REQUEST, "input_required");
     }
     match state
         .registry

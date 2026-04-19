@@ -129,7 +129,7 @@ impl Drop for ActiveSession {
         // will SIGKILL the subprocess as the whole struct unwinds.
         self.pump
             .lock()
-            .expect("session pump mutex poisoned")
+            .unwrap_or_else(|err| err.into_inner())
             .abort();
     }
 }
@@ -214,6 +214,23 @@ mod tests {
     async fn resumed_session_starts_not_fresh() {
         let (session, _w, _r) = session_pair(false);
         assert!(!session.is_fresh());
+    }
+
+    #[tokio::test]
+    async fn drop_does_not_panic_when_pump_mutex_is_poisoned() {
+        let (session, _w, _r) = session_pair(false);
+        let poison_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe({
+            let session = session.clone();
+            move || {
+                let _guard = session.pump.lock().unwrap();
+                panic!("poison session pump mutex");
+            }
+        }));
+        assert!(poison_result.is_err());
+
+        let drop_result =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || drop(session)));
+        assert!(drop_result.is_ok());
     }
 
     #[tokio::test]

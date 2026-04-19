@@ -40,42 +40,82 @@ impl app::FileSystem for LocalFileSystem {
         pattern: &str,
         max_bytes: usize,
     ) -> Result<app::WalkResult> {
-        let full_pattern = root.join(pattern);
-        let full_pattern = full_pattern
-            .to_str()
-            .context("glob pattern contains invalid UTF-8")?;
-        let entries =
-            glob::glob(full_pattern).map_err(|e| anyhow::anyhow!("invalid glob pattern: {e}"))?;
-
-        let mut results: Vec<PathBuf> = Vec::new();
-        let mut cumulative_bytes: usize = 0;
-        let mut truncated = false;
-
-        // Collect all matching files first so we can sort, then enforce the
-        // byte cap. Sorting before truncation ensures deterministic results.
-        let mut all_files: Vec<PathBuf> = entries
-            .filter_map(|entry| {
-                let path = entry.ok()?;
-                if path.is_file() { Some(path) } else { None }
-            })
-            .collect();
-        all_files.sort();
-
-        for path in all_files {
-            let path_bytes = path.to_string_lossy().len();
-            if cumulative_bytes + path_bytes > max_bytes {
-                truncated = true;
-                break;
-            }
-            cumulative_bytes += path_bytes;
-            results.push(path);
-        }
-
-        Ok(app::WalkResult {
-            paths: results,
-            truncated,
-        })
+        let root = root.to_path_buf();
+        let pattern = pattern.to_owned();
+        tokio::task::spawn_blocking(move || walk_glob_sync(root, pattern, max_bytes))
+            .await
+            .context("joining blocking glob task")?
     }
+}
+
+fn walk_glob_sync(root: PathBuf, pattern: String, max_bytes: usize) -> Result<app::WalkResult> {
+    let full_pattern = root.join(pattern);
+    let full_pattern = full_pattern
+        .to_str()
+        .context("glob pattern contains invalid UTF-8")?;
+    let entries =
+        glob::glob(full_pattern).map_err(|e| anyhow::anyhow!("invalid glob pattern: {e}"))?;
+
+    let mut results: Vec<PathBuf> = Vec::new();
+    let mut cumulative_bytes: usize = 0;
+    let mut truncated = false;
+
+    // Collect all matching files first so we can sort, then enforce the byte
+    // cap. Sorting before truncation keeps output deterministic.
+    let mut all_files: Vec<PathBuf> = entries
+        .filter_map(|entry| {
+            let path = entry.ok()?;
+            if path.is_file() { Some(path) } else { None }
+        })
+        .collect();
+    all_files.sort();
+
+    for path in all_files {
+        let path_bytes = path.to_string_lossy().len();
+        if cumulative_bytes + path_bytes > max_bytes {
+            truncated = true;
+            break;
+        }
+        cumulative_bytes += path_bytes;
+        results.push(path);
+    }
+
+    Ok(app::WalkResult {
+        paths: results,
+        truncated,
+    })
+}
+
+async fn read_bounded(
+    mut pipe: impl tokio::io::AsyncRead + Send + Unpin + 'static,
+    max_bytes: usize,
+) -> std::io::Result<(Vec<u8>, bool)> {
+    use tokio::io::AsyncReadExt;
+
+    let mut buf = Vec::new();
+    let mut tmp = [0u8; 8192];
+    let mut truncated = false;
+    loop {
+        let n = pipe.read(&mut tmp).await?;
+        if n == 0 {
+            break;
+        }
+        if !truncated {
+            let remaining = max_bytes.saturating_sub(buf.len());
+            if remaining == 0 {
+                truncated = true;
+            } else {
+                let take = n.min(remaining);
+                buf.extend_from_slice(&tmp[..take]);
+                if take < n {
+                    truncated = true;
+                }
+            }
+        }
+        // Continue draining even after truncation so the child doesn't block
+        // on a full pipe buffer.
+    }
+    Ok((buf, truncated))
 }
 
 pub struct BashShell {
@@ -95,8 +135,6 @@ impl app::Shell for BashShell {
         timeout: std::time::Duration,
         max_bytes: usize,
     ) -> Result<app::CommandOutput> {
-        use tokio::io::AsyncReadExt;
-
         let mut child = tokio::process::Command::new("/bin/bash")
             .args(["-c", command])
             .current_dir(&self.workspace_root)
@@ -105,79 +143,41 @@ impl app::Shell for BashShell {
             .spawn()
             .context("failed to spawn /bin/bash")?;
 
-        // Take ownership of the pipe handles so we can read them concurrently.
-        // Reading both via tokio::join! avoids pipe-buffer deadlocks that would
-        // occur if we read one to completion before touching the other.
-        let mut stdout_pipe = child.stdout.take().expect("stdout piped");
-        let mut stderr_pipe = child.stderr.take().expect("stderr piped");
+        // Take ownership of the pipe handles so reader tasks can keep
+        // draining after a timeout kill and still hand back partial output.
+        let stdout_pipe = child.stdout.take().expect("stdout piped");
+        let stderr_pipe = child.stderr.take().expect("stderr piped");
+        let stdout_reader = tokio::spawn(read_bounded(stdout_pipe, max_bytes));
+        let stderr_reader = tokio::spawn(read_bounded(stderr_pipe, max_bytes));
 
-        // Read up to `max_bytes` from a pipe, then drain the remainder so the
-        // child process doesn't block on a full pipe buffer. Returns the
-        // collected bytes and whether the cap was hit.
-        async fn read_bounded(
-            pipe: &mut (impl AsyncReadExt + Unpin),
-            max_bytes: usize,
-        ) -> std::io::Result<(Vec<u8>, bool)> {
-            let mut buf = Vec::new();
-            let mut tmp = [0u8; 8192];
-            let mut truncated = false;
-            loop {
-                let n = pipe.read(&mut tmp).await?;
-                if n == 0 {
-                    break;
-                }
-                if !truncated {
-                    let remaining = max_bytes.saturating_sub(buf.len());
-                    if remaining == 0 {
-                        truncated = true;
-                    } else {
-                        let take = n.min(remaining);
-                        buf.extend_from_slice(&tmp[..take]);
-                        if take < n {
-                            truncated = true;
-                        }
-                    }
-                }
-                // Continue draining even after truncation so the child
-                // doesn't block on a full pipe buffer.
+        let (exit_code, timed_out) = match tokio::time::timeout(timeout, child.wait()).await {
+            Ok(status) => (
+                status.context("waiting for child")?.code().unwrap_or(-1),
+                false,
+            ),
+            Err(_elapsed) => {
+                let _ = child.kill().await;
+                let _ = child.wait().await;
+                (-1, true)
             }
-            Ok((buf, truncated))
-        }
-
-        let io_and_wait = async {
-            let (stdout_res, stderr_res) = tokio::join!(
-                read_bounded(&mut stdout_pipe, max_bytes),
-                read_bounded(&mut stderr_pipe, max_bytes),
-            );
-            let (stdout_buf, stdout_trunc) = stdout_res.context("reading stdout")?;
-            let (stderr_buf, stderr_trunc) = stderr_res.context("reading stderr")?;
-            let status = child.wait().await.context("waiting for child")?;
-            Ok::<_, anyhow::Error>((stdout_buf, stdout_trunc, stderr_buf, stderr_trunc, status))
         };
 
-        match tokio::time::timeout(timeout, io_and_wait).await {
-            Ok(Ok((stdout_buf, stdout_trunc, stderr_buf, stderr_trunc, status))) => {
-                Ok(app::CommandOutput {
-                    stdout: String::from_utf8_lossy(&stdout_buf).into_owned(),
-                    stderr: String::from_utf8_lossy(&stderr_buf).into_owned(),
-                    exit_code: status.code().unwrap_or(-1),
-                    timed_out: false,
-                    truncated: stdout_trunc || stderr_trunc,
-                })
-            }
-            Ok(Err(e)) => Err(e),
-            Err(_elapsed) => {
-                // Timeout — kill the process and recover any partial output.
-                let _ = child.kill().await;
-                Ok(app::CommandOutput {
-                    stdout: String::new(),
-                    stderr: String::new(),
-                    exit_code: -1,
-                    timed_out: true,
-                    truncated: false,
-                })
-            }
-        }
+        let (stdout_buf, stdout_trunc) = stdout_reader
+            .await
+            .context("joining stdout reader")?
+            .context("reading stdout")?;
+        let (stderr_buf, stderr_trunc) = stderr_reader
+            .await
+            .context("joining stderr reader")?
+            .context("reading stderr")?;
+
+        Ok(app::CommandOutput {
+            stdout: String::from_utf8_lossy(&stdout_buf).into_owned(),
+            stderr: String::from_utf8_lossy(&stderr_buf).into_owned(),
+            exit_code,
+            timed_out,
+            truncated: stdout_trunc || stderr_trunc,
+        })
     }
 }
 
@@ -421,6 +421,42 @@ mod tests {
         assert_eq!(out.exit_code, -1);
         assert!(out.stdout.is_empty());
         assert!(out.stderr.is_empty());
+    }
+
+    #[tokio::test]
+    async fn bash_timeout_preserves_partial_stdout_and_stderr() {
+        let tmp = TempDir::new().unwrap();
+        let out = shell(tmp.path())
+            .run(
+                "printf partial-out; printf partial-err >&2; sleep 999",
+                std::time::Duration::from_millis(500),
+                TEST_MAX_BYTES,
+            )
+            .await
+            .unwrap();
+        assert!(out.timed_out);
+        assert_eq!(out.exit_code, -1);
+        assert_eq!(out.stdout, "partial-out");
+        assert_eq!(out.stderr, "partial-err");
+        assert!(!out.truncated);
+    }
+
+    #[tokio::test]
+    async fn bash_timeout_reports_truncation_for_capped_partial_output() {
+        let tmp = TempDir::new().unwrap();
+        let out = shell(tmp.path())
+            .run(
+                "head -c 4096 /dev/zero | tr '\\0' x; sleep 999",
+                std::time::Duration::from_millis(500),
+                32,
+            )
+            .await
+            .unwrap();
+        assert!(out.timed_out);
+        assert_eq!(out.exit_code, -1);
+        assert!(out.truncated);
+        assert_eq!(out.stdout.len(), 32);
+        assert!(out.stdout.chars().all(|ch| ch == 'x'));
     }
 
     #[tokio::test]

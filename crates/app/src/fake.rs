@@ -271,14 +271,20 @@ impl FakeModelCatalog {
 
     /// Seed a single model. Returns `self` so tests can chain seeds.
     pub fn with(self, model: impl Into<String>, context_window: u32) -> Self {
-        self.entries.lock().unwrap().insert(model.into(), context_window);
+        self.entries
+            .lock()
+            .unwrap()
+            .insert(model.into(), context_window);
         self
     }
 
     /// Seed after construction. Useful when the catalog needs to be
     /// wrapped in `Arc<dyn ModelCatalog>` first.
     pub fn insert(&self, model: impl Into<String>, context_window: u32) {
-        self.entries.lock().unwrap().insert(model.into(), context_window);
+        self.entries
+            .lock()
+            .unwrap()
+            .insert(model.into(), context_window);
     }
 }
 

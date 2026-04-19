@@ -111,7 +111,9 @@ mod tests {
         session.push_message(Message::user("hi"));
         session.push_message(Message {
             role: Role::Assistant,
-            content: vec![ContentBlock::Text { text: "hello".into() }],
+            content: vec![ContentBlock::Text {
+                text: "hello".into(),
+            }],
             usage: Some(Usage {
                 prompt_tokens: 10,
                 completion_tokens: 2,

@@ -186,9 +186,22 @@ impl app::SessionStore for DiskSessionStore {
             let path = self.session_path(session.id);
             let data = serde_json::to_string_pretty(session)
                 .with_context(|| format!("failed to serialize session {}", session.id))?;
-            tokio::fs::write(&path, data)
+            if let Some(parent) = path.parent() {
+                tokio::fs::create_dir_all(parent).await.with_context(|| {
+                    format!("failed to create session directory {}", parent.display())
+                })?;
+            }
+            let tmp_path = tmp_path_for(&path);
+            tokio::fs::write(&tmp_path, data)
                 .await
-                .with_context(|| format!("failed to write session file {}", path.display()))?;
+                .with_context(|| format!("failed to write session file {}", tmp_path.display()))?;
+            tokio::fs::rename(&tmp_path, &path).await.with_context(|| {
+                format!(
+                    "failed to replace session file {} with {}",
+                    path.display(),
+                    tmp_path.display()
+                )
+            })?;
             Ok(())
         })
     }
@@ -358,6 +371,39 @@ mod tests {
         let loaded = store.try_load(id).await.unwrap().expect("session exists");
         assert_eq!(loaded.messages.len(), 2);
         assert_eq!(loaded.messages[1].text(), "second");
+    }
+
+    #[tokio::test]
+    async fn save_replaces_via_tmp_file_and_leaves_no_tmp_after_success() {
+        let (store, _tmp) = temp_store();
+        let id = SessionId::new_v4();
+        let session = multi_role_session(id);
+        let path = store.session_path(id);
+        let tmp_path = tmp_path_for(&path);
+
+        store.save(&session).await.unwrap();
+
+        assert!(path.exists());
+        assert!(!tmp_path.exists());
+        let loaded = store.try_load(id).await.unwrap().expect("session exists");
+        assert_eq!(loaded.messages.len(), session.messages.len());
+    }
+
+    #[tokio::test]
+    async fn save_overwrites_stale_tmp_file() {
+        let (store, _tmp) = temp_store();
+        let id = SessionId::new_v4();
+        let session = multi_role_session(id);
+        let path = store.session_path(id);
+        let tmp_path = tmp_path_for(&path);
+        std::fs::write(&tmp_path, "stale partial write").unwrap();
+
+        store.save(&session).await.unwrap();
+
+        assert!(path.exists());
+        assert!(!tmp_path.exists());
+        let loaded = store.try_load(id).await.unwrap().expect("session exists");
+        assert_eq!(loaded.id, id);
     }
 
     #[tokio::test]

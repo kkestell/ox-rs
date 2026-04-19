@@ -60,10 +60,7 @@ impl SessionRegistry {
         // catalog lookup per entry. If per-session models arrive later,
         // this switches to per-session resolution without changing the
         // wire payload.
-        let context_window = self
-            .catalog()
-            .context_window(default_model)
-            .unwrap_or(0);
+        let context_window = self.catalog().context_window(default_model).unwrap_or(0);
 
         // Present sessions in layout order first, then append any
         // live sessions that aren't referenced by the layout (e.g.,

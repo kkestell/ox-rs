@@ -7,6 +7,8 @@ use serde::Deserialize;
 
 use crate::state::AppState;
 
+use super::json_error_message;
+
 #[derive(Deserialize)]
 pub(super) struct LayoutBody {
     #[serde(default)]
@@ -24,11 +26,11 @@ pub(super) async fn put_layout(
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(err) => {
             eprintln!("ox: put_layout failed: {err:#}");
-            (
+            json_error_message(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("layout persist failed: {err}"),
+                "layout_persist_failed",
+                err.to_string(),
             )
-                .into_response()
         }
     }
 }

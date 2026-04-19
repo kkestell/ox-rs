@@ -70,9 +70,16 @@ fn event_to_sse(event: AgentEvent) -> Result<Event, Infallible> {
         // Serialization of a wire type should never fail; if it does,
         // emit a structured Error frame so the client sees something
         // instead of a silent drop.
-        format!(r#"{{"type":"error","message":"sse encode failed: {e}"}}"#)
+        fallback_error_json(format!("sse encode failed: {e}"))
     });
     Ok(Event::default().data(json))
+}
+
+fn fallback_error_json(message: String) -> String {
+    serde_json::to_string(&AgentEvent::Error { message }).unwrap_or_else(|_| {
+        // Hard fallback for an impossible second serialization failure.
+        r#"{"type":"error","message":"sse encode failed"}"#.to_owned()
+    })
 }
 
 /// Streams returned by [`sse_handler`] — exposed at module scope so the
@@ -109,6 +116,18 @@ mod tests {
     use crate::test_support::{
         AgentHandles, DuplexSpawner, empty_layout, test_catalog, test_lifecycle, unique_temp_dir,
     };
+
+    #[test]
+    fn fallback_error_json_escapes_special_characters() {
+        let encoded = super::fallback_error_json("quotes \" and slash \\ survive".into());
+        let event: AgentEvent = serde_json::from_str(&encoded).unwrap();
+        match event {
+            AgentEvent::Error { message } => {
+                assert_eq!(message, "quotes \" and slash \\ survive");
+            }
+            other => panic!("expected Error fallback, got {other:?}"),
+        }
+    }
 
     async fn make_app() -> (
         Router,

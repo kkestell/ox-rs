@@ -27,6 +27,25 @@ mod messages;
 mod sessions;
 mod static_assets;
 
+pub(super) fn json_error(status: StatusCode, reason: &'static str) -> Response {
+    (status, Json(serde_json::json!({ "reason": reason }))).into_response()
+}
+
+pub(super) fn json_error_message(
+    status: StatusCode,
+    reason: &'static str,
+    message: impl Into<String>,
+) -> Response {
+    (
+        status,
+        Json(serde_json::json!({
+            "reason": reason,
+            "message": message.into(),
+        })),
+    )
+        .into_response()
+}
+
 /// Build the router. `state` is cloned into axum once; every handler
 /// receives it via the `State` extractor.
 pub fn router(state: AppState) -> Router {
@@ -100,11 +119,11 @@ pub(super) fn merge_rejection_response(rej: MergeRejection, is_abandon: bool) ->
             .into_response(),
         MergeRejection::Internal(msg) => {
             eprintln!("ox: session close failed: {msg}");
-            (
+            json_error_message(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("session close failed: {msg}"),
+                "session_close_failed",
+                msg,
             )
-                .into_response()
         }
     }
 }
@@ -117,7 +136,9 @@ mod tests {
     //! listed in the plan: status codes, body shapes, and the
     //! wire-level side-effects (did a frame actually reach the agent?).
 
-    use std::path::PathBuf;
+    use std::future::Future;
+    use std::path::{Path, PathBuf};
+    use std::pin::Pin;
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -158,6 +179,25 @@ mod tests {
         /// reference; the `FakeGit::merge` call target resolves against
         /// this path.
         workspace_root: PathBuf,
+    }
+
+    struct FailingLayoutRepository;
+
+    impl agent_host::LayoutRepository for FailingLayoutRepository {
+        fn get<'a>(
+            &'a self,
+            _workspace_root: &'a Path,
+        ) -> Pin<Box<dyn Future<Output = anyhow::Result<Option<Layout>>> + Send + 'a>> {
+            Box::pin(async { Ok(None) })
+        }
+
+        fn put<'a>(
+            &'a self,
+            _workspace_root: &'a Path,
+            _layout: Layout,
+        ) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send + 'a>> {
+            Box::pin(async { Err(anyhow::anyhow!("layout disk denied")) })
+        }
     }
 
     /// Build a ready-to-serve router plus all the handles a merge/abandon
@@ -461,6 +501,15 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["reason"], "agent_start_failed");
+        assert!(
+            body["message"]
+                .as_str()
+                .unwrap()
+                .contains("DuplexSpawner configured to fail")
+        );
     }
 
     // -- POST /api/sessions/:id/messages ----------------------------------
@@ -481,6 +530,9 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["reason"], "input_required");
     }
 
     #[tokio::test]
@@ -1523,6 +1575,66 @@ mod tests {
         // Only the known session survives the filter.
         let stored = registry.snapshot().await.layout;
         assert_eq!(stored.order, vec![known]);
+    }
+
+    #[tokio::test]
+    async fn put_layout_persist_failure_returns_json_error() {
+        let workspace_root = unique_temp_dir("routes-layout-fail");
+        let (spawner, _rx) = DuplexSpawner::new();
+        let spawn_config = AgentSpawnConfig {
+            binary: std::path::PathBuf::from("/nonexistent/ox-agent"),
+            workspace_root: workspace_root.clone(),
+            model: "routes/test".into(),
+            sessions_dir: std::path::PathBuf::from("/nonexistent/sessions"),
+            resume: None,
+            session_id: None,
+            env: vec![],
+        };
+        let registry = SessionRegistry::new(
+            spawner,
+            spawn_config,
+            std::sync::Arc::new(FailingLayoutRepository),
+            workspace_root,
+            test_catalog(),
+            std::sync::Arc::new(agent_host::fake::NoopCloseRequestSink),
+            std::sync::Arc::new(agent_host::fake::NoopFirstTurnSink),
+        );
+        let app = router(AppState {
+            registry,
+            lifecycle: test_lifecycle(),
+        });
+
+        let body = serde_json::json!({
+            "order": [],
+            "sizes": [],
+        });
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/api/layout")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["reason"], "layout_persist_failed");
+        assert_eq!(body["message"], "layout disk denied");
+    }
+
+    #[tokio::test]
+    async fn internal_merge_rejection_returns_json_error() {
+        let resp = merge_rejection_response(MergeRejection::Internal("disk denied".into()), false);
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["reason"], "session_close_failed");
+        assert_eq!(body["message"], "disk denied");
     }
 
     // -- end-to-end -------------------------------------------------------

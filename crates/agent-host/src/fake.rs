@@ -13,7 +13,7 @@
 //! dependency on `agent-host`, or when `agent-host`'s own tests run —
 //! the module is always compiled for this crate's own unit tests).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -53,7 +53,7 @@ struct FakeGitState {
     statuses: HashMap<PathBuf, WorktreeStatus>,
     /// Next-call override for `merge`. Pops one per call; after empty,
     /// defaults to `Merged`.
-    merge_outcomes: Vec<MergeOutcome>,
+    merge_outcomes: VecDeque<MergeOutcome>,
     /// Every invocation in arrival order. Tests assert on this.
     calls: Vec<GitCall>,
 }
@@ -111,7 +111,7 @@ impl FakeGit {
                 detached: Vec::new(),
                 branches: HashMap::new(),
                 statuses: HashMap::new(),
-                merge_outcomes: Vec::new(),
+                merge_outcomes: VecDeque::new(),
                 calls: Vec::new(),
             }),
         }
@@ -148,7 +148,7 @@ impl FakeGit {
     /// Queue the next `merge()` result. FIFO — push once per expected
     /// call. After the queue empties, defaults to `Merged`.
     pub fn enqueue_merge_outcome(&self, outcome: MergeOutcome) {
-        self.state.lock().unwrap().merge_outcomes.push(outcome);
+        self.state.lock().unwrap().merge_outcomes.push_back(outcome);
     }
 
     /// Snapshot of every call made so far, in arrival order.
@@ -281,7 +281,10 @@ impl Git for FakeGit {
                 branch: branch.to_owned(),
             });
             let mut state = self.state.lock().unwrap();
-            Ok(state.merge_outcomes.pop().unwrap_or(MergeOutcome::Merged))
+            Ok(state
+                .merge_outcomes
+                .pop_front()
+                .unwrap_or(MergeOutcome::Merged))
         })
     }
 
@@ -557,11 +560,16 @@ mod tests {
     async fn merge_respects_queued_outcomes_then_defaults_to_merged() {
         let git = FakeGit::new();
         git.enqueue_merge_outcome(MergeOutcome::Conflicts);
+        git.enqueue_merge_outcome(MergeOutcome::MainDirty);
         assert_eq!(
             git.merge(Path::new("/w"), "ox/abc").await.unwrap(),
             MergeOutcome::Conflicts
         );
-        // Second call exhausts the queue; defaults to Merged.
+        assert_eq!(
+            git.merge(Path::new("/w"), "ox/abc").await.unwrap(),
+            MergeOutcome::MainDirty
+        );
+        // Third call exhausts the queue; defaults to Merged.
         assert_eq!(
             git.merge(Path::new("/w"), "ox/abc").await.unwrap(),
             MergeOutcome::Merged

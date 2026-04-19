@@ -23,6 +23,18 @@ use crate::use_cases::{TurnEvent, TurnOutcome};
 /// a runaway turn surfaces as an error rather than burning tokens forever.
 const MAX_LOOP_ITERATIONS: usize = 25;
 
+enum AssistantStreamOutcome {
+    Completed {
+        tool_calls: Vec<(String, String, String)>,
+    },
+    Cancelled,
+}
+
+enum ToolPlanOutcome {
+    Continue,
+    Cancelled,
+}
+
 /// Runs conversation turns against an LLM, handling session creation, message
 /// accumulation, persistence, and the tool-call loop. Exposes two entry points:
 ///
@@ -159,16 +171,8 @@ impl<L: LlmProvider, S: SessionStore> SessionRunner<L, S> {
         approver: &dyn ToolApprover,
         mut on_event: impl FnMut(TurnEvent<'_>) + Send,
     ) -> Result<TurnOutcome> {
-        // Commit the user message before any network work — its presence in
-        // `session.messages` is what keeps the final persisted session valid
-        // if a later error aborts the turn.
-        session.push_message(Message::user(input));
-        on_event(TurnEvent::MessageAppended(
-            session.messages.last().expect("just pushed"),
-        ));
-        self.store.save(session).await?;
-
-        let defs = self.tools.defs();
+        self.commit_user_message(session, input, &mut on_event)
+            .await?;
 
         for _ in 0..MAX_LOOP_ITERATIONS {
             // Check cancellation before starting a new LLM stream. This
@@ -178,37 +182,12 @@ impl<L: LlmProvider, S: SessionStore> SessionRunner<L, S> {
                 return Ok(TurnOutcome::Cancelled);
             }
 
-            let mut event_stream = self
-                .llm
-                .stream(&session.messages, &self.system_prompt, defs)
-                .await?;
-            let mut acc = StreamAccumulator::new();
-            while let Some(event) = event_stream.next().await {
-                let event = event?;
-                on_event(TurnEvent::StreamDelta(&event));
-                acc.push(event);
-
-                if cancel.is_cancelled() {
-                    // Commit whatever the accumulator has collected so far.
-                    // Skip the commit if nothing meaningful arrived — avoids
-                    // polluting the session with a zero-content assistant
-                    // message.
-                    let partial = acc.into_message();
-                    if !partial.content.is_empty() {
-                        session.push_message(partial);
-                        on_event(TurnEvent::MessageAppended(
-                            session.messages.last().expect("just pushed"),
-                        ));
-                        self.store.save(session).await?;
-                    }
-                    return Ok(TurnOutcome::Cancelled);
-                }
-            }
-            session.push_message(acc.into_message());
-            let response = session.messages.last().expect("just pushed");
-            on_event(TurnEvent::MessageAppended(response));
-            let tool_calls = extract_tool_calls(response);
-            self.store.save(session).await?;
+            let AssistantStreamOutcome::Completed { tool_calls } = self
+                .stream_assistant_response(session, cancel.clone(), &mut on_event)
+                .await?
+            else {
+                return Ok(TurnOutcome::Cancelled);
+            };
 
             if tool_calls.is_empty() {
                 return Ok(TurnOutcome::Completed);
@@ -221,112 +200,188 @@ impl<L: LlmProvider, S: SessionStore> SessionRunner<L, S> {
                 bail!("model returned tool calls but no tools are registered");
             }
 
-            let approval_plan = self.plan_tool_approvals(tool_calls).await;
-            if cancel.is_cancelled() {
-                return Ok(TurnOutcome::Cancelled);
-            }
-
-            // Split the plan into entries that need a user decision and
-            // entries that can be committed immediately (Ready tools + policy
-            // errors). Ready tools run in plan order. Approval-gated tools
-            // execute in *decision arrival order* so a user approving one
-            // doesn't block on a different tool still waiting for input.
-            let mut approval_requests: Vec<ToolApprovalRequest> = Vec::new();
-            let mut pending: HashMap<String, (String, String, String)> = HashMap::new();
-
-            for planned in approval_plan {
-                if cancel.is_cancelled() {
-                    return Ok(TurnOutcome::Cancelled);
-                }
-                match planned {
-                    PlannedToolCall::Ready {
-                        id,
-                        name,
-                        arguments,
-                    } => {
-                        execute_and_commit(
-                            &self.tools,
-                            &self.store,
-                            session,
-                            &mut on_event,
-                            id,
-                            name,
-                            arguments,
-                        )
-                        .await?;
-                    }
-                    PlannedToolCall::PolicyError { id, error } => {
-                        commit_tool_result(
-                            &self.store,
-                            session,
-                            &mut on_event,
-                            Message::tool_result(id, error, true),
-                        )
-                        .await?;
-                    }
-                    PlannedToolCall::NeedsApproval {
-                        id,
-                        name,
-                        arguments,
-                        request,
-                    } => {
-                        pending.insert(request.request_id.clone(), (id, name, arguments));
-                        approval_requests.push(request);
-                    }
-                }
-            }
-
-            if !approval_requests.is_empty() {
-                on_event(TurnEvent::ToolApprovalRequested {
-                    requests: approval_requests.clone(),
-                });
-                let mut stream = approver.approve(approval_requests, cancel.clone());
-                while let Some(decision) = stream.next().await {
-                    let decision = decision?;
-                    on_event(TurnEvent::ToolApprovalResolved {
-                        request_id: decision.request_id.clone(),
-                        approved: decision.approved,
-                    });
-                    let Some((id, name, arguments)) = pending.remove(&decision.request_id) else {
-                        continue;
-                    };
-                    if cancel.is_cancelled() {
-                        return Ok(TurnOutcome::Cancelled);
-                    }
-                    if decision.approved {
-                        execute_and_commit(
-                            &self.tools,
-                            &self.store,
-                            session,
-                            &mut on_event,
-                            id,
-                            name,
-                            arguments,
-                        )
-                        .await?;
-                    } else {
-                        commit_tool_result(
-                            &self.store,
-                            session,
-                            &mut on_event,
-                            Message::tool_result(id, TOOL_REJECTED_MESSAGE, true),
-                        )
-                        .await?;
-                    }
-                }
-                drop(stream);
-
-                // If the approver ended the stream without decisions for
-                // every pending request — typically because cancellation
-                // fired — treat the turn as cancelled so no tool runs
-                // without an explicit user choice.
-                if !pending.is_empty() {
-                    return Ok(TurnOutcome::Cancelled);
-                }
+            match self
+                .execute_approval_plan(session, tool_calls, cancel.clone(), approver, &mut on_event)
+                .await?
+            {
+                ToolPlanOutcome::Continue => {}
+                ToolPlanOutcome::Cancelled => return Ok(TurnOutcome::Cancelled),
             }
         }
 
         bail!("tool-call loop exceeded {MAX_LOOP_ITERATIONS} iterations — model is not converging");
+    }
+
+    async fn commit_user_message(
+        &self,
+        session: &mut Session,
+        input: &str,
+        on_event: &mut (impl FnMut(TurnEvent<'_>) + Send),
+    ) -> Result<()> {
+        // Commit the user message before any network work — its presence in
+        // `session.messages` is what keeps the final persisted session valid
+        // if a later error aborts the turn.
+        session.push_message(Message::user(input));
+        on_event(TurnEvent::MessageAppended(
+            session.messages.last().expect("just pushed"),
+        ));
+        self.store.save(session).await
+    }
+
+    async fn stream_assistant_response(
+        &self,
+        session: &mut Session,
+        cancel: CancelToken,
+        on_event: &mut (impl FnMut(TurnEvent<'_>) + Send),
+    ) -> Result<AssistantStreamOutcome> {
+        let mut event_stream = self
+            .llm
+            .stream(&session.messages, &self.system_prompt, self.tools.defs())
+            .await?;
+        let mut acc = StreamAccumulator::new();
+        while let Some(event) = event_stream.next().await {
+            let event = event?;
+            on_event(TurnEvent::StreamDelta(&event));
+            acc.push(event);
+
+            if cancel.is_cancelled() {
+                // Commit whatever the accumulator has collected so far.
+                // Skip the commit if nothing meaningful arrived — avoids
+                // polluting the session with a zero-content assistant message.
+                let partial = acc.into_message();
+                if !partial.content.is_empty() {
+                    session.push_message(partial);
+                    on_event(TurnEvent::MessageAppended(
+                        session.messages.last().expect("just pushed"),
+                    ));
+                    self.store.save(session).await?;
+                }
+                return Ok(AssistantStreamOutcome::Cancelled);
+            }
+        }
+        session.push_message(acc.into_message());
+        let response = session.messages.last().expect("just pushed");
+        on_event(TurnEvent::MessageAppended(response));
+        let tool_calls = extract_tool_calls(response);
+        self.store.save(session).await?;
+
+        Ok(AssistantStreamOutcome::Completed { tool_calls })
+    }
+
+    async fn execute_approval_plan(
+        &self,
+        session: &mut Session,
+        tool_calls: Vec<(String, String, String)>,
+        cancel: CancelToken,
+        approver: &dyn ToolApprover,
+        on_event: &mut (impl FnMut(TurnEvent<'_>) + Send),
+    ) -> Result<ToolPlanOutcome> {
+        let approval_plan = self.plan_tool_approvals(tool_calls).await;
+        if cancel.is_cancelled() {
+            return Ok(ToolPlanOutcome::Cancelled);
+        }
+
+        // Split the plan into entries that need a user decision and entries
+        // that can be committed immediately (Ready tools + policy errors).
+        // Ready tools run in plan order. Approval-gated tools execute in
+        // decision arrival order so a user approving one doesn't block on a
+        // different tool still waiting for input.
+        let mut approval_requests: Vec<ToolApprovalRequest> = Vec::new();
+        let mut pending: HashMap<String, (String, String, String)> = HashMap::new();
+
+        for planned in approval_plan {
+            if cancel.is_cancelled() {
+                return Ok(ToolPlanOutcome::Cancelled);
+            }
+            match planned {
+                PlannedToolCall::Ready {
+                    id,
+                    name,
+                    arguments,
+                } => {
+                    execute_and_commit(
+                        &self.tools,
+                        &self.store,
+                        session,
+                        on_event,
+                        id,
+                        name,
+                        arguments,
+                    )
+                    .await?;
+                }
+                PlannedToolCall::PolicyError { id, error } => {
+                    commit_tool_result(
+                        &self.store,
+                        session,
+                        on_event,
+                        Message::tool_result(id, error, true),
+                    )
+                    .await?;
+                }
+                PlannedToolCall::NeedsApproval {
+                    id,
+                    name,
+                    arguments,
+                    request,
+                } => {
+                    pending.insert(request.request_id.clone(), (id, name, arguments));
+                    approval_requests.push(request);
+                }
+            }
+        }
+
+        if approval_requests.is_empty() {
+            return Ok(ToolPlanOutcome::Continue);
+        }
+
+        on_event(TurnEvent::ToolApprovalRequested {
+            requests: approval_requests.clone(),
+        });
+        let mut stream = approver.approve(approval_requests, cancel.clone());
+        while let Some(decision) = stream.next().await {
+            let decision = decision?;
+            on_event(TurnEvent::ToolApprovalResolved {
+                request_id: decision.request_id.clone(),
+                approved: decision.approved,
+            });
+            let Some((id, name, arguments)) = pending.remove(&decision.request_id) else {
+                continue;
+            };
+            if cancel.is_cancelled() {
+                return Ok(ToolPlanOutcome::Cancelled);
+            }
+            if decision.approved {
+                execute_and_commit(
+                    &self.tools,
+                    &self.store,
+                    session,
+                    on_event,
+                    id,
+                    name,
+                    arguments,
+                )
+                .await?;
+            } else {
+                commit_tool_result(
+                    &self.store,
+                    session,
+                    on_event,
+                    Message::tool_result(id, TOOL_REJECTED_MESSAGE, true),
+                )
+                .await?;
+            }
+        }
+        drop(stream);
+
+        // If the approver ended the stream without decisions for every
+        // pending request — typically because cancellation fired — treat the
+        // turn as cancelled so no tool runs without an explicit user choice.
+        if !pending.is_empty() {
+            return Ok(ToolPlanOutcome::Cancelled);
+        }
+
+        Ok(ToolPlanOutcome::Continue)
     }
 
     async fn plan_tool_approvals(
@@ -483,6 +538,40 @@ mod tests {
                 })
                 .collect();
             Box::pin(futures::stream::iter(decisions))
+        }
+    }
+
+    struct OrderedApprover {
+        decisions: Vec<ToolApprovalDecision>,
+        batches: Mutex<Vec<Vec<ToolApprovalRequest>>>,
+    }
+
+    impl OrderedApprover {
+        fn new(decisions: impl IntoIterator<Item = (&'static str, bool)>) -> Self {
+            Self {
+                decisions: decisions
+                    .into_iter()
+                    .map(|(request_id, approved)| ToolApprovalDecision {
+                        request_id: request_id.to_owned(),
+                        approved,
+                    })
+                    .collect(),
+                batches: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl ToolApprover for OrderedApprover {
+        fn approve(
+            &self,
+            requests: Vec<ToolApprovalRequest>,
+            _cancel: CancelToken,
+        ) -> Pin<Box<dyn futures::Stream<Item = Result<ToolApprovalDecision>> + Send + '_>>
+        {
+            self.batches.lock().unwrap().push(requests);
+            Box::pin(futures::stream::iter(
+                self.decisions.iter().cloned().map(Ok),
+            ))
         }
     }
 
@@ -966,6 +1055,77 @@ mod tests {
                 assert_eq!(c1, "from-a");
                 assert_eq!(id2, "c2");
                 assert_eq!(c2, "from-b");
+            }
+            _ => panic!("expected tool results"),
+        }
+        assert_eq!(a.calls(), vec![r#"{"first":true}"#.to_owned()]);
+        assert_eq!(b.calls(), vec![r#"{"second":true}"#.to_owned()]);
+    }
+
+    #[tokio::test]
+    async fn approval_required_tools_execute_in_decision_arrival_order() {
+        let llm = FakeLlmProvider::new();
+        llm.push_response(vec![
+            StreamEvent::ToolCallStart {
+                index: 0,
+                id: "c1".into(),
+                name: "a".into(),
+            },
+            StreamEvent::ToolCallStart {
+                index: 1,
+                id: "c2".into(),
+                name: "b".into(),
+            },
+            StreamEvent::ToolCallArgumentDelta {
+                index: 0,
+                delta: r#"{"first":true}"#.into(),
+            },
+            StreamEvent::ToolCallArgumentDelta {
+                index: 1,
+                delta: r#"{"second":true}"#.into(),
+            },
+            StreamEvent::Finished {
+                usage: Usage {
+                    prompt_tokens: 0,
+                    completion_tokens: 2,
+                    reasoning_tokens: 0,
+                },
+            },
+        ]);
+        llm.push_text("finished");
+
+        let a = Arc::new(ApprovalFakeTool::new("a", "from-a"));
+        let b = Arc::new(ApprovalFakeTool::new("b", "from-b"));
+        let tools =
+            tool_registry_with(vec![a.clone() as Arc<dyn Tool>, b.clone() as Arc<dyn Tool>]);
+        let store = FakeSessionStore::new();
+        let runner = make_runner(llm, store, tools);
+        let approver = OrderedApprover::new([("c2", true), ("c1", true)]);
+        let id = SessionId::new_v4();
+
+        runner
+            .start_with_approver(id, "/p".into(), "hi", CancelToken::new(), &approver, |_| {})
+            .await
+            .unwrap();
+
+        let saved = runner.store.get(id).unwrap();
+        match (&saved.messages[2].content[0], &saved.messages[3].content[0]) {
+            (
+                ContentBlock::ToolResult {
+                    content: c2,
+                    tool_call_id: id2,
+                    ..
+                },
+                ContentBlock::ToolResult {
+                    content: c1,
+                    tool_call_id: id1,
+                    ..
+                },
+            ) => {
+                assert_eq!(id2, "c2");
+                assert_eq!(c2, "from-b");
+                assert_eq!(id1, "c1");
+                assert_eq!(c1, "from-a");
             }
             _ => panic!("expected tool results"),
         }

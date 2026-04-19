@@ -38,7 +38,39 @@ impl Drop for CloseGuard<'_> {
         {
             session.clear_closing();
         }
-        let mut map = self.closing.lock().expect("close map poisoned");
+        let mut map = self.closing.lock().unwrap_or_else(|err| err.into_inner());
         map.remove(&self.id);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+
+    use domain::SessionId;
+
+    use super::*;
+
+    #[test]
+    fn drop_does_not_panic_when_close_map_is_poisoned() {
+        let id = SessionId::new_v4();
+        let closing = Mutex::new(HashMap::from([(id, CloseState::Closing)]));
+        let poison_result = std::panic::catch_unwind(|| {
+            let _guard = closing.lock().unwrap();
+            panic!("poison close map");
+        });
+        assert!(poison_result.is_err());
+
+        let drop_result = std::panic::catch_unwind(|| {
+            drop(CloseGuard {
+                closing: &closing,
+                id,
+                session: None,
+                clear_session_on_drop: true,
+            });
+        });
+        assert!(drop_result.is_ok());
+        assert!(closing.lock().unwrap_err().into_inner().is_empty());
     }
 }

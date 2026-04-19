@@ -109,6 +109,11 @@ impl ToolRegistry {
     /// order the schema lists them.
     pub fn register(&mut self, tool: Arc<dyn Tool>) {
         let def = tool.def();
+        assert!(
+            !self.by_name.contains_key(&def.name),
+            "duplicate tool registration: {}",
+            def.name
+        );
         self.by_name.insert(def.name.clone(), tool);
         self.defs.push(def);
     }
@@ -252,6 +257,14 @@ mod tests {
 
         let names: Vec<_> = reg.defs().iter().map(|d| d.name.as_str()).collect();
         assert_eq!(names, vec!["first", "second", "third"]);
+    }
+
+    #[test]
+    #[should_panic(expected = "duplicate tool registration: duplicate")]
+    fn register_rejects_duplicate_tool_names() {
+        let mut reg = ToolRegistry::new();
+        reg.register(Arc::new(FakeTool::new("duplicate")) as Arc<dyn Tool>);
+        reg.register(Arc::new(FakeTool::new("duplicate")) as Arc<dyn Tool>);
     }
 
     #[test]

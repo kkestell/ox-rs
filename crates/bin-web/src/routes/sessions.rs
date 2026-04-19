@@ -7,7 +7,7 @@ use serde::Deserialize;
 
 use crate::state::AppState;
 
-use super::merge_rejection_response;
+use super::{json_error_message, merge_rejection_response};
 
 pub(super) async fn list_sessions(State(state): State<AppState>) -> Response {
     let snapshot = state.registry.snapshot().await;
@@ -19,11 +19,11 @@ pub(super) async fn create_session(State(state): State<AppState>) -> Response {
         Ok(session_id) => Json(CreatedSession { session_id }).into_response(),
         Err(err) => {
             eprintln!("ox: create_session failed: {err:#}");
-            (
+            json_error_message(
                 StatusCode::BAD_GATEWAY,
-                format!("failed to start agent: {err}"),
+                "agent_start_failed",
+                format!("{err:#}"),
             )
-                .into_response()
         }
     }
 }

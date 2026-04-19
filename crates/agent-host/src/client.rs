@@ -44,9 +44,8 @@ pub struct AgentSpawnConfig {
     pub env: Vec<(String, String)>,
 }
 
-/// Send-side handle. Thread-safe by construction — `mpsc::UnboundedSender`
-/// is `Sync`, so the state guard can hand out `&AgentClient` references
-/// across tasks without cloning the client.
+/// Send-side handle. Cheap to move into shared host state; callers usually
+/// send through `&AgentClient` while a mutex protects the owning session.
 pub struct AgentClient {
     cmd_tx: mpsc::UnboundedSender<AgentCommand>,
     /// Optional owner for transport lifetime resources supplied by an
