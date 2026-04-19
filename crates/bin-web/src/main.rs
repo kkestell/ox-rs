@@ -32,14 +32,15 @@ use std::process::ExitCode;
 use std::sync::Arc;
 
 use adapter_git::CliGit;
-use adapter_llm::{OpenRouterCatalog, OpenRouterSlugGenerator};
+use adapter_llm::{OpenRouterSlugGenerator, ProvidersCatalog};
 use adapter_process::ProcessSpawner;
 use adapter_storage::{DiskLayoutRepository, DiskSessionStore};
 use agent_host::{
     AgentSpawnConfig, CloseRequestSink, FirstTurnSink, Git, LayoutRepository, SlugGenerator,
     workspace_slug,
 };
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result};
+use app::config::{ProvidersConfig, Settings};
 use app::{ModelCatalog, SessionStore};
 use clap::Parser;
 use domain::SessionId;
@@ -52,9 +53,6 @@ use crate::registry::SessionRegistry;
 use crate::routes::router;
 use crate::startup::assert_workspace_ready;
 use crate::state::AppState;
-
-/// Default OpenRouter model for new sessions.
-const DEFAULT_MODEL: &str = "deepseek/deepseek-v3.2";
 
 /// Default port for the local HTTP server.
 const DEFAULT_PORT: u16 = 3737;
@@ -69,10 +67,6 @@ struct Cli {
     /// Workspace directory to open (defaults to current directory).
     #[arg(long)]
     workspace: Option<PathBuf>,
-
-    /// Default model for new sessions.
-    #[arg(long, default_value = DEFAULT_MODEL)]
-    model: String,
 
     /// Port to bind the HTTP server to on 127.0.0.1.
     #[arg(long, default_value_t = DEFAULT_PORT)]
@@ -127,48 +121,41 @@ async fn run(cli: Cli) -> Result<()> {
     let git: Arc<dyn Git> = Arc::new(CliGit::new());
     let workspace_ctx = assert_workspace_ready(git.as_ref(), &workspace_root).await?;
 
-    let api_key = std::env::var("OPENROUTER_API_KEY")
-        .context("OPENROUTER_API_KEY is not set — export it before launching ox")?;
-
-    // Fetch the OpenRouter `/models` catalog now so the per-session
-    // context window is known by the time the browser paints. Failure
-    // here aborts startup with a pointed error: the usage chip is a
-    // load-bearing part of the UI, so running with a missing catalog
-    // would ship a broken feature rather than gracefully degrade. The
-    // base URL is deliberately fixed here — the rest of the OpenRouter
-    // adapter hardcodes it too, so there is no config knob to forget.
-    let http_client = reqwest::Client::new();
-    let catalog = OpenRouterCatalog::fetch(&http_client, "https://openrouter.ai/api/v1", &api_key)
-        .await
-        .with_context(|| {
-            "failed to fetch OpenRouter /models catalog from https://openrouter.ai/api/v1/models"
-                .to_string()
-        })?;
-
-    // Validate the default model up front. An unknown model at this
-    // point is a configuration error (bad --model flag, or catalog
-    // drift); fail fast so the user fixes it before sessions spawn.
-    // The registry re-checks at each spawn, but that path surfaces a
-    // 502 to an in-flight HTTP client instead of aborting cleanly at
-    // startup.
-    if catalog.context_window(&cli.model).is_none() {
-        return Err(anyhow!(
-            "model {:?} is not present in the OpenRouter catalog — pick a known model id with --model",
-            cli.model,
-        ));
-    }
-    let catalog: Arc<dyn ModelCatalog> = Arc::new(catalog);
-
-    // The slug generator needs the same OpenRouter credentials the
-    // agent does, plus a model id. We clone the key so the spawn_config
-    // can still move `api_key` into its env list below.
-    let slug_api_key = api_key.clone();
-    let slug_model = cli.model.clone();
-
     let agent_binary = resolve_agent_binary().context("locating the ox-agent binary")?;
 
     let home = dirs::home_dir().context("resolving the user's home directory")?;
     let ox_dir = home.join(".ox");
+    let providers_path = ox_dir.join("providers.json");
+    let settings_path = ox_dir.join("settings.json");
+    if ProvidersConfig::write_shipped_default_if_missing(&providers_path)? {
+        eprintln!(
+            "ox: wrote shipped providers config to {}",
+            providers_path.display()
+        );
+    }
+    if Settings::write_shipped_default_if_missing(&settings_path)? {
+        eprintln!(
+            "ox: wrote shipped settings config to {}",
+            settings_path.display()
+        );
+    }
+    let providers = Arc::new(ProvidersConfig::load(&providers_path)?);
+    let settings = Settings::load(&settings_path)?;
+    settings.validate(&providers)?;
+    let default_model = settings.default_model.clone();
+    if !providers.is_wired_model(&default_model) {
+        anyhow::bail!(
+            "default model {:?} is not backed by a wired provider",
+            default_model
+        );
+    }
+    let catalog: Arc<dyn ModelCatalog> = Arc::new(ProvidersCatalog::new(providers.clone()));
+
+    let api_key = std::env::var("OPENROUTER_API_KEY")
+        .context("OPENROUTER_API_KEY is not set — export it before launching ox")?;
+    let slug_api_key = api_key.clone();
+    let slug_model = default_model.clone();
+
     let slug = workspace_slug(&workspace_root);
     let sessions_dir = ox_dir.join("workspaces").join(&slug).join("sessions");
     let layout_path = ox_dir.join("workspaces.json");
@@ -198,7 +185,6 @@ async fn run(cli: Cli) -> Result<()> {
     let spawn_config = AgentSpawnConfig {
         binary: agent_binary,
         workspace_root: workspace_root.clone(),
-        model: cli.model.clone(),
         sessions_dir,
         resume: None,
         session_id: None,
@@ -243,6 +229,7 @@ async fn run(cli: Cli) -> Result<()> {
             layout.clone(),
             workspace_root.clone(),
             catalog.clone(),
+            default_model.clone(),
             close_sink.clone(),
             first_turn_sink.clone(),
         );
@@ -255,6 +242,7 @@ async fn run(cli: Cli) -> Result<()> {
             layout,
             workspace_root.clone(),
             catalog.clone(),
+            default_model.clone(),
             close_sink.clone(),
             first_turn_sink.clone(),
             session_store_dyn.clone(),
@@ -268,6 +256,7 @@ async fn run(cli: Cli) -> Result<()> {
     let state = AppState {
         registry: registry.clone(),
         lifecycle: lifecycle.clone(),
+        providers: providers.clone(),
     };
     let app = router(state);
 

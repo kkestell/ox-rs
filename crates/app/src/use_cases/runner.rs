@@ -82,12 +82,25 @@ impl<L: LlmProvider, S: SessionStore> SessionRunner<L, S> {
         cancel: CancelToken,
         on_event: impl FnMut(TurnEvent<'_>) + Send,
     ) -> Result<TurnOutcome> {
+        self.start_with_model(id, workspace_root, "test/model", input, cancel, on_event)
+            .await
+    }
+
+    pub async fn start_with_model(
+        &self,
+        id: SessionId,
+        workspace_root: PathBuf,
+        model: &str,
+        input: &str,
+        cancel: CancelToken,
+        on_event: impl FnMut(TurnEvent<'_>) + Send,
+    ) -> Result<TurnOutcome> {
         // The agent's `workspace_root` CLI argument is its CWD, which is
         // the session's worktree path for worktree-backed sessions. The
         // agent has no separate knowledge of the main repository root —
         // only the host (which tracks it via `WorkspaceContext`) does — so
         // both `Session` fields are populated from the same value here.
-        let mut session = Session::new(id, workspace_root.clone(), workspace_root);
+        let mut session = Session::new(id, workspace_root.clone(), workspace_root, model.into());
         self.run_turn(&mut session, input, cancel, on_event).await
     }
 
@@ -100,7 +113,30 @@ impl<L: LlmProvider, S: SessionStore> SessionRunner<L, S> {
         approver: &dyn ToolApprover,
         on_event: impl FnMut(TurnEvent<'_>) + Send,
     ) -> Result<TurnOutcome> {
-        let mut session = Session::new(id, workspace_root.clone(), workspace_root);
+        self.start_with_model_and_approver(
+            id,
+            workspace_root,
+            "test/model",
+            input,
+            cancel,
+            approver,
+            on_event,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn start_with_model_and_approver(
+        &self,
+        id: SessionId,
+        workspace_root: PathBuf,
+        model: &str,
+        input: &str,
+        cancel: CancelToken,
+        approver: &dyn ToolApprover,
+        on_event: impl FnMut(TurnEvent<'_>) + Send,
+    ) -> Result<TurnOutcome> {
+        let mut session = Session::new(id, workspace_root.clone(), workspace_root, model.into());
         self.run_turn_with_approver(&mut session, input, cancel, approver, on_event)
             .await
     }
@@ -113,9 +149,22 @@ impl<L: LlmProvider, S: SessionStore> SessionRunner<L, S> {
         cancel: CancelToken,
         on_event: impl FnMut(TurnEvent<'_>) + Send,
     ) -> Result<TurnOutcome> {
+        self.resume_with_model(id, "test/model", input, cancel, on_event)
+            .await
+    }
+
+    pub async fn resume_with_model(
+        &self,
+        id: SessionId,
+        model: &str,
+        input: &str,
+        cancel: CancelToken,
+        on_event: impl FnMut(TurnEvent<'_>) + Send,
+    ) -> Result<TurnOutcome> {
         let Some(mut session) = self.store.try_load(id).await? else {
             bail!("session {id} not found");
         };
+        session.model = model.into();
         self.run_turn(&mut session, input, cancel, on_event).await
     }
 
@@ -127,9 +176,23 @@ impl<L: LlmProvider, S: SessionStore> SessionRunner<L, S> {
         approver: &dyn ToolApprover,
         on_event: impl FnMut(TurnEvent<'_>) + Send,
     ) -> Result<TurnOutcome> {
+        self.resume_with_model_and_approver(id, "test/model", input, cancel, approver, on_event)
+            .await
+    }
+
+    pub async fn resume_with_model_and_approver(
+        &self,
+        id: SessionId,
+        model: &str,
+        input: &str,
+        cancel: CancelToken,
+        approver: &dyn ToolApprover,
+        on_event: impl FnMut(TurnEvent<'_>) + Send,
+    ) -> Result<TurnOutcome> {
         let Some(mut session) = self.store.try_load(id).await? else {
             bail!("session {id} not found");
         };
+        session.model = model.into();
         self.run_turn_with_approver(&mut session, input, cancel, approver, on_event)
             .await
     }
@@ -236,7 +299,12 @@ impl<L: LlmProvider, S: SessionStore> SessionRunner<L, S> {
     ) -> Result<AssistantStreamOutcome> {
         let mut event_stream = self
             .llm
-            .stream(&session.messages, &self.system_prompt, self.tools.defs())
+            .stream(
+                &session.model,
+                &session.messages,
+                &self.system_prompt,
+                self.tools.defs(),
+            )
             .await?;
         let mut acc = StreamAccumulator::new();
         while let Some(event) = event_stream.next().await {
@@ -634,7 +702,12 @@ mod tests {
         let store = FakeSessionStore::new();
 
         let id = SessionId::new_v4();
-        let mut existing = Session::new(id, "/project".into(), "/project".into());
+        let mut existing = Session::new(
+            id,
+            "/project".into(),
+            "/project".into(),
+            "test/model".into(),
+        );
         existing.push_message(Message::user("turn 1"));
         existing.push_message(Message::assistant(vec![ContentBlock::Text {
             text: "response 1".into(),

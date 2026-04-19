@@ -1,4 +1,3 @@
-mod catalog;
 mod slug;
 pub mod sse;
 pub mod wire;
@@ -15,18 +14,15 @@ use wire::RequestBody;
 pub struct OpenRouterProvider {
     client: reqwest::Client,
     api_key: String,
-    model: String,
 }
 
-pub use catalog::{CatalogError, OpenRouterCatalog};
 pub use slug::OpenRouterSlugGenerator;
 
 impl OpenRouterProvider {
-    pub fn new(api_key: String, model: String) -> Self {
+    pub fn new(api_key: String) -> Self {
         Self {
             client: reqwest::Client::new(),
             api_key,
-            model,
         }
     }
 }
@@ -34,11 +30,12 @@ impl OpenRouterProvider {
 impl app::LlmProvider for OpenRouterProvider {
     async fn stream(
         &self,
+        model: &str,
         messages: &[Message],
         system_prompt: &str,
         tools: &[ToolDef],
     ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamEvent>> + Send>>> {
-        let body = RequestBody::from_messages(&self.model, messages, system_prompt, tools)?;
+        let body = RequestBody::from_messages(model, messages, system_prompt, tools)?;
 
         let response = self
             .client

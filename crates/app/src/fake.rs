@@ -35,6 +35,8 @@ pub struct FakeLlmProvider {
     responses: Mutex<VecDeque<QueuedResponse>>,
     /// Every `system_prompt` value passed to `stream()`, in call order.
     system_prompts: Mutex<Vec<String>>,
+    /// Every model value passed to `stream()`, in call order.
+    models: Mutex<Vec<String>>,
 }
 
 impl Default for FakeLlmProvider {
@@ -48,12 +50,18 @@ impl FakeLlmProvider {
         Self {
             responses: Mutex::new(VecDeque::new()),
             system_prompts: Mutex::new(Vec::new()),
+            models: Mutex::new(Vec::new()),
         }
     }
 
     /// All `system_prompt` values passed to `stream()` so far, in call order.
     pub fn system_prompts(&self) -> Vec<String> {
         self.system_prompts.lock().unwrap().clone()
+    }
+
+    /// All model ids passed to `stream()` so far, in call order.
+    pub fn models(&self) -> Vec<String> {
+        self.models.lock().unwrap().clone()
     }
 
     /// Queue a raw sequence of events.
@@ -139,10 +147,12 @@ impl FakeLlmProvider {
 impl LlmProvider for FakeLlmProvider {
     async fn stream(
         &self,
+        model: &str,
         _messages: &[Message],
         system_prompt: &str,
         _tools: &[ToolDef],
     ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamEvent>> + Send>>> {
+        self.models.lock().unwrap().push(model.to_owned());
         self.system_prompts
             .lock()
             .unwrap()
@@ -622,7 +632,7 @@ mod tests {
         let fake = FakeLlmProvider::new();
         fake.push_text("hello world");
 
-        let mut stream = fake.stream(&[], "", &[]).await.unwrap();
+        let mut stream = fake.stream("test/model", &[], "", &[]).await.unwrap();
         let mut acc = StreamAccumulator::new();
         while let Some(event) = stream.next().await {
             acc.push(event.unwrap());
@@ -637,7 +647,7 @@ mod tests {
         let fake = FakeLlmProvider::new();
         fake.push_tool_call("call_1", "read_file", r#"{"path":"a.rs"}"#);
 
-        let mut stream = fake.stream(&[], "", &[]).await.unwrap();
+        let mut stream = fake.stream("test/model", &[], "", &[]).await.unwrap();
         let mut acc = StreamAccumulator::new();
         while let Some(event) = stream.next().await {
             acc.push(event.unwrap());
@@ -666,7 +676,7 @@ mod tests {
         fake.push_text("second");
 
         // First call
-        let mut s1 = fake.stream(&[], "", &[]).await.unwrap();
+        let mut s1 = fake.stream("test/model", &[], "", &[]).await.unwrap();
         let mut acc1 = StreamAccumulator::new();
         while let Some(e) = s1.next().await {
             acc1.push(e.unwrap());
@@ -674,19 +684,32 @@ mod tests {
         assert_eq!(acc1.into_message().text(), "first");
 
         // Second call
-        let mut s2 = fake.stream(&[], "", &[]).await.unwrap();
+        let mut s2 = fake.stream("test/model", &[], "", &[]).await.unwrap();
         let mut acc2 = StreamAccumulator::new();
         while let Some(e) = s2.next().await {
             acc2.push(e.unwrap());
         }
         assert_eq!(acc2.into_message().text(), "second");
+        assert_eq!(fake.models(), vec!["test/model", "test/model"]);
+    }
+
+    #[tokio::test]
+    async fn fake_records_models_per_stream_call() {
+        let fake = FakeLlmProvider::new();
+        fake.push_text("one");
+        fake.push_text("two");
+
+        let _ = fake.stream("model/one", &[], "", &[]).await.unwrap();
+        let _ = fake.stream("model/two", &[], "", &[]).await.unwrap();
+
+        assert_eq!(fake.models(), vec!["model/one", "model/two"]);
     }
 
     #[tokio::test]
     #[should_panic(expected = "no responses queued")]
     async fn panics_when_no_responses_queued() {
         let fake = FakeLlmProvider::new();
-        let _ = fake.stream(&[], "", &[]).await;
+        let _ = fake.stream("test/model", &[], "", &[]).await;
     }
 
     // -- FakeSessionStore tests --
@@ -695,7 +718,12 @@ mod tests {
     async fn store_save_load_roundtrip() {
         let store = FakeSessionStore::new();
         let id = SessionId::new_v4();
-        let mut session = Session::new(id, "/tmp/project".into(), "/tmp/project/wt".into());
+        let mut session = Session::new(
+            id,
+            "/tmp/project".into(),
+            "/tmp/project/wt".into(),
+            "test/model".into(),
+        );
         session.push_message(Message::user("hello"));
 
         store.save(&session).await.unwrap();
@@ -720,11 +748,11 @@ mod tests {
         let store = FakeSessionStore::new();
 
         let id1 = SessionId::new_v4();
-        let s1 = Session::new(id1, "/a".into(), "/a/wt1".into());
+        let s1 = Session::new(id1, "/a".into(), "/a/wt1".into(), "test/model".into());
         store.save(&s1).await.unwrap();
 
         let id2 = SessionId::new_v4();
-        let s2 = Session::new(id2, "/b".into(), "/b/wt2".into());
+        let s2 = Session::new(id2, "/b".into(), "/b/wt2".into(), "test/model".into());
         store.save(&s2).await.unwrap();
 
         let summaries = store.list().await.unwrap();
@@ -737,7 +765,7 @@ mod tests {
     async fn store_delete_removes_and_is_idempotent() {
         let store = FakeSessionStore::new();
         let id = SessionId::new_v4();
-        let session = Session::new(id, "/a".into(), "/a/wt".into());
+        let session = Session::new(id, "/a".into(), "/a/wt".into(), "test/model".into());
         store.save(&session).await.unwrap();
 
         store.delete(id).await.unwrap();

@@ -1,7 +1,7 @@
 //! `ox-agent` — the headless session runner.
 //!
 //! One agent process == one session. The GUI spawns this binary with the
-//! `SessionId` (if resuming), model, sessions directory, and workspace root on
+//! `SessionId` (if resuming), sessions directory, and workspace root on
 //! the command line, and the API key via env. The agent then drives its
 //! `SessionRunner` over NDJSON frames on stdin/stdout. Everything about the
 //! session — loading, saving, tool execution, LLM streaming — lives here, not
@@ -29,7 +29,7 @@ use tokio::io::{AsyncWriteExt, BufReader};
 
 mod driver;
 
-fn build_system_prompt(workspace_root: &Path, model: &str) -> String {
+fn build_system_prompt(workspace_root: &Path) -> String {
     format!(
         "\
 You are an interactive agent that helps users with software engineering tasks. \
@@ -38,7 +38,6 @@ Use the instructions below and the tools available to you to assist the user.
 Environment:
 - Workspace root: {workspace_root}
 - Platform: {os}
-- Model: {model}
 - Today's date: {date}
 
 # System
@@ -216,7 +215,6 @@ If you can say it in one sentence, don't use three. Prefer short, direct \
 sentences over long explanations. This does not apply to code or tool calls.",
         workspace_root = workspace_root.display(),
         os = std::env::consts::OS,
-        model = model,
         date = Local::now().format("%Y-%m-%d"),
     )
 }
@@ -227,11 +225,6 @@ struct AgentCli {
     /// Workspace root the agent's file tools resolve relative paths against.
     #[arg(long)]
     workspace_root: PathBuf,
-
-    /// OpenRouter model ID (e.g. `deepseek/deepseek-r1`). Passed through
-    /// verbatim to the provider.
-    #[arg(long)]
-    model: String,
 
     /// Directory where session JSON files are stored.
     #[arg(long)]
@@ -308,7 +301,7 @@ async fn run(cli: AgentCli) -> Result<()> {
         .get("OPENROUTER_API_KEY")?
         .context("OPENROUTER_API_KEY is not set — export it before launching ox-agent")?;
 
-    let llm = adapter_llm::OpenRouterProvider::new(api_key, cli.model.clone());
+    let llm = adapter_llm::OpenRouterProvider::new(api_key);
 
     // File tools share a single `LocalFileSystem` so concurrent tool calls in
     // the same turn see a consistent filesystem view.
@@ -346,7 +339,7 @@ async fn run(cli: AgentCli) -> Result<()> {
     tools.register(Arc::new(AbandonTool::new(close_signal.clone())) as Arc<dyn Tool>);
 
     let store = adapter_storage::DiskSessionStore::new(cli.sessions_dir)?;
-    let system_prompt = build_system_prompt(&cli.workspace_root, &cli.model);
+    let system_prompt = build_system_prompt(&cli.workspace_root);
     let runner = SessionRunner::new(llm, store, tools, system_prompt);
 
     let stdin = tokio::io::stdin();

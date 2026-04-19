@@ -24,12 +24,14 @@ impl SessionRegistry {
             None => return CommandDispatch::NotFound,
         };
         match cmd {
-            AgentCommand::SendMessage { input } => match session.send_message(input) {
-                SendOutcome::Ok => CommandDispatch::Ok,
-                SendOutcome::Dead => CommandDispatch::Dead,
-                SendOutcome::AlreadyTurning => CommandDispatch::AlreadyTurning,
-                SendOutcome::Closing => CommandDispatch::Closing,
-            },
+            AgentCommand::SendMessage { input, .. } => {
+                match session.send_message(input, session.model()) {
+                    SendOutcome::Ok => CommandDispatch::Ok,
+                    SendOutcome::Dead => CommandDispatch::Dead,
+                    SendOutcome::AlreadyTurning => CommandDispatch::AlreadyTurning,
+                    SendOutcome::Closing => CommandDispatch::Closing,
+                }
+            }
             AgentCommand::Cancel => {
                 session.cancel();
                 CommandDispatch::Ok

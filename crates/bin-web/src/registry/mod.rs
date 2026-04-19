@@ -32,7 +32,7 @@ use agent_host::{
 };
 use anyhow::{Context, Result, anyhow};
 use app::ModelCatalog;
-use domain::SessionId;
+use domain::{Session, SessionId};
 
 use crate::session::ActiveSession;
 
@@ -58,6 +58,7 @@ pub struct SessionRegistry {
     /// the browser through `SessionSummary` as the denominator of the
     /// context-usage chip.
     catalog: Arc<dyn ModelCatalog>,
+    default_model: String,
     /// Sink for `AgentEvent::RequestClose` frames the pump observes.
     /// Passed through to every `ActiveSession` at creation so the pump
     /// can route close intents to the lifecycle coordinator without a
@@ -74,12 +75,14 @@ pub struct SessionRegistry {
 impl SessionRegistry {
     /// Build an empty registry. `restore` is the usual entry point on
     /// startup; `new` exists for tests that want an empty registry.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         spawner: Arc<dyn AgentSpawner>,
         spawn_config: AgentSpawnConfig,
         layout: Arc<dyn LayoutRepository>,
         workspace_root: PathBuf,
         catalog: Arc<dyn ModelCatalog>,
+        default_model: String,
         close_sink: Arc<dyn CloseRequestSink>,
         first_turn_sink: Arc<dyn FirstTurnSink>,
     ) -> Arc<Self> {
@@ -90,6 +93,7 @@ impl SessionRegistry {
             layout,
             workspace_root,
             catalog,
+            default_model,
             close_sink,
             first_turn_sink,
         })
@@ -105,7 +109,31 @@ impl SessionRegistry {
     /// snapshot layer to supply a denominator to the browser when the
     /// workspace has no sessions yet.
     pub(super) fn default_model(&self) -> &str {
-        &self.spawn_config.model
+        &self.default_model
+    }
+
+    pub async fn set_session_model(&self, id: SessionId, model: String) -> Result<()> {
+        let session = self
+            .get(id)
+            .ok_or_else(|| anyhow!("session {id} not found in registry"))?;
+        let path = self.spawn_config.sessions_dir.join(format!("{id}.json"));
+        let bytes = tokio::fs::read_to_string(&path)
+            .await
+            .with_context(|| format!("reading session JSON {}", path.display()))?;
+        let mut saved: Session = serde_json::from_str(&bytes)
+            .with_context(|| format!("parsing session JSON {}", path.display()))?;
+        saved.model = model.clone();
+        let data = serde_json::to_string_pretty(&saved)
+            .with_context(|| format!("serializing session {id}"))?;
+        let tmp_path = path.with_extension("json.tmp");
+        tokio::fs::write(&tmp_path, data)
+            .await
+            .with_context(|| format!("writing session JSON {}", tmp_path.display()))?;
+        tokio::fs::rename(&tmp_path, &path)
+            .await
+            .with_context(|| format!("replacing session JSON {}", path.display()))?;
+        session.set_model(model);
+        Ok(())
     }
 
     /// Drop the session from the registry. The `Arc<ActiveSession>`
@@ -210,18 +238,16 @@ impl SessionRegistry {
         config.workspace_root = worktree_path;
         config.resume = resume;
 
-        // Per-session unknown-model rejection: if the catalog does not
-        // know the model this session would use, fail the spawn here
-        // with a pointed error rather than silently handing back a
-        // zero-token context window. An unknown model at this point
-        // means a bad `--model` flag or catalog drift — the caller (the
-        // HTTP handler or `main`) maps the error into a 502 / startup
-        // abort so the user fixes it instead of staring at a broken
-        // usage chip.
-        if self.catalog.context_window(&config.model).is_none() {
+        let model = if let Some(id) = resume {
+            self.session_model_from_disk(id).await?
+        } else {
+            self.default_model.clone()
+        };
+
+        if self.catalog.context_window(&model).is_none() {
             return Err(anyhow!(
                 "model {:?} is not present in the model catalog",
-                config.model,
+                model,
             ));
         }
         // Pass the pre-allocated id through to the agent so the
@@ -244,6 +270,7 @@ impl SessionRegistry {
             self.close_sink.clone(),
             self.first_turn_sink.clone(),
             fresh,
+            model,
         );
 
         let id = session
@@ -288,14 +315,26 @@ impl SessionRegistry {
         config.workspace_root = new_worktree_path;
         config.resume = Some(id);
         config.session_id = Some(id);
+        let model = self.session_model_from_disk(id).await?;
 
         let (client, stream) = self
             .spawner
             .spawn(config)
             .context("spawning replacement agent")?;
 
+        session.set_model(model);
         session.replace_agent(client, stream);
         Ok(())
+    }
+
+    async fn session_model_from_disk(&self, id: SessionId) -> Result<String> {
+        let path = self.spawn_config.sessions_dir.join(format!("{id}.json"));
+        let bytes = tokio::fs::read_to_string(&path)
+            .await
+            .with_context(|| format!("reading session JSON {}", path.display()))?;
+        let session: Session = serde_json::from_str(&bytes)
+            .with_context(|| format!("parsing session JSON {}", path.display()))?;
+        Ok(session.model)
     }
 
     /// Accessor for handlers and tests that need the workspace root
@@ -457,7 +496,10 @@ mod tests {
         let outcome = registry
             .send_command(
                 unknown,
-                protocol::AgentCommand::SendMessage { input: "hi".into() },
+                protocol::AgentCommand::SendMessage {
+                    input: "hi".into(),
+                    model: "test/model".into(),
+                },
             )
             .await;
         assert_eq!(outcome, CommandDispatch::NotFound);
@@ -476,6 +518,7 @@ mod tests {
                 id,
                 protocol::AgentCommand::SendMessage {
                     input: "one".into(),
+                    model: "test/model".into(),
                 },
             )
             .await;
@@ -485,6 +528,7 @@ mod tests {
                 id,
                 protocol::AgentCommand::SendMessage {
                     input: "two".into(),
+                    model: "test/model".into(),
                 },
             )
             .await;
@@ -495,8 +539,9 @@ mod tests {
             .await
             .expect("first frame timeout");
         match frame1 {
-            Some(protocol::AgentCommand::SendMessage { input }) => {
+            Some(protocol::AgentCommand::SendMessage { input, model }) => {
                 assert_eq!(input, "one");
+                assert_eq!(model, "test/model");
             }
             other => panic!("expected SendMessage('one'), got {other:?}"),
         }
@@ -537,6 +582,7 @@ mod tests {
                 id,
                 protocol::AgentCommand::SendMessage {
                     input: "after-death".into(),
+                    model: "test/model".into(),
                 },
             )
             .await;
@@ -604,7 +650,6 @@ mod tests {
             AgentSpawnConfig {
                 binary: PathBuf::from("/nonexistent/ox-agent"),
                 workspace_root: workspace_root.clone(),
-                model: "test/model".into(),
                 sessions_dir: PathBuf::from("/nonexistent/sessions"),
                 resume: None,
                 session_id: None,
@@ -613,6 +658,7 @@ mod tests {
             Arc::new(store),
             workspace_root.clone(),
             test_catalog(),
+            "test/model".into(),
             Arc::new(agent_host::fake::NoopCloseRequestSink),
             Arc::new(agent_host::fake::NoopFirstTurnSink),
         );
@@ -664,7 +710,12 @@ mod tests {
         label: &str,
     ) -> PathBuf {
         let worktree = unique_temp_dir(label);
-        let session = domain::Session::new(id, workspace_root.to_path_buf(), worktree.clone());
+        let session = domain::Session::new(
+            id,
+            workspace_root.to_path_buf(),
+            worktree.clone(),
+            "test/model".into(),
+        );
         app::SessionStore::save(store, &session).await.unwrap();
         worktree
     }
@@ -695,7 +746,6 @@ mod tests {
         let spawn_config = AgentSpawnConfig {
             binary: PathBuf::from("/nonexistent/ox-agent"),
             workspace_root: workspace_root.clone(),
-            model: "test/model".into(),
             sessions_dir,
             resume: None,
             session_id: None,
@@ -708,6 +758,7 @@ mod tests {
             Arc::new(layout),
             workspace_root,
             test_catalog(),
+            "test/model".into(),
             Arc::new(agent_host::fake::NoopCloseRequestSink),
             Arc::new(agent_host::fake::NoopFirstTurnSink),
             session_store,
@@ -737,7 +788,8 @@ mod tests {
         // Seed a session whose worktree_path is a non-existent directory.
         {
             let fake_wt = std::env::temp_dir().join("does-not-exist-intentionally");
-            let session = domain::Session::new(id, workspace_root.clone(), fake_wt);
+            let session =
+                domain::Session::new(id, workspace_root.clone(), fake_wt, "test/model".into());
             app::SessionStore::save(session_store.as_ref(), &session)
                 .await
                 .unwrap();
@@ -757,7 +809,6 @@ mod tests {
         let spawn_config = AgentSpawnConfig {
             binary: PathBuf::from("/nonexistent/ox-agent"),
             workspace_root: workspace_root.clone(),
-            model: "test/model".into(),
             sessions_dir,
             resume: None,
             session_id: None,
@@ -770,6 +821,7 @@ mod tests {
             Arc::new(layout),
             workspace_root,
             test_catalog(),
+            "test/model".into(),
             Arc::new(agent_host::fake::NoopCloseRequestSink),
             Arc::new(agent_host::fake::NoopFirstTurnSink),
             session_store,
@@ -808,7 +860,6 @@ mod tests {
         let spawn_config = AgentSpawnConfig {
             binary: PathBuf::from("/nonexistent/ox-agent"),
             workspace_root: workspace_root.clone(),
-            model: "test/model".into(),
             sessions_dir,
             resume: None,
             session_id: None,
@@ -822,6 +873,7 @@ mod tests {
                 Arc::new(layout),
                 workspace_root.clone(),
                 test_catalog(),
+                "test/model".into(),
                 Arc::new(agent_host::fake::NoopCloseRequestSink),
                 Arc::new(agent_host::fake::NoopFirstTurnSink),
                 session_store,
@@ -878,7 +930,6 @@ mod tests {
         let spawn_config = AgentSpawnConfig {
             binary: PathBuf::from("/nonexistent/ox-agent"),
             workspace_root: workspace_root.clone(),
-            model: "test/model".into(),
             sessions_dir,
             resume: None,
             session_id: None,
@@ -891,6 +942,7 @@ mod tests {
             Arc::new(layout),
             workspace_root,
             test_catalog(),
+            "test/model".into(),
             Arc::new(agent_host::fake::NoopCloseRequestSink),
             Arc::new(agent_host::fake::NoopFirstTurnSink),
             session_store,
@@ -915,7 +967,6 @@ mod tests {
             AgentSpawnConfig {
                 binary: PathBuf::from("/nonexistent/ox-agent"),
                 workspace_root: workspace_root.clone(),
-                model: "test/model".into(),
                 sessions_dir: PathBuf::from("/nonexistent/sessions"),
                 resume: None,
                 session_id: None,
@@ -924,6 +975,7 @@ mod tests {
             Arc::new(store),
             workspace_root.clone(),
             test_catalog(),
+            "test/model".into(),
             Arc::new(agent_host::fake::NoopCloseRequestSink),
             Arc::new(agent_host::fake::NoopFirstTurnSink),
         );

@@ -21,6 +21,7 @@ impl OllamaProvider {
 impl app::LlmProvider for OllamaProvider {
     async fn stream(
         &self,
+        _model: &str,
         _messages: &[Message],
         _system_prompt: &str,
         _tools: &[ToolDef],

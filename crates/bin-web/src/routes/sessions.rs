@@ -1,9 +1,10 @@
+use app::config::{Model, Provider, ProviderType};
 use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use domain::SessionId;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::state::AppState;
 
@@ -25,6 +26,53 @@ pub(super) async fn create_session(State(state): State<AppState>) -> Response {
                 format!("{err:#}"),
             )
         }
+    }
+}
+
+pub(super) async fn get_providers(State(state): State<AppState>) -> Response {
+    let providers: Vec<ProviderJson> = state
+        .providers
+        .providers
+        .iter()
+        .map(ProviderJson::from_provider)
+        .collect();
+    Json(ProvidersJson { providers }).into_response()
+}
+
+#[derive(Deserialize)]
+pub(super) struct PatchModelBody {
+    model: String,
+}
+
+pub(super) async fn patch_model(
+    State(state): State<AppState>,
+    Path(id): Path<SessionId>,
+    Json(body): Json<PatchModelBody>,
+) -> Response {
+    let Some((provider, _model)) = state.providers.model(&body.model) else {
+        return json_error_message(
+            StatusCode::BAD_REQUEST,
+            "unknown_model",
+            format!("unknown model {:?}", body.model),
+        );
+    };
+    if provider.provider_type != ProviderType::OpenRouter {
+        return json_error_message(
+            StatusCode::BAD_REQUEST,
+            "unwired_model",
+            format!("model {:?} is not backed by a wired provider", body.model),
+        );
+    }
+    if state.registry.get(id).is_none() {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    match state.registry.set_session_model(id, body.model).await {
+        Ok(()) => Json(state.registry.snapshot().await).into_response(),
+        Err(err) => json_error_message(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "model_update_failed",
+            format!("{err:#}"),
+        ),
     }
 }
 
@@ -85,4 +133,55 @@ pub(super) async fn abandon_session(
 #[derive(serde::Serialize)]
 struct CreatedSession {
     session_id: SessionId,
+}
+
+#[derive(Serialize)]
+struct ProvidersJson {
+    providers: Vec<ProviderJson>,
+}
+
+#[derive(Serialize)]
+struct ProviderJson {
+    id: String,
+    name: String,
+    #[serde(rename = "type")]
+    provider_type: ProviderType,
+    base_url: Option<String>,
+    models: Vec<ModelJson>,
+}
+
+#[derive(Serialize)]
+struct ModelJson {
+    id: String,
+    name: String,
+    context_in: u32,
+    wired: bool,
+}
+
+impl ProviderJson {
+    fn from_provider(provider: &Provider) -> Self {
+        let wired = provider.provider_type == ProviderType::OpenRouter;
+        Self {
+            id: provider.id.clone(),
+            name: provider.name.clone(),
+            provider_type: provider.provider_type,
+            base_url: provider.base_url.clone(),
+            models: provider
+                .models
+                .iter()
+                .map(|model| ModelJson::from_model(model, wired))
+                .collect(),
+        }
+    }
+}
+
+impl ModelJson {
+    fn from_model(model: &Model, wired: bool) -> Self {
+        Self {
+            id: model.id.clone(),
+            name: model.name.clone(),
+            context_in: model.context_in,
+            wired,
+        }
+    }
 }

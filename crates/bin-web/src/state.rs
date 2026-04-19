@@ -10,12 +10,15 @@
 
 use std::sync::Arc;
 
+use app::config::ProvidersConfig;
+
 use crate::lifecycle::SessionLifecycle;
 use crate::registry::SessionRegistry;
 
 #[derive(Clone)]
 pub struct AppState {
     pub registry: Arc<SessionRegistry>,
+    pub providers: Arc<ProvidersConfig>,
     /// Lifecycle coordinator. The `POST /sessions`, `/merge`, and
     /// `/abandon` handlers dispatch through this; the registry handles
     /// session-map lookups for everything else.

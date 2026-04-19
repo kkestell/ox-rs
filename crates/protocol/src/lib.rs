@@ -39,6 +39,7 @@ pub enum AgentCommand {
     /// and drives a turn.
     SendMessage {
         input: String,
+        model: String,
     },
     /// Request cancellation of the in-progress turn. The agent sets a
     /// cooperative cancel flag; actual cancellation happens at the next
@@ -213,8 +214,12 @@ mod tests {
     fn roundtrip_send_message_command() {
         let json = roundtrip_json(AgentCommand::SendMessage {
             input: "hello".into(),
+            model: "test/model".into(),
         });
-        assert_eq!(json, r#"{"type":"send_message","input":"hello"}"#);
+        assert_eq!(
+            json,
+            r#"{"type":"send_message","input":"hello","model":"test/model"}"#
+        );
     }
 
     #[test]
@@ -429,7 +434,10 @@ mod tests {
         let (mut client, server) = tokio::io::duplex(4096);
         write_frame(
             &mut client,
-            &AgentCommand::SendMessage { input: "hi".into() },
+            &AgentCommand::SendMessage {
+                input: "hi".into(),
+                model: "test/model".into(),
+            },
         )
         .await
         .unwrap();
@@ -437,10 +445,11 @@ mod tests {
 
         let mut reader = BufReader::new(server);
         let parsed: Option<AgentCommand> = read_frame(&mut reader).await.unwrap();
-        let Some(AgentCommand::SendMessage { input }) = parsed else {
+        let Some(AgentCommand::SendMessage { input, model }) = parsed else {
             panic!("expected SendMessage");
         };
         assert_eq!(input, "hi");
+        assert_eq!(model, "test/model");
     }
 
     #[tokio::test]

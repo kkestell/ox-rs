@@ -274,10 +274,20 @@ button:disabled {
   background: var(--bg-pane);
 }
 
-.model-chip {
+.model-select {
+  max-width: 22rem;
+  background: var(--bg-block);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
   color: var(--fg-muted);
   font-family: var(--font-mono);
+  font-size: 12px;
+  padding: 4px 8px;
   white-space: nowrap;
+}
+
+.model-select:disabled {
+  opacity: 0.65;
 }
 
 .composer textarea {

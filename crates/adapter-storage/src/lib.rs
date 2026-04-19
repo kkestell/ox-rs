@@ -139,6 +139,10 @@ impl DiskSessionStore {
         Ok(Self { dir })
     }
 
+    pub fn dir(&self) -> &Path {
+        &self.dir
+    }
+
     /// Build the on-disk path for a given session: `{dir}/{id}.json`.
     fn session_path(&self, id: SessionId) -> PathBuf {
         self.dir.join(format!("{id}.json"))
@@ -277,7 +281,12 @@ mod tests {
     /// Build a session containing one message of each role (user, assistant,
     /// tool) to exercise all ContentBlock variants through serialization.
     fn multi_role_session(id: SessionId) -> Session {
-        let mut session = Session::new(id, "/tmp/project".into(), "/tmp/project/wt".into());
+        let mut session = Session::new(
+            id,
+            "/tmp/project".into(),
+            "/tmp/project/wt".into(),
+            "test/model".into(),
+        );
         session.push_message(Message::user("hello"));
         session.push_message(Message::assistant(vec![
             ContentBlock::Text {
@@ -334,15 +343,15 @@ mod tests {
         let (store, _tmp) = temp_store();
 
         let id1 = SessionId::new_v4();
-        let s1 = Session::new(id1, "/a".into(), "/a/wt1".into());
+        let s1 = Session::new(id1, "/a".into(), "/a/wt1".into(), "test/model".into());
         store.save(&s1).await.unwrap();
 
         let id2 = SessionId::new_v4();
-        let s2 = Session::new(id2, "/b".into(), "/b/wt2".into());
+        let s2 = Session::new(id2, "/b".into(), "/b/wt2".into(), "test/model".into());
         store.save(&s2).await.unwrap();
 
         let id3 = SessionId::new_v4();
-        let s3 = Session::new(id3, "/c".into(), "/c/wt3".into());
+        let s3 = Session::new(id3, "/c".into(), "/c/wt3".into(), "test/model".into());
         store.save(&s3).await.unwrap();
 
         let summaries = store.list().await.unwrap();
@@ -360,7 +369,7 @@ mod tests {
         let (store, _tmp) = temp_store();
         let id = SessionId::new_v4();
 
-        let mut session = Session::new(id, "/tmp".into(), "/tmp/wt".into());
+        let mut session = Session::new(id, "/tmp".into(), "/tmp/wt".into(), "test/model".into());
         session.push_message(Message::user("first"));
         store.save(&session).await.unwrap();
 
@@ -412,7 +421,7 @@ mod tests {
 
         // Save a real session so the directory isn't empty.
         let id = SessionId::new_v4();
-        let session = Session::new(id, "/tmp".into(), "/tmp/wt".into());
+        let session = Session::new(id, "/tmp".into(), "/tmp/wt".into(), "test/model".into());
         store.save(&session).await.unwrap();
 
         // Drop non-json files and a json file with a non-UUID name into the
@@ -456,7 +465,7 @@ mod tests {
     async fn empty_session_round_trips() {
         let (store, _tmp) = temp_store();
         let id = SessionId::new_v4();
-        let session = Session::new(id, "/empty".into(), "/empty/wt".into());
+        let session = Session::new(id, "/empty".into(), "/empty/wt".into(), "test/model".into());
 
         store.save(&session).await.unwrap();
         let loaded = store.try_load(id).await.unwrap().expect("session exists");
@@ -469,7 +478,7 @@ mod tests {
     async fn delete_removes_the_file_and_list_no_longer_reports_it() {
         let (store, _tmp) = temp_store();
         let id = SessionId::new_v4();
-        let session = Session::new(id, "/proj".into(), "/proj/wt".into());
+        let session = Session::new(id, "/proj".into(), "/proj/wt".into(), "test/model".into());
         store.save(&session).await.unwrap();
 
         store.delete(id).await.unwrap();
@@ -514,7 +523,7 @@ mod tests {
     async fn try_load_returns_some_for_saved_session() {
         let (store, _tmp) = temp_store();
         let id = SessionId::new_v4();
-        let session = Session::new(id, "/p".into(), "/p/wt".into());
+        let session = Session::new(id, "/p".into(), "/p/wt".into(), "test/model".into());
         store.save(&session).await.unwrap();
 
         let loaded = store

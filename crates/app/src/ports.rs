@@ -14,6 +14,7 @@ pub trait LlmProvider {
     /// connection is established; the inner Stream yields incremental events.
     fn stream(
         &self,
+        model: &str,
         messages: &[Message],
         system_prompt: &str,
         tools: &[ToolDef],

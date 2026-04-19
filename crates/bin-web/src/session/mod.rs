@@ -117,6 +117,7 @@ pub struct ActiveSession {
     /// into the replacement pump alongside the other per-session
     /// handles.
     first_turn_sink: Arc<dyn FirstTurnSink>,
+    model: Mutex<String>,
 }
 
 impl Drop for ActiveSession {
@@ -168,6 +169,7 @@ mod tests {
             Arc::new(NoopCloseRequestSink) as Arc<dyn CloseRequestSink>,
             Arc::new(NoopFirstTurnSink) as Arc<dyn FirstTurnSink>,
             fresh,
+            "test/model".into(),
         );
         (session, agent_writer, BufReader::new(agent_reader))
     }
@@ -193,6 +195,7 @@ mod tests {
             Arc::new(NoopCloseRequestSink) as Arc<dyn CloseRequestSink>,
             sink.clone() as Arc<dyn FirstTurnSink>,
             fresh,
+            "test/model".into(),
         );
         (session, agent_writer, BufReader::new(agent_reader), sink)
     }
@@ -239,7 +242,7 @@ mod tests {
 
         assert_eq!(session.begin_close(), CloseStart::Closing);
         assert_eq!(
-            session.send_message("after close".into()),
+            session.send_message("after close".into(), "test/model".into()),
             SendOutcome::Closing
         );
 
@@ -251,7 +254,10 @@ mod tests {
         assert!(frame.is_err(), "closing send unexpectedly wrote a frame");
 
         session.clear_closing();
-        assert_eq!(session.send_message("after clear".into()), SendOutcome::Ok);
+        assert_eq!(
+            session.send_message("after clear".into(), "test/model".into()),
+            SendOutcome::Ok
+        );
         let cmd = timeout(
             Duration::from_secs(2),
             read_frame::<_, AgentCommand>(&mut agent_r),
@@ -261,7 +267,10 @@ mod tests {
         .expect("read_frame error")
         .expect("agent pipe closed");
         match cmd {
-            AgentCommand::SendMessage { input } => assert_eq!(input, "after clear"),
+            AgentCommand::SendMessage { input, model } => {
+                assert_eq!(input, "after clear");
+                assert_eq!(model, "test/model");
+            }
             other => panic!("expected SendMessage after clear, got {other:?}"),
         }
     }
@@ -344,7 +353,10 @@ mod tests {
 
         // `send_message` still goes through the new client — read back
         // one frame to prove the stdin pipe is the new one.
-        assert_eq!(session.send_message("hello".into()), SendOutcome::Ok);
+        assert_eq!(
+            session.send_message("hello".into(), "test/model".into()),
+            SendOutcome::Ok
+        );
         let cmd = timeout(
             Duration::from_secs(2),
             read_frame::<_, AgentCommand>(&mut new_agent_reader),
@@ -354,7 +366,10 @@ mod tests {
         .expect("read_frame error")
         .expect("EOF on new agent pipe");
         match cmd {
-            AgentCommand::SendMessage { input } => assert_eq!(input, "hello"),
+            AgentCommand::SendMessage { input, model } => {
+                assert_eq!(input, "hello");
+                assert_eq!(model, "test/model");
+            }
             other => panic!("expected SendMessage on new pipe, got {other:?}"),
         }
     }

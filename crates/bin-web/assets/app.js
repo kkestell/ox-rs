@@ -26,6 +26,7 @@ const state = {
   // `mountSession` tolerates that and simply hides the chip.
   contextWindow: 0,
   model: null,
+  providers: null,
 };
 
 // Window title — `<spinner> Ox - <slug>`. The spinner animates at 1Hz
@@ -158,9 +159,14 @@ class StreamAccumulator {
 async function main() {
   let snapshot;
   try {
-    const res = await fetch("/api/sessions");
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    snapshot = await res.json();
+    const [sessionsRes, providersRes] = await Promise.all([
+      fetch("/api/sessions"),
+      fetch("/api/providers"),
+    ]);
+    if (!sessionsRes.ok) throw new Error(`sessions HTTP ${sessionsRes.status}`);
+    if (!providersRes.ok) throw new Error(`providers HTTP ${providersRes.status}`);
+    snapshot = await sessionsRes.json();
+    state.providers = await providersRes.json();
   } catch (err) {
     const bar = document.createElement("div");
     bar.className = "banner";
@@ -246,7 +252,7 @@ function mountSession(id, model, contextWindow, size) {
     abandonButton: node.querySelector(".abandon"),
     slugEl: node.querySelector(".session-slug"),
     usageChipEl: node.querySelector(".usage-chip"),
-    modelChipEl: node.querySelector(".model-chip"),
+    modelSelectEl: node.querySelector(".model-select"),
     eventSource: null,
     accumulator: null,
     streamingEl: null,
@@ -272,6 +278,7 @@ function mountSession(id, model, contextWindow, size) {
   sess.cancelButton.addEventListener("click", () => cancelTurn(sess));
   sess.mergeButton.addEventListener("click", () => mergeSession(sess));
   sess.abandonButton.addEventListener("click", () => abandonSession(sess));
+  sess.modelSelectEl.addEventListener("change", () => changeModel(sess));
   // Track the last pane that received focus — the window title follows it.
   node.addEventListener("focusin", () => setFocusedSession(id));
 
@@ -403,9 +410,57 @@ function renderUsage(sess, usage) {
 }
 
 function renderModel(sess) {
-  const chip = sess.modelChipEl;
-  if (!chip) return;
-  chip.textContent = sess.model || "";
+  const select = sess.modelSelectEl;
+  if (!select) return;
+  select.replaceChildren();
+  const providers = state.providers?.providers || [];
+  for (const provider of providers) {
+    const group = document.createElement("optgroup");
+    group.label = provider.name;
+    for (const model of provider.models || []) {
+      const option = document.createElement("option");
+      option.value = model.id;
+      option.textContent = model.name || model.id;
+      option.disabled = !model.wired;
+      option.dataset.contextIn = String(model.context_in || 0);
+      group.appendChild(option);
+    }
+    select.appendChild(group);
+  }
+  select.value = sess.model || "";
+  select.disabled = sess.ended || providers.length === 0;
+}
+
+async function changeModel(sess) {
+  const select = sess.modelSelectEl;
+  const previous = sess.model;
+  const next = select.value;
+  if (!next || next === previous) return;
+  select.disabled = true;
+  try {
+    const res = await fetch(`/api/sessions/${sess.id}/model`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ model: next }),
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const snapshot = await res.json();
+    const summary = (snapshot.sessions || []).find((s) => s.session_id === sess.id);
+    sess.model = summary?.model || next;
+    sess.contextWindow = summary?.context_window || selectedContextWindow(select);
+    renderUsage(sess, { prompt_tokens: 0 });
+  } catch (err) {
+    select.value = previous || "";
+    showBanner(sess, `model update failed: ${err}`);
+  } finally {
+    renderModel(sess);
+  }
+}
+
+function selectedContextWindow(select) {
+  const selected = select.selectedOptions && select.selectedOptions[0];
+  const value = selected ? Number(selected.dataset.contextIn || "0") : 0;
+  return Number.isFinite(value) ? value : 0;
 }
 
 function renderInlineApproval(sess, request) {

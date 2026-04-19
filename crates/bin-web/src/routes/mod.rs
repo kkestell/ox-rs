@@ -16,7 +16,7 @@ use axum::Router;
 use axum::extract::DefaultBodyLimit;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post, put};
+use axum::routing::{get, patch, post, put};
 
 use crate::lifecycle::MergeRejection;
 use crate::sse;
@@ -57,6 +57,8 @@ pub fn router(state: AppState) -> Router {
             "/api/sessions",
             get(sessions::list_sessions).post(sessions::create_session),
         )
+        .route("/api/providers", get(sessions::get_providers))
+        .route("/api/sessions/{id}/model", patch(sessions::patch_model))
         .route("/api/sessions/{id}/merge", post(sessions::merge_session))
         .route(
             "/api/sessions/{id}/abandon",
@@ -159,7 +161,7 @@ mod tests {
     use crate::state::AppState;
     use crate::test_support::{
         AgentHandles, DuplexSpawner, empty_layout, test_catalog, test_lifecycle,
-        test_lifecycle_for_workspace, unique_temp_dir,
+        test_lifecycle_for_workspace, test_providers, unique_temp_dir,
     };
 
     use super::*;
@@ -214,8 +216,7 @@ mod tests {
         let spawn_config = AgentSpawnConfig {
             binary: std::path::PathBuf::from("/nonexistent/ox-agent"),
             workspace_root: workspace_root.clone(),
-            model: "routes/test".into(),
-            sessions_dir: std::path::PathBuf::from("/nonexistent/sessions"),
+            sessions_dir: store.dir().to_path_buf(),
             resume: None,
             session_id: None,
             env: vec![],
@@ -230,6 +231,7 @@ mod tests {
             empty_layout().await,
             workspace_root.clone(),
             test_catalog(),
+            "routes/test".into(),
             close_sink,
             std::sync::Arc::new(agent_host::fake::NoopFirstTurnSink),
         );
@@ -253,6 +255,7 @@ mod tests {
         let app = router(AppState {
             registry: registry.clone(),
             lifecycle,
+            providers: test_providers(),
         });
         Harness {
             app,
@@ -322,6 +325,7 @@ mod tests {
     async fn list_sessions_returns_empty_snapshot_on_fresh_registry() {
         let (app, _reg, _rx) = make_app().await;
         let resp = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .method("GET")
@@ -355,6 +359,7 @@ mod tests {
         let (_status, id, _handles) = create_via_router(app.clone(), &mut harness.rx).await;
 
         let resp = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .uri("/api/sessions")
@@ -373,6 +378,129 @@ mod tests {
             Some(u64::from(crate::test_support::TEST_CONTEXT_WINDOW)),
         );
         assert_eq!(sessions[0]["model"].as_str(), Some("routes/test"));
+    }
+
+    #[tokio::test]
+    async fn get_providers_marks_only_openrouter_models_wired() {
+        let (app, _reg, _rx) = make_app().await;
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/providers")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: serde_json::Value =
+            serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
+        let providers = body["providers"].as_array().unwrap();
+        let openrouter = providers.iter().find(|p| p["id"] == "openrouter").unwrap();
+        assert!(
+            openrouter["models"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|m| m["wired"] == true)
+        );
+        let ollama = providers.iter().find(|p| p["id"] == "ollama").unwrap();
+        assert!(
+            ollama["models"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|m| m["wired"] == false)
+        );
+    }
+
+    #[tokio::test]
+    async fn patch_model_updates_snapshot_and_persisted_session() {
+        let mut harness = make_harness().await;
+        let app = harness.app.clone();
+        let (_status, id, mut handles) = create_via_router(app.clone(), &mut harness.rx).await;
+
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PATCH")
+                    .uri(format!("/api/sessions/{id}/model"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"model":"routes/alt"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: serde_json::Value =
+            serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
+        let session = body["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["session_id"].as_str() == Some(&id.to_string()))
+            .unwrap();
+        assert_eq!(session["model"], "routes/alt");
+        assert_eq!(session["context_window"].as_u64(), Some(12_345));
+
+        let saved = harness
+            .store
+            .try_load(id)
+            .await
+            .unwrap()
+            .expect("session persisted");
+        assert_eq!(saved.model, "routes/alt");
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/sessions/{id}/messages"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"input":"hello"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        match timeout(Duration::from_secs(2), handles.next_command())
+            .await
+            .expect("command timeout")
+        {
+            Some(AgentCommand::SendMessage { model, .. }) => assert_eq!(model, "routes/alt"),
+            other => panic!("expected SendMessage, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn patch_model_rejects_unknown_and_unwired_models() {
+        let mut harness = make_harness().await;
+        let app = harness.app.clone();
+        let (_status, id, _handles) = create_via_router(app.clone(), &mut harness.rx).await;
+
+        for (model, reason) in [
+            ("missing/model", "unknown_model"),
+            ("llama3.2", "unwired_model"),
+        ] {
+            let resp = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("PATCH")
+                        .uri(format!("/api/sessions/{id}/model"))
+                        .header("content-type", "application/json")
+                        .body(Body::from(format!(r#"{{"model":"{model}"}}"#)))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+            let body: serde_json::Value =
+                serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes())
+                    .unwrap();
+            assert_eq!(body["reason"], reason);
+        }
     }
 
     // -- POST /api/sessions -----------------------------------------------
@@ -431,7 +559,6 @@ mod tests {
         let spawn_config = AgentSpawnConfig {
             binary: std::path::PathBuf::from("/nonexistent/ox-agent"),
             workspace_root: workspace_root.clone(),
-            model: "totally/unknown-model".into(),
             sessions_dir: std::path::PathBuf::from("/nonexistent/sessions"),
             resume: None,
             session_id: None,
@@ -443,6 +570,7 @@ mod tests {
             empty_layout().await,
             workspace_root.clone(),
             test_catalog(),
+            "totally/unknown-model".into(),
             std::sync::Arc::new(agent_host::fake::NoopCloseRequestSink),
             std::sync::Arc::new(agent_host::fake::NoopFirstTurnSink),
         );
@@ -470,7 +598,6 @@ mod tests {
         let spawn_config = AgentSpawnConfig {
             binary: std::path::PathBuf::from("/nonexistent/ox-agent"),
             workspace_root: workspace_root.clone(),
-            model: "routes/test".into(),
             sessions_dir: std::path::PathBuf::from("/nonexistent/sessions"),
             resume: None,
             session_id: None,
@@ -482,6 +609,7 @@ mod tests {
             empty_layout().await,
             workspace_root,
             test_catalog(),
+            "routes/test".into(),
             std::sync::Arc::new(agent_host::fake::NoopCloseRequestSink),
             std::sync::Arc::new(agent_host::fake::NoopFirstTurnSink),
         );
@@ -489,6 +617,7 @@ mod tests {
         let app = router(AppState {
             registry,
             lifecycle,
+            providers: test_providers(),
         });
         let resp = app
             .oneshot(
@@ -558,7 +687,7 @@ mod tests {
             .await
             .expect("next_command timeout");
         match cmd {
-            Some(AgentCommand::SendMessage { input }) => assert_eq!(input, "hello"),
+            Some(AgentCommand::SendMessage { input, .. }) => assert_eq!(input, "hello"),
             other => panic!("expected SendMessage, got {other:?}"),
         }
     }
@@ -937,7 +1066,7 @@ mod tests {
             .await
             .expect("send after rejected merge timed out")
         {
-            Some(AgentCommand::SendMessage { input }) => assert_eq!(input, "still open"),
+            Some(AgentCommand::SendMessage { input, .. }) => assert_eq!(input, "still open"),
             other => panic!("expected SendMessage after rejected merge, got {other:?}"),
         }
     }
@@ -1584,7 +1713,6 @@ mod tests {
         let spawn_config = AgentSpawnConfig {
             binary: std::path::PathBuf::from("/nonexistent/ox-agent"),
             workspace_root: workspace_root.clone(),
-            model: "routes/test".into(),
             sessions_dir: std::path::PathBuf::from("/nonexistent/sessions"),
             resume: None,
             session_id: None,
@@ -1596,12 +1724,14 @@ mod tests {
             std::sync::Arc::new(FailingLayoutRepository),
             workspace_root,
             test_catalog(),
+            "routes/test".into(),
             std::sync::Arc::new(agent_host::fake::NoopCloseRequestSink),
             std::sync::Arc::new(agent_host::fake::NoopFirstTurnSink),
         );
         let app = router(AppState {
             registry,
             lifecycle: test_lifecycle(),
+            providers: test_providers(),
         });
 
         let body = serde_json::json!({

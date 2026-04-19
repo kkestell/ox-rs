@@ -55,11 +55,6 @@ impl SessionRegistry {
         };
         let sessions = self.sessions.read().expect("sessions lock poisoned");
         let default_model = self.default_model();
-        // Every session today uses `spawn_config.model`; resolving once
-        // here is equivalent to resolving per session and saves a
-        // catalog lookup per entry. If per-session models arrive later,
-        // this switches to per-session resolution without changing the
-        // wire payload.
         let context_window = self.catalog().context_window(default_model).unwrap_or(0);
 
         // Present sessions in layout order first, then append any
@@ -70,21 +65,22 @@ impl SessionRegistry {
         let mut seen = std::collections::HashSet::new();
         for id in &layout.order {
             if let Some(session) = sessions.get(id) {
-                let _ = session; // Summary doesn't need session-level state today.
+                let model = session.model();
                 ordered.push(SessionSummary {
                     session_id: *id,
-                    model: default_model.to_owned(),
-                    context_window,
+                    context_window: self.catalog().context_window(&model).unwrap_or(0),
+                    model,
                 });
                 seen.insert(*id);
             }
         }
-        for id in sessions.keys() {
+        for (id, session) in sessions.iter() {
             if !seen.contains(id) {
+                let model = session.model();
                 ordered.push(SessionSummary {
                     session_id: *id,
-                    model: default_model.to_owned(),
-                    context_window,
+                    context_window: self.catalog().context_window(&model).unwrap_or(0),
+                    model,
                 });
             }
         }

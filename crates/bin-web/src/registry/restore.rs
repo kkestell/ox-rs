@@ -33,6 +33,7 @@ impl SessionRegistry {
         layout: Arc<dyn LayoutRepository>,
         workspace_root: PathBuf,
         catalog: Arc<dyn ModelCatalog>,
+        default_model: String,
         close_sink: Arc<dyn CloseRequestSink>,
         first_turn_sink: Arc<dyn FirstTurnSink>,
         session_store: Arc<dyn SessionStore>,
@@ -43,6 +44,7 @@ impl SessionRegistry {
             layout,
             workspace_root.clone(),
             catalog,
+            default_model,
             close_sink,
             first_turn_sink,
         );

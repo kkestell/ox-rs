@@ -137,7 +137,7 @@ where
         };
 
         match cmd {
-            AgentCommand::SendMessage { input } => {
+            AgentCommand::SendMessage { input, model } => {
                 // Scoped so the pinned turn future (which borrows `writer`)
                 // is dropped before we write the terminal frame below.
                 let result = {
@@ -151,6 +151,7 @@ where
                             workspace_root: &workspace_root,
                             session_id,
                             input: &input,
+                            model: &model,
                             initialized,
                             cancel: cancel_clone,
                             approvals: approvals_for_turn,
@@ -367,6 +368,7 @@ mod tests {
             &mut cmd_tx,
             &AgentCommand::SendMessage {
                 input: "hello".into(),
+                model: "test/model".into(),
             },
         )
         .await
@@ -402,6 +404,7 @@ mod tests {
             id,
             PathBuf::from("/test/workspace"),
             PathBuf::from("/test/workspace"),
+            "test/model".into(),
         );
         seeded.push_message(Message::user("old 1"));
         seeded.push_message(Message::user("old 2"));
@@ -471,7 +474,10 @@ mod tests {
         let _ = expect_ready(&mut evt_rx).await;
         write_frame(
             &mut cmd_tx,
-            &AgentCommand::SendMessage { input: "hi".into() },
+            &AgentCommand::SendMessage {
+                input: "hi".into(),
+                model: "test/model".into(),
+            },
         )
         .await
         .unwrap();
@@ -509,6 +515,7 @@ mod tests {
             &mut cmd_tx,
             &AgentCommand::SendMessage {
                 input: "hello".into(),
+                model: "test/model".into(),
             },
         )
         .await
@@ -558,7 +565,10 @@ mod tests {
         // Now send a valid command — the loop should still be responsive.
         write_frame(
             &mut cmd_tx,
-            &AgentCommand::SendMessage { input: "go".into() },
+            &AgentCommand::SendMessage {
+                input: "go".into(),
+                model: "test/model".into(),
+            },
         )
         .await
         .unwrap();
@@ -594,7 +604,10 @@ mod tests {
         let _ = expect_ready(&mut evt_rx).await;
         write_frame(
             &mut cmd_tx,
-            &AgentCommand::SendMessage { input: "hi".into() },
+            &AgentCommand::SendMessage {
+                input: "hi".into(),
+                model: "test/model".into(),
+            },
         )
         .await
         .unwrap();
@@ -655,6 +668,7 @@ mod tests {
             &mut cmd_tx,
             &AgentCommand::SendMessage {
                 input: "one".into(),
+                model: "test/model".into(),
             },
         )
         .await
@@ -663,6 +677,7 @@ mod tests {
             &mut cmd_tx,
             &AgentCommand::SendMessage {
                 input: "two".into(),
+                model: "test/model".into(),
             },
         )
         .await
@@ -720,7 +735,10 @@ mod tests {
         let _ = expect_ready(&mut evt_rx).await;
         write_frame(
             &mut cmd_tx,
-            &AgentCommand::SendMessage { input: "hi".into() },
+            &AgentCommand::SendMessage {
+                input: "hi".into(),
+                model: "test/model".into(),
+            },
         )
         .await
         .unwrap();
@@ -763,6 +781,7 @@ mod tests {
             &mut cmd_tx,
             &AgentCommand::SendMessage {
                 input: "hello".into(),
+                model: "test/model".into(),
             },
         )
         .await
@@ -880,6 +899,7 @@ mod tests {
             &mut cmd_tx,
             &AgentCommand::SendMessage {
                 input: "hello".into(),
+                model: "test/model".into(),
             },
         )
         .await
@@ -968,6 +988,7 @@ mod tests {
             &mut cmd_tx,
             &AgentCommand::SendMessage {
                 input: "one".into(),
+                model: "test/model".into(),
             },
         )
         .await
@@ -981,6 +1002,7 @@ mod tests {
             &mut cmd_tx,
             &AgentCommand::SendMessage {
                 input: "two".into(),
+                model: "test/model".into(),
             },
         )
         .await
@@ -1022,6 +1044,7 @@ mod tests {
             &mut cmd_tx,
             &AgentCommand::SendMessage {
                 input: "please merge".into(),
+                model: "test/model".into(),
             },
         )
         .await
@@ -1117,6 +1140,7 @@ mod tests {
             &mut cmd_tx,
             &AgentCommand::SendMessage {
                 input: "do something risky".into(),
+                model: "test/model".into(),
             },
         )
         .await
@@ -1213,7 +1237,10 @@ mod tests {
 
         write_frame(
             &mut cmd_tx,
-            &AgentCommand::SendMessage { input: "go".into() },
+            &AgentCommand::SendMessage {
+                input: "go".into(),
+                model: "test/model".into(),
+            },
         )
         .await
         .unwrap();
@@ -1255,7 +1282,10 @@ mod tests {
 
         write_frame(
             &mut cmd_tx,
-            &AgentCommand::SendMessage { input: "hi".into() },
+            &AgentCommand::SendMessage {
+                input: "hi".into(),
+                model: "test/model".into(),
+            },
         )
         .await
         .unwrap();

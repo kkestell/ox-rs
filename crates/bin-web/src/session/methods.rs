@@ -30,6 +30,7 @@ impl ActiveSession {
         close_sink: Arc<dyn CloseRequestSink>,
         first_turn_sink: Arc<dyn FirstTurnSink>,
         fresh: bool,
+        model: String,
     ) -> Arc<Self> {
         let (tx, _) = broadcast::channel(BROADCAST_CAPACITY);
         let history = Arc::new(Mutex::new(Vec::new()));
@@ -70,6 +71,7 @@ impl ActiveSession {
                 pump: Mutex::new(pump),
                 close_sink,
                 first_turn_sink,
+                model: Mutex::new(model),
             }
         })
     }
@@ -160,7 +162,18 @@ impl ActiveSession {
     /// Place a `SendMessage` command on the agent's stdin, guarded by
     /// [`begin_send`] so a second concurrent send while a turn is in
     /// flight returns `AlreadyTurning` without touching the wire.
-    pub fn send_message(&self, input: String) -> SendOutcome {
+    pub fn model(&self) -> String {
+        self.model
+            .lock()
+            .expect("session model mutex poisoned")
+            .clone()
+    }
+
+    pub fn set_model(&self, model: String) {
+        *self.model.lock().expect("session model mutex poisoned") = model;
+    }
+
+    pub fn send_message(&self, input: String, model: String) -> SendOutcome {
         if !self.is_alive() {
             return SendOutcome::Dead;
         }
@@ -174,7 +187,7 @@ impl ActiveSession {
         }
         let send_result = {
             let agent = self.agent.lock().expect("session agent mutex poisoned");
-            agent.send(AgentCommand::SendMessage { input })
+            agent.send(AgentCommand::SendMessage { input, model })
         };
         if send_result.is_err() {
             // Writer task dropped — roll back the `waiting` flag so a

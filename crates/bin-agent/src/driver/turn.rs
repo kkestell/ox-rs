@@ -16,6 +16,7 @@ pub(super) struct TurnRun<'a> {
     pub(super) workspace_root: &'a std::path::Path,
     pub(super) session_id: SessionId,
     pub(super) input: &'a str,
+    pub(super) model: &'a str,
     pub(super) initialized: bool,
     pub(super) cancel: CancelToken,
     pub(super) approvals: Arc<ApprovalBroker>,
@@ -77,8 +78,9 @@ where
         };
         if turn.initialized {
             runner
-                .resume_with_approver(
+                .resume_with_model_and_approver(
                     turn.session_id,
+                    turn.model,
                     turn.input,
                     turn.cancel,
                     turn.approvals.as_ref(),
@@ -87,9 +89,10 @@ where
                 .await
         } else {
             runner
-                .start_with_approver(
+                .start_with_model_and_approver(
                     turn.session_id,
                     workspace,
+                    turn.model,
                     turn.input,
                     turn.cancel,
                     turn.approvals.as_ref(),

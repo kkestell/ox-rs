@@ -49,15 +49,29 @@ pub struct Session {
     /// this path — never to `workspace_root`. On slug rename this path
     /// is updated to the new `ox/<slug>-<short-uuid>` directory.
     pub worktree_path: PathBuf,
+    /// Current LLM model id for this session. The host mutates this
+    /// independently of in-flight turns; the agent reads it per turn.
+    #[serde(default = "default_model")]
+    pub model: String,
     pub messages: Vec<Message>,
 }
 
+fn default_model() -> String {
+    "deepseek/deepseek-v3.2".to_owned()
+}
+
 impl Session {
-    pub fn new(id: SessionId, workspace_root: PathBuf, worktree_path: PathBuf) -> Self {
+    pub fn new(
+        id: SessionId,
+        workspace_root: PathBuf,
+        worktree_path: PathBuf,
+        model: String,
+    ) -> Self {
         Self {
             id,
             workspace_root,
             worktree_path,
+            model,
             messages: Vec::new(),
         }
     }
@@ -90,10 +104,11 @@ mod tests {
         let id = SessionId::new_v4();
         let root = PathBuf::from("/tmp/project");
         let worktree = PathBuf::from("/tmp/project/.ox/worktrees/ox/abcdef");
-        let session = Session::new(id, root.clone(), worktree.clone());
+        let session = Session::new(id, root.clone(), worktree.clone(), "test/model".into());
         assert_eq!(session.id, id);
         assert_eq!(session.workspace_root, root);
         assert_eq!(session.worktree_path, worktree);
+        assert_eq!(session.model, "test/model");
         assert!(session.messages.is_empty());
     }
 
@@ -107,7 +122,7 @@ mod tests {
         let id = SessionId::new_v4();
         let root = PathBuf::from("/tmp/ws");
         let worktree = PathBuf::from("/tmp/ws/.ox/wt");
-        let mut session = Session::new(id, root, worktree);
+        let mut session = Session::new(id, root, worktree, "test/model".into());
         session.push_message(Message::user("hi"));
         session.push_message(Message {
             role: Role::Assistant,
@@ -141,5 +156,19 @@ mod tests {
             })
         );
         assert_eq!(back.messages[2].usage, None);
+        assert_eq!(back.model, "test/model");
+    }
+
+    #[test]
+    fn session_missing_model_uses_default() {
+        let id = SessionId::new_v4();
+        let json = serde_json::json!({
+            "id": id,
+            "workspace_root": "/tmp/ws",
+            "worktree_path": "/tmp/ws/wt",
+            "messages": []
+        });
+        let back: Session = serde_json::from_value(json).unwrap();
+        assert_eq!(back.model, "deepseek/deepseek-v3.2");
     }
 }

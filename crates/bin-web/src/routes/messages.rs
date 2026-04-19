@@ -26,7 +26,13 @@ pub(super) async fn post_message(
     }
     match state
         .registry
-        .send_command(id, AgentCommand::SendMessage { input: body.input })
+        .send_command(
+            id,
+            AgentCommand::SendMessage {
+                input: body.input,
+                model: String::new(),
+            },
+        )
         .await
     {
         CommandDispatch::Ok => StatusCode::NO_CONTENT.into_response(),

@@ -23,7 +23,11 @@ use agent_host::{
     fake::{FakeGit, FakeSlugGenerator, NoopCloseRequestSink, NoopFirstTurnSink},
 };
 use anyhow::{Result, anyhow};
-use app::{ModelCatalog, fake::FakeModelCatalog};
+use app::{
+    ModelCatalog,
+    config::{Model, Provider, ProviderType, ProvidersConfig},
+    fake::FakeModelCatalog,
+};
 use domain::SessionId;
 use protocol::{AgentCommand, AgentEvent, read_frame, write_frame};
 use tokio::io::{BufReader, DuplexStream, duplex};
@@ -48,8 +52,50 @@ pub fn test_catalog() -> Arc<dyn ModelCatalog> {
     Arc::new(
         FakeModelCatalog::new()
             .with("test/model", TEST_CONTEXT_WINDOW)
-            .with("routes/test", TEST_CONTEXT_WINDOW),
+            .with("routes/test", TEST_CONTEXT_WINDOW)
+            .with("routes/alt", 12_345),
     )
+}
+
+pub fn test_providers() -> Arc<ProvidersConfig> {
+    Arc::new(ProvidersConfig {
+        providers: vec![
+            Provider {
+                id: "openrouter".into(),
+                name: "OpenRouter".into(),
+                provider_type: ProviderType::OpenRouter,
+                base_url: Some("https://openrouter.ai/api/v1".into()),
+                models: vec![
+                    Model {
+                        id: "test/model".into(),
+                        name: "Test Model".into(),
+                        context_in: TEST_CONTEXT_WINDOW,
+                    },
+                    Model {
+                        id: "routes/test".into(),
+                        name: "Routes Test".into(),
+                        context_in: TEST_CONTEXT_WINDOW,
+                    },
+                    Model {
+                        id: "routes/alt".into(),
+                        name: "Routes Alt".into(),
+                        context_in: 12345,
+                    },
+                ],
+            },
+            Provider {
+                id: "ollama".into(),
+                name: "Ollama".into(),
+                provider_type: ProviderType::Ollama,
+                base_url: Some("http://127.0.0.1:11434".into()),
+                models: vec![Model {
+                    id: "llama3.2".into(),
+                    name: "Llama 3.2".into(),
+                    context_in: 131072,
+                }],
+            },
+        ],
+    })
 }
 
 /// Handles the test side holds after a spawn: the bytes headed to the
@@ -150,7 +196,6 @@ pub async fn test_registry(
     let spawn_config = AgentSpawnConfig {
         binary: PathBuf::from("/nonexistent/ox-agent"),
         workspace_root: workspace_root.clone(),
-        model: "test/model".into(),
         sessions_dir: PathBuf::from("/nonexistent/sessions"),
         resume: None,
         session_id: None,
@@ -162,6 +207,7 @@ pub async fn test_registry(
         layout,
         workspace_root.clone(),
         test_catalog(),
+        "test/model".into(),
         Arc::new(NoopCloseRequestSink),
         Arc::new(NoopFirstTurnSink),
     );

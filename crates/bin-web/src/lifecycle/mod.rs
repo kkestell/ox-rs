@@ -195,7 +195,12 @@ impl SessionLifecycle {
             .spawn_for_worktree(worktree_path.clone(), session_id, None)
             .await?;
 
-        let session = Session::new(id, self.workspace.workspace_root.clone(), worktree_path);
+        let session = Session::new(
+            id,
+            self.workspace.workspace_root.clone(),
+            worktree_path,
+            registry.default_model().to_owned(),
+        );
         self.session_store
             .save(&session)
             .await

@@ -17,8 +17,6 @@ impl AgentSpawner for ProcessSpawner {
         let mut cmd = Command::new(&config.binary);
         cmd.arg("--workspace-root")
             .arg(&config.workspace_root)
-            .arg("--model")
-            .arg(&config.model)
             .arg("--sessions-dir")
             .arg(&config.sessions_dir);
         if let Some(id) = config.resume {

@@ -25,8 +25,6 @@ pub struct AgentSpawnConfig {
     pub binary: PathBuf,
     /// Workspace root passed to the agent on the command line.
     pub workspace_root: PathBuf,
-    /// OpenRouter model ID.
-    pub model: String,
     /// Sessions directory the agent reads/writes.
     pub sessions_dir: PathBuf,
     /// Optional session to resume. `None` starts a fresh session.
@@ -257,11 +255,13 @@ mod tests {
         client
             .send(AgentCommand::SendMessage {
                 input: "first".into(),
+                model: "test/one".into(),
             })
             .unwrap();
         client
             .send(AgentCommand::SendMessage {
                 input: "second".into(),
+                model: "test/two".into(),
             })
             .unwrap();
 
@@ -269,11 +269,17 @@ mod tests {
         let f1: Option<AgentCommand> = read_frame(&mut reader).await.unwrap();
         let f2: Option<AgentCommand> = read_frame(&mut reader).await.unwrap();
         match f1.unwrap() {
-            AgentCommand::SendMessage { input } => assert_eq!(input, "first"),
+            AgentCommand::SendMessage { input, model } => {
+                assert_eq!(input, "first");
+                assert_eq!(model, "test/one");
+            }
             other => panic!("unexpected {other:?}"),
         }
         match f2.unwrap() {
-            AgentCommand::SendMessage { input } => assert_eq!(input, "second"),
+            AgentCommand::SendMessage { input, model } => {
+                assert_eq!(input, "second");
+                assert_eq!(model, "test/two");
+            }
             other => panic!("unexpected {other:?}"),
         }
 
@@ -334,7 +340,10 @@ mod tests {
         // Subsequent sends will break the pipe. Send a handful to force the
         // failure.
         for _ in 0..10 {
-            let _ = client.send(AgentCommand::SendMessage { input: "hi".into() });
+            let _ = client.send(AgentCommand::SendMessage {
+                input: "hi".into(),
+                model: "test/model".into(),
+            });
         }
 
         // Eventually an Error frame arrives on the event stream.

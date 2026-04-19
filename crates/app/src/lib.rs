@@ -1,5 +1,6 @@
 pub mod approval;
 pub mod cancel;
+pub mod config;
 pub mod lifecycle;
 mod ports;
 pub mod tools;
