@@ -1,0 +1,84 @@
+direction: down
+
+start: {
+  label: "User creates session"
+  shape: oval
+}
+
+create_branch: {
+  label: "Create git branch\nox/<slug>-<short-uuid>"
+  shape: rectangle
+}
+
+create_worktree: {
+  label: "Create worktree\n~/.ox/workspaces/<slug>/worktrees/<short-uuid>/"
+  shape: rectangle
+}
+
+spawn_agent: {
+  label: "Spawn ox-agent subprocess\n--workspace-root → worktree"
+  shape: rectangle
+}
+
+working: {
+  label: "Agent working\n(tools operate on worktree)"
+  shape: rectangle
+}
+
+decision: {
+  label: "Session complete"
+  shape: diamond
+}
+
+merge: {
+  label: "Merge\nPOST /api/sessions/{id}/merge"
+  shape: rectangle
+}
+
+abandon: {
+  label: "Abandon\nPOST /api/sessions/{id}/abandon"
+  shape: rectangle
+}
+
+merge_branch: {
+  label: "Merge session branch → base branch"
+  shape: rectangle
+}
+
+cleanup_merge: {
+  label: "Remove worktree\nDelete branch\nDelete session JSON"
+  shape: rectangle
+}
+
+cleanup_abandon: {
+  label: "Remove worktree\nDelete branch\nDelete session JSON\n(no merge)"
+  shape: rectangle
+}
+
+conflict: {
+  label: "Conflict / dirty worktree\n409 response"
+  shape: rectangle
+}
+
+end_merge: {
+  label: "Done"
+  shape: oval
+}
+
+end_abandon: {
+  label: "Done"
+  shape: oval
+}
+
+start -> create_branch -> create_worktree -> spawn_agent -> working
+working -> decision
+
+decision -> merge: user chooses merge
+decision -> abandon: user chooses abandon
+
+merge -> merge_branch -> cleanup_merge -> end_merge
+
+abandon -> cleanup_abandon -> end_abandon
+
+merge_branch -> conflict: merge conflict\nor dirty base
+conflict -> decision: "retry after\nresolution"

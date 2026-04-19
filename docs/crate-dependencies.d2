@@ -1,0 +1,117 @@
+direction: down
+
+core: {
+  label: "Core"
+  direction: right
+
+  domain: {
+    label: domain
+    shape: rectangle
+  }
+  protocol: {
+    label: protocol
+    shape: rectangle
+  }
+}
+
+framework: {
+  label: "Framework"
+  direction: right
+
+  app: {
+    label: app
+    shape: rectangle
+  }
+  agent_host: {
+    label: agent-host
+    shape: rectangle
+  }
+}
+
+adapters: {
+  label: "Adapters"
+  direction: right
+
+  app_only: {
+    label: "app adapters"
+    direction: down
+
+    adapter_fs: {
+      label: adapter-fs
+      shape: rectangle
+    }
+    adapter_secrets: {
+      label: adapter-secrets
+      shape: rectangle
+    }
+  }
+
+  shared: {
+    label: "shared adapters"
+    direction: down
+
+    adapter_llm: {
+      label: adapter-llm
+      shape: rectangle
+    }
+    adapter_storage: {
+      label: adapter-storage
+      shape: rectangle
+    }
+  }
+
+  host_only: {
+    label: "host adapters"
+    direction: down
+
+    adapter_git: {
+      label: adapter-git
+      shape: rectangle
+    }
+    adapter_process: {
+      label: adapter-process
+      shape: rectangle
+    }
+  }
+}
+
+binaries: {
+  label: "Binaries"
+  direction: right
+
+  bin_agent: {
+    label: "bin-agent (ox-agent)"
+    shape: rectangle
+  }
+  bin_web: {
+    label: "bin-web (ox)"
+    shape: rectangle
+  }
+}
+
+core.domain -> core.protocol
+core.domain -> framework.app
+core.protocol -> framework.app
+core.domain -> framework.agent_host
+core.protocol -> framework.agent_host
+
+framework.app -> adapters.app_only.adapter_fs
+framework.app -> adapters.app_only.adapter_secrets
+
+framework.app -> adapters.shared.adapter_llm
+framework.agent_host -> adapters.shared.adapter_llm
+framework.app -> adapters.shared.adapter_storage
+framework.agent_host -> adapters.shared.adapter_storage
+
+framework.agent_host -> adapters.host_only.adapter_git
+framework.agent_host -> adapters.host_only.adapter_process
+
+adapters.app_only.adapter_fs -> binaries.bin_agent
+adapters.app_only.adapter_secrets -> binaries.bin_agent
+adapters.shared.adapter_llm -> binaries.bin_agent
+adapters.shared.adapter_storage -> binaries.bin_agent
+
+adapters.shared.adapter_llm -> binaries.bin_web
+adapters.shared.adapter_storage -> binaries.bin_web
+adapters.host_only.adapter_git -> binaries.bin_web
+adapters.host_only.adapter_process -> binaries.bin_web

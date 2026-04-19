@@ -1,0 +1,27 @@
+shape: sequence_diagram
+
+browser: Browser
+axum: Axum route handler
+pump: Session pump
+runtime: SessionRuntime
+client: AgentClient
+driver: "agent_driver (bin-agent)"
+runner: SessionRunner
+llm: LlmProvider
+tools: Tools
+
+browser -> axum: "POST /api/sessions/{id}/messages"
+axum -> pump: enqueue user message
+pump -> runtime: "ShouldSend::Yes"
+runtime -> client: "write_frame(AgentCommand::Send)"
+client -> driver: "NDJSON on stdin"
+driver -> runner: drive turn
+runner -> llm: streaming chat completion
+llm -> runner: stream events
+runner -> tools: tool calls
+tools -> runner: tool results
+runner -> driver: "TurnOutcome"
+driver -> client: "AgentEvent frames on stdout"
+client -> pump: "AgentEventStream"
+pump -> axum: forward to broadcast channel
+axum -> browser: "SSE: AgentEvent stream"

@@ -1,0 +1,34 @@
+browser: Browser {
+  shape: rectangle
+}
+web_host: "ox (bin-web)" {
+  shape: hexagon
+}
+agent: "ox-agent subprocess" {
+  shape: rectangle
+}
+fs: "Session worktree\n(git branch + filesystem)" {
+  shape: cylinder
+}
+llm: "LLM provider\n(OpenRouter)" {
+  shape: cloud
+}
+
+browser <-> web_host: "HTTP JSON commands\nSSE event stream" {
+  style.stroke-dash: 3
+}
+web_host <-> agent: "NDJSON frames\n(tokio stdin/stdout pipes)" {
+  style.stroke-dash: 3
+}
+agent <-> llm: "Streaming chat\n(HTTP SSE)" {
+  style.stroke-dash: 3
+}
+agent -> fs: "Read/write/edit files\nGlob, grep, bash" {
+  style.stroke-dash: 0
+}
+
+note: "One agent subprocess per session.\nEach runs in its own git worktree\nunder ~/.ox/workspaces/." {
+  shape: page
+}
+
+agent -- note

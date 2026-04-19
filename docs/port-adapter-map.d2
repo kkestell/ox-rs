@@ -1,0 +1,188 @@
+direction: right
+
+ports: {
+  label: "Port traits"
+  direction: down
+
+  LlmProvider: {
+    label: LlmProvider
+    shape: rectangle
+  }
+  ModelCatalog: {
+    label: ModelCatalog
+    shape: rectangle
+  }
+  SlugGenerator: {
+    label: "SlugGenerator"
+    shape: rectangle
+  }
+  SessionStore: {
+    label: SessionStore
+    shape: rectangle
+  }
+  LayoutRepository: {
+    label: "LayoutRepository"
+    shape: rectangle
+  }
+  FileSystem: {
+    label: FileSystem
+    shape: rectangle
+  }
+  Shell: {
+    label: Shell
+    shape: rectangle
+  }
+  SecretStore: {
+    label: SecretStore
+    shape: rectangle
+  }
+  Git: {
+    label: Git
+    shape: rectangle
+  }
+  AgentSpawner: {
+    label: AgentSpawner
+    shape: rectangle
+  }
+  ToolApprover: {
+    label: ToolApprover
+    shape: rectangle
+  }
+  Tool: {
+    label: Tool
+    shape: rectangle
+  }
+  CloseRequestSink: {
+    label: CloseRequestSink
+    shape: rectangle
+  }
+  FirstTurnSink: {
+    label: FirstTurnSink
+    shape: rectangle
+  }
+}
+
+impls: {
+  label: "Implementations"
+  direction: down
+
+  adapter_llm: {
+    label: adapter-llm
+    OpenRouterProvider: {
+      label: OpenRouterProvider
+      shape: rectangle
+    }
+    OllamaProvider: {
+      label: "OllamaProvider (stub)"
+      shape: rectangle
+    }
+    ProvidersCatalog: {
+      label: ProvidersCatalog
+      shape: rectangle
+    }
+    OpenRouterSlugGenerator: {
+      label: OpenRouterSlugGenerator
+      shape: rectangle
+    }
+  }
+
+  adapter_storage: {
+    label: adapter-storage
+    DiskSessionStore: {
+      label: DiskSessionStore
+      shape: rectangle
+    }
+    DiskLayoutRepository: {
+      label: DiskLayoutRepository
+      shape: rectangle
+    }
+  }
+
+  adapter_fs: {
+    label: adapter-fs
+    LocalFileSystem: {
+      label: LocalFileSystem
+      shape: rectangle
+    }
+    BashShell: {
+      label: BashShell
+      shape: rectangle
+    }
+  }
+
+  adapter_secrets: {
+    label: adapter-secrets
+    EnvSecretStore: {
+      label: EnvSecretStore
+      shape: rectangle
+    }
+  }
+
+  adapter_git: {
+    label: adapter-git
+    CliGit: {
+      label: CliGit
+      shape: rectangle
+    }
+  }
+
+  adapter_process: {
+    label: adapter-process
+    ProcessSpawner: {
+      label: ProcessSpawner
+      shape: rectangle
+    }
+  }
+
+  bin_agent: {
+    label: bin-agent
+    ApprovalBroker: {
+      label: ApprovalBroker
+      shape: rectangle
+    }
+  }
+
+  app_tools: {
+    label: app
+    BuiltInTools: {
+      label: "9 built-in tools"
+      shape: rectangle
+    }
+  }
+
+  bin_web: {
+    label: bin-web
+    ChannelCloseSink: {
+      label: ChannelCloseSink
+      shape: rectangle
+    }
+    ChannelFirstTurnSink: {
+      label: ChannelFirstTurnSink
+      shape: rectangle
+    }
+  }
+}
+
+ports.LlmProvider -> impls.adapter_llm.OpenRouterProvider
+ports.LlmProvider -> impls.adapter_llm.OllamaProvider
+ports.ModelCatalog -> impls.adapter_llm.ProvidersCatalog
+ports.SlugGenerator -> impls.adapter_llm.OpenRouterSlugGenerator
+
+ports.SessionStore -> impls.adapter_storage.DiskSessionStore
+ports.LayoutRepository -> impls.adapter_storage.DiskLayoutRepository
+
+ports.FileSystem -> impls.adapter_fs.LocalFileSystem
+ports.Shell -> impls.adapter_fs.BashShell
+
+ports.SecretStore -> impls.adapter_secrets.EnvSecretStore
+
+ports.Git -> impls.adapter_git.CliGit
+
+ports.AgentSpawner -> impls.adapter_process.ProcessSpawner
+
+ports.ToolApprover -> impls.bin_agent.ApprovalBroker
+
+ports.Tool -> impls.app_tools.BuiltInTools
+
+ports.CloseRequestSink -> impls.bin_web.ChannelCloseSink
+ports.FirstTurnSink -> impls.bin_web.ChannelFirstTurnSink
