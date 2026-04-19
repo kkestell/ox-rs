@@ -5,7 +5,7 @@
 //! persistence type, the [`SessionRuntime`] state machine, and the
 //! [`AgentSpawner`] trait that lets tests substitute an in-memory
 //! subprocess. The crate is framework-agnostic: nothing here knows
-//! about GTK, axum, or HTTP.
+//! about axum or HTTP.
 
 mod client;
 mod close_request_sink;

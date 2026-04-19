@@ -8,7 +8,7 @@
 //!
 //! The module deliberately has no dependency on the UI framework or the
 //! transport — it is plain Rust data and transition methods. Frontend
-//! code (GTK previously, axum today) forwards events through
+//! code (the web host) forwards events through
 //! `apply_event` and makes its own rendering decisions from the snapshot.
 
 use domain::{Message, SessionId, StreamAccumulator};
@@ -140,8 +140,7 @@ impl SessionRuntime {
 
 #[cfg(test)]
 mod tests {
-    //! State-machine tests, originally ported from the deleted
-    //! `agent_host::split::tests`. No UI framework; runs headless.
+    //! State-machine tests. No UI framework; runs headless.
 
     use std::path::PathBuf;
 

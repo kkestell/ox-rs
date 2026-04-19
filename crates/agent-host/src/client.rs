@@ -215,8 +215,8 @@ mod tests {
         (client, stream, agent_writer, agent_reader)
     }
 
-    /// Await the next event with a timeout. Replaces the old `try_recv`
-    /// polling loop now that the receiver is an async `AgentEventStream`.
+    /// Await the next event with a timeout. The receiver is an async
+    /// `AgentEventStream`, so we can `.recv()` directly.
     async fn recv_event(stream: &mut AgentEventStream, timeout: Duration) -> Option<AgentEvent> {
         tokio::time::timeout(timeout, stream.recv())
             .await

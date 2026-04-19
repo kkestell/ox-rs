@@ -7,8 +7,8 @@
 //!
 //! No `focused` field: focus is pure client-side UI state (the browser
 //! doesn't need the server to remember which tab it last clicked on).
-//! Files written by the deleted GTK app carrying `focused` round-trip
-//! cleanly — unknown fields are ignored by serde.
+//! Files carrying an unknown `focused` field round-trip cleanly —
+//! unknown fields are ignored by serde.
 
 use std::future::Future;
 use std::path::Path;

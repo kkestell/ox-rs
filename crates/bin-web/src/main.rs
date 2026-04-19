@@ -53,8 +53,7 @@ use crate::routes::router;
 use crate::startup::assert_workspace_ready;
 use crate::state::AppState;
 
-/// Default OpenRouter model for new sessions. Matches the default the
-/// deleted GTK binary used — keeps existing user flows working.
+/// Default OpenRouter model for new sessions.
 const DEFAULT_MODEL: &str = "anthropic/claude-sonnet-4.5";
 
 /// Default port for the local HTTP server.
