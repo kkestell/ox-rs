@@ -163,9 +163,13 @@ pub fn unique_temp_dir(label: &str) -> PathBuf {
 
 /// Empty layout repository pointed at a scratch JSON path. Used when a
 /// test doesn't care about pre-existing layout state.
-pub fn empty_layout() -> Arc<dyn LayoutRepository> {
+pub async fn empty_layout() -> Arc<dyn LayoutRepository> {
     let path = unique_temp_dir("layout").join("workspaces.json");
-    Arc::new(DiskLayoutRepository::load(path).expect("empty layout repository"))
+    Arc::new(
+        DiskLayoutRepository::load(path)
+            .await
+            .expect("empty layout repository"),
+    )
 }
 
 /// Build a [`SessionLifecycle`] whose workspace root matches the

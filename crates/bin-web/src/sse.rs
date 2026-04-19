@@ -129,7 +129,7 @@ mod tests {
         let registry = SessionRegistry::new(
             spawner,
             spawn_config,
-            empty_layout(),
+            empty_layout().await,
             workspace_root.clone(),
             std::sync::Arc::new(agent_host::fake::NoopCloseRequestSink),
             std::sync::Arc::new(agent_host::fake::NoopFirstTurnSink),

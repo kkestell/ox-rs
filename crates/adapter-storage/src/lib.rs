@@ -2,12 +2,12 @@ use std::collections::BTreeMap;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::sync::Mutex;
 
 use agent_host::{Layout, LayoutRepository, normalize_sizes};
 use anyhow::{Context, Result};
 use domain::{Session, SessionId, SessionSummary};
 use serde::{Deserialize, Serialize};
+use tokio::sync::Mutex;
 
 /// File-backed layout repository keyed by workspace root.
 #[derive(Debug)]
@@ -27,15 +27,21 @@ impl DiskLayoutRepository {
     /// Load layouts from `path`. A missing file starts empty; malformed JSON
     /// is returned as an error so the composition root can decide whether to
     /// move the file aside and continue.
-    pub fn load(path: PathBuf) -> Result<Self> {
-        if !path.exists() {
-            return Ok(Self {
-                path,
-                data: Mutex::new(LayoutFile::default()),
-            });
-        }
-        let text = std::fs::read_to_string(&path)
-            .with_context(|| format!("reading workspace layout file {}", path.display()))?;
+    pub async fn load(path: PathBuf) -> Result<Self> {
+        let text = match tokio::fs::read_to_string(&path).await {
+            Ok(text) => text,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(Self {
+                    path,
+                    data: Mutex::new(LayoutFile::default()),
+                });
+            }
+            Err(err) => {
+                return Err(err).with_context(|| {
+                    format!("reading workspace layout file {}", path.display())
+                });
+            }
+        };
         let data: LayoutFile = serde_json::from_str(&text)
             .with_context(|| format!("parsing workspace layout file {}", path.display()))?;
         Ok(Self {
@@ -48,39 +54,59 @@ impl DiskLayoutRepository {
         &self.path
     }
 
-    fn persist(&self, data: &LayoutFile) -> Result<()> {
+    async fn persist(&self, data: &LayoutFile) -> Result<()> {
         if let Some(parent) = self.path.parent() {
-            std::fs::create_dir_all(parent).with_context(|| {
+            tokio::fs::create_dir_all(parent).await.with_context(|| {
                 format!("creating workspace layout directory {}", parent.display())
             })?;
         }
         let tmp_path = tmp_path_for(&self.path);
         let text = serde_json::to_string_pretty(data).context("serializing workspace layouts")?;
-        std::fs::write(&tmp_path, text)
+        tokio::fs::write(&tmp_path, text)
+            .await
             .with_context(|| format!("writing workspace layout file {}", tmp_path.display()))?;
-        std::fs::rename(&tmp_path, &self.path).with_context(|| {
-            format!(
-                "replacing workspace layout file {} with {}",
-                self.path.display(),
-                tmp_path.display()
-            )
-        })?;
+        tokio::fs::rename(&tmp_path, &self.path)
+            .await
+            .with_context(|| {
+                format!(
+                    "replacing workspace layout file {} with {}",
+                    self.path.display(),
+                    tmp_path.display()
+                )
+            })?;
         Ok(())
     }
 }
 
 impl LayoutRepository for DiskLayoutRepository {
-    fn get(&self, workspace_root: &Path) -> Result<Option<Layout>> {
-        let data = self.data.lock().expect("layout repository mutex poisoned");
-        Ok(data.workspaces.get(&workspace_key(workspace_root)).cloned())
+    fn get<'a>(
+        &'a self,
+        workspace_root: &'a Path,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<Layout>>> + Send + 'a>> {
+        Box::pin(async move {
+            let data = self.data.lock().await;
+            Ok(data.workspaces.get(&workspace_key(workspace_root)).cloned())
+        })
     }
 
-    fn put(&self, workspace_root: &Path, mut layout: Layout) -> Result<()> {
-        normalize_sizes(&mut layout.sizes, layout.order.len());
-        let mut data = self.data.lock().expect("layout repository mutex poisoned");
-        data.workspaces
-            .insert(workspace_key(workspace_root), layout);
-        self.persist(&data)
+    fn put<'a>(
+        &'a self,
+        workspace_root: &'a Path,
+        mut layout: Layout,
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
+        Box::pin(async move {
+            normalize_sizes(&mut layout.sizes, layout.order.len());
+            // Update the in-memory cache and clone a consistent snapshot
+            // under the lock, then release the lock *before* touching disk
+            // so the fs call never straddles the critical section.
+            let snapshot = {
+                let mut data = self.data.lock().await;
+                data.workspaces
+                    .insert(workspace_key(workspace_root), layout);
+                data.clone()
+            };
+            self.persist(&snapshot).await
+        })
     }
 }
 
@@ -471,58 +497,61 @@ mod tests {
         assert!(err.to_string().contains("deserialize"), "{err}");
     }
 
-    #[test]
-    fn layout_load_missing_file_returns_empty_store() {
+    #[tokio::test]
+    async fn layout_load_missing_file_returns_empty_store() {
         let (path, tmp) = temp_layout_path("missing");
-        let repo = DiskLayoutRepository::load(path).unwrap();
-        assert!(repo.get(tmp.path()).unwrap().is_none());
+        let repo = DiskLayoutRepository::load(path).await.unwrap();
+        assert!(repo.get(tmp.path()).await.unwrap().is_none());
     }
 
-    #[test]
-    fn layout_put_and_get_round_trip_via_memory() {
+    #[tokio::test]
+    async fn layout_put_and_get_round_trip_via_memory() {
         let (path, tmp) = temp_layout_path("roundtrip");
-        let repo = DiskLayoutRepository::load(path).unwrap();
+        let repo = DiskLayoutRepository::load(path).await.unwrap();
         let id = SessionId::new_v4();
         repo.put(tmp.path(), Layout::new(vec![id], vec![1.0]))
+            .await
             .unwrap();
-        let got = repo.get(tmp.path()).unwrap().unwrap();
+        let got = repo.get(tmp.path()).await.unwrap().unwrap();
         assert_eq!(got.order, vec![id]);
         assert_eq!(got.sizes, vec![1.0]);
     }
 
-    #[test]
-    fn layout_put_persists_to_disk_and_reloads() {
+    #[tokio::test]
+    async fn layout_put_persists_to_disk_and_reloads() {
         let (path, tmp) = temp_layout_path("persist");
         let workspace = tmp.path().join("workspace");
         std::fs::create_dir_all(&workspace).unwrap();
         let id = SessionId::new_v4();
 
         {
-            let repo = DiskLayoutRepository::load(path.clone()).unwrap();
+            let repo = DiskLayoutRepository::load(path.clone()).await.unwrap();
             repo.put(&workspace, Layout::new(vec![id], vec![1.0]))
+                .await
                 .unwrap();
         }
 
-        let reloaded = DiskLayoutRepository::load(path).unwrap();
-        let got = reloaded.get(&workspace).unwrap().unwrap();
+        let reloaded = DiskLayoutRepository::load(path).await.unwrap();
+        let got = reloaded.get(&workspace).await.unwrap().unwrap();
         assert_eq!(got.order, vec![id]);
         assert_eq!(got.sizes, vec![1.0]);
     }
 
-    #[test]
-    fn layout_put_normalizes_bad_sizes() {
+    #[tokio::test]
+    async fn layout_put_normalizes_bad_sizes() {
         let (path, tmp) = temp_layout_path("normalize");
-        let repo = DiskLayoutRepository::load(path).unwrap();
+        let repo = DiskLayoutRepository::load(path).await.unwrap();
         let id1 = SessionId::new_v4();
         let id2 = SessionId::new_v4();
         repo.put(tmp.path(), Layout::new(vec![id1, id2], vec![-1.0, 2.0]))
+            .await
             .unwrap();
-        let got = repo.get(tmp.path()).unwrap().unwrap();
+        let got = repo.get(tmp.path()).await.unwrap().unwrap();
         assert_eq!(got.sizes, vec![0.5, 0.5]);
     }
 
-    #[test]
-    fn layout_load_tolerates_extra_fields_from_older_schemas() {
+    #[tokio::test]
+    async fn layout_load_tolerates_extra_fields_from_older_schemas() {
         let (path, tmp) = temp_layout_path("legacy");
         let workspace = tmp.path().join("workspace");
         std::fs::create_dir_all(&workspace).unwrap();
@@ -542,32 +571,34 @@ mod tests {
         );
         std::fs::write(&path, legacy).unwrap();
 
-        let repo = DiskLayoutRepository::load(path).unwrap();
-        let got = repo.get(&workspace).unwrap().unwrap();
+        let repo = DiskLayoutRepository::load(path).await.unwrap();
+        let got = repo.get(&workspace).await.unwrap().unwrap();
         assert_eq!(got.order, vec![id]);
         assert_eq!(got.sizes, vec![1.0]);
     }
 
-    #[test]
-    fn layout_load_corrupt_file_returns_err() {
+    #[tokio::test]
+    async fn layout_load_corrupt_file_returns_err() {
         let (path, _tmp) = temp_layout_path("corrupt");
         std::fs::write(&path, "not json at all").unwrap();
-        let err = DiskLayoutRepository::load(path).unwrap_err();
+        let err = DiskLayoutRepository::load(path).await.unwrap_err();
         let s = format!("{err:#}");
         assert!(s.contains("parsing workspace layout"), "{s}");
     }
 
-    #[test]
-    fn layout_put_overwrites_existing_entry() {
+    #[tokio::test]
+    async fn layout_put_overwrites_existing_entry() {
         let (path, tmp) = temp_layout_path("overwrite");
-        let repo = DiskLayoutRepository::load(path).unwrap();
+        let repo = DiskLayoutRepository::load(path).await.unwrap();
         let id1 = SessionId::new_v4();
         let id2 = SessionId::new_v4();
         repo.put(tmp.path(), Layout::new(vec![id1], vec![1.0]))
+            .await
             .unwrap();
         repo.put(tmp.path(), Layout::new(vec![id2], vec![1.0]))
+            .await
             .unwrap();
-        let got = repo.get(tmp.path()).unwrap().unwrap();
+        let got = repo.get(tmp.path()).await.unwrap().unwrap();
         assert_eq!(got.order, vec![id2]);
     }
 }

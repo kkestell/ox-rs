@@ -10,7 +10,9 @@
 //! Files written by the deleted GTK app carrying `focused` round-trip
 //! cleanly — unknown fields are ignored by serde.
 
+use std::future::Future;
 use std::path::Path;
+use std::pin::Pin;
 
 use anyhow::Result;
 use domain::SessionId;
@@ -41,8 +43,15 @@ impl Layout {
 /// Persistence port for workspace layouts. Implementations return owned
 /// values so callers are not coupled to cache lifetimes or lock guards.
 pub trait LayoutRepository: Send + Sync + 'static {
-    fn get(&self, workspace_root: &Path) -> Result<Option<Layout>>;
-    fn put(&self, workspace_root: &Path, layout: Layout) -> Result<()>;
+    fn get<'a>(
+        &'a self,
+        workspace_root: &'a Path,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<Layout>>> + Send + 'a>>;
+    fn put<'a>(
+        &'a self,
+        workspace_root: &'a Path,
+        layout: Layout,
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>>;
 }
 
 /// Normalize `sizes` in place so it has `len` non-negative entries that

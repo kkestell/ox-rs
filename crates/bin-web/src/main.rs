@@ -144,7 +144,7 @@ async fn run(cli: Cli) -> Result<()> {
     let layout_path = ox_dir.join("workspaces.json");
 
     let layout: Arc<dyn LayoutRepository> =
-        Arc::new(match DiskLayoutRepository::load(layout_path.clone()) {
+        Arc::new(match DiskLayoutRepository::load(layout_path.clone()).await {
             Ok(l) => l,
             Err(err) => {
                 // A corrupt layout file should not prevent the server from
@@ -159,6 +159,7 @@ async fn run(cli: Cli) -> Result<()> {
                 );
                 let _ = std::fs::rename(&layout_path, &bak);
                 DiskLayoutRepository::load(layout_path.clone())
+                    .await
                     .context("reloading layout after corrupt-file fallback")?
             }
         });
@@ -260,7 +261,7 @@ async fn run(cli: Cli) -> Result<()> {
     // handlers already persist on every change, so this is only
     // relevant when the server has run entirely idle since the last
     // mutation — but it's cheap insurance against a missed write.
-    if let Err(err) = registry.persist_current_layout() {
+    if let Err(err) = registry.persist_current_layout().await {
         eprintln!("ox: failed to persist layout on shutdown: {err:#}");
     }
 

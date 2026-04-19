@@ -85,7 +85,7 @@ async fn styles_css() -> Response {
 // -- /api/sessions -----------------------------------------------------------
 
 async fn list_sessions(State(state): State<AppState>) -> Response {
-    let snapshot = state.registry.snapshot();
+    let snapshot = state.registry.snapshot().await;
     Json(snapshot).into_response()
 }
 
@@ -298,7 +298,7 @@ struct LayoutBody {
 
 async fn put_layout(State(state): State<AppState>, Json(body): Json<LayoutBody>) -> Response {
     let layout = agent_host::Layout::new(body.order, body.sizes);
-    match state.registry.put_layout(layout) {
+    match state.registry.put_layout(layout).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(err) => {
             eprintln!("ox: put_layout failed: {err:#}");
@@ -386,7 +386,7 @@ mod tests {
         let registry = SessionRegistry::new(
             spawner,
             spawn_config,
-            empty_layout(),
+            empty_layout().await,
             workspace_root.clone(),
             close_sink,
             std::sync::Arc::new(agent_host::fake::NoopFirstTurnSink),
@@ -545,7 +545,7 @@ mod tests {
         let registry = SessionRegistry::new(
             spawner,
             spawn_config,
-            empty_layout(),
+            empty_layout().await,
             workspace_root,
             std::sync::Arc::new(agent_host::fake::NoopCloseRequestSink),
             std::sync::Arc::new(agent_host::fake::NoopFirstTurnSink),
@@ -1597,7 +1597,7 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::NO_CONTENT);
 
-        let snap = registry.snapshot();
+        let snap = registry.snapshot().await;
         assert_eq!(snap.layout.order, vec![second, first]);
         assert!((snap.layout.sizes[0] - 0.25).abs() < 1e-5);
         assert!((snap.layout.sizes[1] - 0.75).abs() < 1e-5);
@@ -1627,7 +1627,7 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::NO_CONTENT);
 
         // Only the known session survives the filter.
-        let stored = registry.snapshot().layout;
+        let stored = registry.snapshot().await.layout;
         assert_eq!(stored.order, vec![known]);
     }
 
@@ -1774,7 +1774,7 @@ mod tests {
 
         // A third session arrives; it lands in the "extras" tail.
         let (_, third, _h3) = create_via_router(app, &mut rx).await;
-        let snap = registry.snapshot();
+        let snap = registry.snapshot().await;
         let order: Vec<SessionId> = snap.sessions.iter().map(|s| s.session_id).collect();
         assert_eq!(order, vec![second, first, third]);
     }

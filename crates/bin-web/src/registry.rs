@@ -139,14 +139,12 @@ impl SessionRegistry {
             first_turn_sink,
         );
 
-        let saved_order: Vec<SessionId> = {
-            match registry.layout.get(&workspace_root) {
-                Ok(Some(layout)) => layout.order,
-                Ok(None) => Vec::new(),
-                Err(err) => {
-                    eprintln!("ox: failed to load saved layout for restore: {err:#}");
-                    Vec::new()
-                }
+        let saved_order: Vec<SessionId> = match registry.layout.get(&workspace_root).await {
+            Ok(Some(layout)) => layout.order,
+            Ok(None) => Vec::new(),
+            Err(err) => {
+                eprintln!("ox: failed to load saved layout for restore: {err:#}");
+                Vec::new()
             }
         };
 
@@ -242,9 +240,8 @@ impl SessionRegistry {
     }
 
     /// Snapshot for `GET /api/sessions`.
-    pub fn snapshot(&self) -> SnapshotJson {
-        let sessions = self.sessions.read().expect("sessions lock poisoned");
-        let layout = match self.layout.get(&self.workspace_root) {
+    pub async fn snapshot(&self) -> SnapshotJson {
+        let layout = match self.layout.get(&self.workspace_root).await {
             Ok(Some(layout)) => layout,
             Ok(None) => Layout::default(),
             Err(err) => {
@@ -252,6 +249,7 @@ impl SessionRegistry {
                 Layout::default()
             }
         };
+        let sessions = self.sessions.read().expect("sessions lock poisoned");
 
         // Present sessions in layout order first, then append any
         // live sessions that aren't referenced by the layout (e.g.,
@@ -288,7 +286,7 @@ impl SessionRegistry {
     /// Persist a client-authored layout. Unknown session ids are
     /// filtered out (the client can race the server on remove);
     /// [`LayoutRepository::put`] normalizes sizes.
-    pub fn put_layout(&self, mut layout: Layout) -> Result<()> {
+    pub async fn put_layout(&self, mut layout: Layout) -> Result<()> {
         {
             let sessions = self.sessions.read().expect("sessions lock poisoned");
             // Filter order by known ids, preserving sizes by index.
@@ -308,13 +306,13 @@ impl SessionRegistry {
             layout.sizes = new_sizes;
         }
 
-        self.layout.put(&self.workspace_root, layout)
+        self.layout.put(&self.workspace_root, layout).await
     }
 
     /// Persist the current registry state as a one-row layout with
     /// equal sizes. Used on graceful shutdown when the server wants
     /// to make sure a restart can find the current set of sessions.
-    pub fn persist_current_layout(&self) -> Result<()> {
+    pub async fn persist_current_layout(&self) -> Result<()> {
         let ids: Vec<SessionId> = {
             let sessions = self.sessions.read().expect("sessions lock poisoned");
             sessions.keys().copied().collect()
@@ -324,7 +322,7 @@ impl SessionRegistry {
         }
         let n = ids.len();
         let layout = Layout::new(ids, vec![1.0 / n as f32; n]);
-        self.layout.put(&self.workspace_root, layout)
+        self.layout.put(&self.workspace_root, layout).await
     }
 
     /// Dispatch a command to a session by id. Maps `SendOutcome`
@@ -530,18 +528,18 @@ mod tests {
 
     #[tokio::test]
     async fn spawn_awaits_ready_then_registers_session() {
-        let (registry, mut rx, _ws) = test_registry(empty_layout()).await;
+        let (registry, mut rx, _ws) = test_registry(empty_layout().await).await;
         let (id, _handles) = create_session(registry.clone(), &mut rx).await;
 
         // Snapshot must now include the session in the order/sessions list.
-        let snap = registry.snapshot();
+        let snap = registry.snapshot().await;
         assert!(snap.sessions.iter().any(|s| s.session_id == id));
         assert!(registry.get(id).is_some());
     }
 
     #[tokio::test]
     async fn spawn_returns_error_if_agent_exits_before_ready() {
-        let (registry, mut rx, _ws) = test_registry(empty_layout()).await;
+        let (registry, mut rx, _ws) = test_registry(empty_layout().await).await;
         let id = SessionId::new_v4();
         let worktree = registry.workspace_root().to_path_buf();
         let create = tokio::spawn({
@@ -567,7 +565,7 @@ mod tests {
 
     #[tokio::test]
     async fn remove_returns_true_once_then_false() {
-        let (registry, mut rx, _ws) = test_registry(empty_layout()).await;
+        let (registry, mut rx, _ws) = test_registry(empty_layout().await).await;
         let (id, _handles) = create_session(registry.clone(), &mut rx).await;
 
         assert!(registry.remove(id));
@@ -580,7 +578,7 @@ mod tests {
         // Removing the session drops its Arc, which drops the AgentClient,
         // which closes the stdin pipe. The test reads the duplex until
         // EOF to verify the close propagates.
-        let (registry, mut rx, _ws) = test_registry(empty_layout()).await;
+        let (registry, mut rx, _ws) = test_registry(empty_layout().await).await;
         let (id, mut handles) = create_session(registry.clone(), &mut rx).await;
 
         registry.remove(id);
@@ -597,16 +595,17 @@ mod tests {
 
     #[tokio::test]
     async fn snapshot_orders_sessions_by_layout_then_extras() {
-        let (registry, mut rx, ws) = test_registry(empty_layout()).await;
+        let (registry, mut rx, ws) = test_registry(empty_layout().await).await;
         let (first, _h1) = create_session(registry.clone(), &mut rx).await;
         let (second, _h2) = create_session(registry.clone(), &mut rx).await;
 
         // Persist a layout that inverts insertion order.
         registry
             .put_layout(Layout::new(vec![second, first], vec![0.3, 0.7]))
+            .await
             .expect("put_layout");
 
-        let snap = registry.snapshot();
+        let snap = registry.snapshot().await;
         assert_eq!(snap.workspace_root, ws);
         assert_eq!(
             snap.sessions
@@ -624,7 +623,7 @@ mod tests {
 
     #[tokio::test]
     async fn send_message_returns_not_found_for_unknown_id() {
-        let (registry, _rx, _ws) = test_registry(empty_layout()).await;
+        let (registry, _rx, _ws) = test_registry(empty_layout().await).await;
         let unknown = SessionId::new_v4();
         let outcome = registry
             .send_command(
@@ -640,7 +639,7 @@ mod tests {
         // Plan's "double-send guard" acceptance test: the second send
         // while a turn is in flight must return AlreadyTurning and must
         // not place a second SendMessage on the agent's stdin.
-        let (registry, mut rx, _ws) = test_registry(empty_layout()).await;
+        let (registry, mut rx, _ws) = test_registry(empty_layout().await).await;
         let (id, mut handles) = create_session(registry.clone(), &mut rx).await;
 
         let first = registry
@@ -685,7 +684,7 @@ mod tests {
 
     #[tokio::test]
     async fn send_message_returns_dead_after_agent_closes() {
-        let (registry, mut rx, _ws) = test_registry(empty_layout()).await;
+        let (registry, mut rx, _ws) = test_registry(empty_layout().await).await;
         let (id, handles) = create_session(registry.clone(), &mut rx).await;
 
         // Dropping the handles closes the agent side of the duplex. The
@@ -717,7 +716,7 @@ mod tests {
 
     #[tokio::test]
     async fn cancel_is_idempotent_even_on_dead_session() {
-        let (registry, mut rx, _ws) = test_registry(empty_layout()).await;
+        let (registry, mut rx, _ws) = test_registry(empty_layout().await).await;
         let (id, handles) = create_session(registry.clone(), &mut rx).await;
 
         // Two live cancels succeed, as does a cancel after the agent exits.
@@ -747,15 +746,16 @@ mod tests {
 
     #[tokio::test]
     async fn put_layout_drops_unknown_session_ids() {
-        let (registry, mut rx, _ws) = test_registry(empty_layout()).await;
+        let (registry, mut rx, _ws) = test_registry(empty_layout().await).await;
         let (known, _handles) = create_session(registry.clone(), &mut rx).await;
         let unknown = SessionId::new_v4();
 
         registry
             .put_layout(Layout::new(vec![unknown, known], vec![0.5, 0.5]))
+            .await
             .expect("put_layout");
 
-        let snap = registry.snapshot();
+        let snap = registry.snapshot().await;
         // The unknown id is filtered; the known id survives.
         assert_eq!(snap.layout.order, vec![known]);
     }
@@ -765,7 +765,7 @@ mod tests {
         // A PUT-then-reload cycle must round-trip order and (normalized)
         // sizes so a restart picks up the same pane tiling.
         let layout_path = unique_temp_dir("persist").join("workspaces.json");
-        let store = DiskLayoutRepository::load(layout_path.clone()).unwrap();
+        let store = DiskLayoutRepository::load(layout_path.clone()).await.unwrap();
         let workspace_root = unique_temp_dir("ws-persist");
         let (spawner, mut rx) = DuplexSpawner::new();
         let registry = SessionRegistry::new(
@@ -787,12 +787,14 @@ mod tests {
         let (id, _handles) = create_session(registry.clone(), &mut rx).await;
         registry
             .put_layout(Layout::new(vec![id], vec![1.0]))
+            .await
             .expect("put_layout");
 
         // Reload and confirm the file contains the expected entry.
-        let reloaded = DiskLayoutRepository::load(layout_path).unwrap();
+        let reloaded = DiskLayoutRepository::load(layout_path).await.unwrap();
         let got = reloaded
             .get(&workspace_root)
+            .await
             .expect("layout read")
             .expect("layout row");
         assert_eq!(got.order, vec![id]);
@@ -801,14 +803,15 @@ mod tests {
 
     #[tokio::test]
     async fn put_layout_normalizes_non_finite_sizes() {
-        let (registry, mut rx, _ws) = test_registry(empty_layout()).await;
+        let (registry, mut rx, _ws) = test_registry(empty_layout().await).await;
         let (a, _ha) = create_session(registry.clone(), &mut rx).await;
         let (b, _hb) = create_session(registry.clone(), &mut rx).await;
 
         registry
             .put_layout(Layout::new(vec![a, b], vec![f32::NAN, 0.5]))
+            .await
             .expect("put_layout");
-        let snap = registry.snapshot();
+        let snap = registry.snapshot().await;
         for s in &snap.layout.sizes {
             assert!(s.is_finite());
         }
@@ -843,13 +846,16 @@ mod tests {
         let workspace_root = unique_temp_dir("ws-restore-no-file");
         let stale_id = SessionId::new_v4();
         {
-            let store = DiskLayoutRepository::load(layout_path.clone()).unwrap();
+            let store = DiskLayoutRepository::load(layout_path.clone())
+                .await
+                .unwrap();
             store
                 .put(&workspace_root, Layout::new(vec![stale_id], vec![1.0]))
+                .await
                 .unwrap();
         }
 
-        let layout = DiskLayoutRepository::load(layout_path).unwrap();
+        let layout = DiskLayoutRepository::load(layout_path).await.unwrap();
         // Empty session store — no `{id}.json` exists for stale_id.
         let sessions_dir = unique_temp_dir("sessions-no-file");
         let session_store = Arc::new(DiskSessionStore::new(&sessions_dir).unwrap());
@@ -904,13 +910,16 @@ mod tests {
                 .unwrap();
         }
         {
-            let layout = DiskLayoutRepository::load(layout_path.clone()).unwrap();
+            let layout = DiskLayoutRepository::load(layout_path.clone())
+                .await
+                .unwrap();
             layout
                 .put(&workspace_root, Layout::new(vec![id], vec![1.0]))
+                .await
                 .unwrap();
         }
 
-        let layout = DiskLayoutRepository::load(layout_path).unwrap();
+        let layout = DiskLayoutRepository::load(layout_path).await.unwrap();
         let (spawner, mut rx) = DuplexSpawner::new();
         let spawn_config = AgentSpawnConfig {
             binary: PathBuf::from("/nonexistent/ox-agent"),
@@ -951,13 +960,16 @@ mod tests {
         let id = SessionId::new_v4();
         let worktree = seed_saved_session(&session_store, id, &workspace_root, "wt-happy").await;
         {
-            let layout = DiskLayoutRepository::load(layout_path.clone()).unwrap();
+            let layout = DiskLayoutRepository::load(layout_path.clone())
+                .await
+                .unwrap();
             layout
                 .put(&workspace_root, Layout::new(vec![id], vec![1.0]))
+                .await
                 .unwrap();
         }
 
-        let layout = DiskLayoutRepository::load(layout_path).unwrap();
+        let layout = DiskLayoutRepository::load(layout_path).await.unwrap();
         let (spawner, mut rx) = DuplexSpawner::new();
         let spawn_config = AgentSpawnConfig {
             binary: PathBuf::from("/nonexistent/ox-agent"),
@@ -1017,13 +1029,16 @@ mod tests {
         let _wt_a = seed_saved_session(&session_store, a, &workspace_root, "wt-fail-a").await;
         let _wt_b = seed_saved_session(&session_store, b, &workspace_root, "wt-fail-b").await;
         {
-            let layout = DiskLayoutRepository::load(layout_path.clone()).unwrap();
+            let layout = DiskLayoutRepository::load(layout_path.clone())
+                .await
+                .unwrap();
             layout
                 .put(&workspace_root, Layout::new(vec![a, b], vec![0.5, 0.5]))
+                .await
                 .unwrap();
         }
 
-        let layout = DiskLayoutRepository::load(layout_path).unwrap();
+        let layout = DiskLayoutRepository::load(layout_path).await.unwrap();
         let spawner = DuplexSpawner::failing();
         let spawn_config = AgentSpawnConfig {
             binary: PathBuf::from("/nonexistent/ox-agent"),
@@ -1054,7 +1069,7 @@ mod tests {
     #[tokio::test]
     async fn persist_current_layout_writes_equal_sizes() {
         let layout_path = unique_temp_dir("persist-current").join("workspaces.json");
-        let store = DiskLayoutRepository::load(layout_path.clone()).unwrap();
+        let store = DiskLayoutRepository::load(layout_path.clone()).await.unwrap();
         let workspace_root = unique_temp_dir("ws-persist-current");
         let (spawner, mut rx) = DuplexSpawner::new();
         let registry = SessionRegistry::new(
@@ -1078,11 +1093,13 @@ mod tests {
 
         registry
             .persist_current_layout()
+            .await
             .expect("persist_current_layout");
 
-        let reloaded = DiskLayoutRepository::load(layout_path).unwrap();
+        let reloaded = DiskLayoutRepository::load(layout_path).await.unwrap();
         let got = reloaded
             .get(&workspace_root)
+            .await
             .expect("layout read")
             .expect("row");
         assert_eq!(got.order.len(), 2);
@@ -1100,7 +1117,7 @@ mod tests {
         // checks that every subscriber sees every event emitted before
         // it subscribed (via the replay snapshot) plus every event
         // after (via the broadcast).
-        let (registry, mut rx, _ws) = test_registry(empty_layout()).await;
+        let (registry, mut rx, _ws) = test_registry(empty_layout().await).await;
         let (id, mut handles) = create_session(registry.clone(), &mut rx).await;
         let session = registry.get(id).expect("session");
 
