@@ -95,7 +95,7 @@ async fn create_session(State(state): State<AppState>) -> Response {
     // `create()` is still available for the `--resume` CLI path and
     // fallback tests, but user-initiated creation always goes through
     // the lifecycle from now on.
-    match state.lifecycle.create_and_spawn().await {
+    match state.lifecycle.create_and_spawn(&state.registry).await {
         Ok(session_id) => Json(CreatedSession { session_id }).into_response(),
         Err(err) => {
             eprintln!("ox: create_session failed: {err:#}");
@@ -123,7 +123,7 @@ async fn create_session(State(state): State<AppState>) -> Response {
 ///   server-side log carries details. The client has no useful action
 ///   beyond retrying.
 async fn merge_session(State(state): State<AppState>, Path(id): Path<SessionId>) -> Response {
-    match state.lifecycle.merge(id).await {
+    match state.lifecycle.merge(id, &state.registry).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(rej) => merge_rejection_response(rej, /* is_abandon */ false),
     }
@@ -153,7 +153,7 @@ async fn abandon_session(
     body: Option<Json<AbandonBody>>,
 ) -> Response {
     let AbandonBody { confirm } = body.map(|Json(b)| b).unwrap_or_default();
-    match state.lifecycle.abandon(id, confirm).await {
+    match state.lifecycle.abandon(id, confirm, &state.registry).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(rej) => merge_rejection_response(rej, /* is_abandon */ true),
     }
@@ -382,7 +382,11 @@ mod tests {
             session_id: None,
             env: vec![],
         };
-        let close_sink: std::sync::Arc<dyn agent_host::CloseRequestSink> = lifecycle.clone();
+        let (close_tx, mut close_rx) = tokio::sync::mpsc::unbounded_channel::<
+            crate::lifecycle::CloseRequestMsg,
+        >();
+        let close_sink: std::sync::Arc<dyn agent_host::CloseRequestSink> =
+            std::sync::Arc::new(crate::lifecycle::ChannelCloseSink::new(close_tx));
         let registry = SessionRegistry::new(
             spawner,
             spawn_config,
@@ -391,12 +395,23 @@ mod tests {
             close_sink,
             std::sync::Arc::new(agent_host::fake::NoopFirstTurnSink),
         );
-        // `POST /api/sessions` routes through the lifecycle coordinator,
-        // which needs its registry back-reference wired up before it can
-        // spawn anything. In production this happens in `bin-web::run`;
-        // here we mirror it after both halves are constructed so the
-        // test's HTTP requests exercise the real coordinator path.
-        lifecycle.set_registry(std::sync::Arc::downgrade(&registry));
+        // Production wiring: pump-driven `RequestClose` frames push onto
+        // the close channel; a consumer task drains them and dispatches
+        // to the lifecycle with a live registry handle. Tests mirror
+        // that so `RequestClose` flows exercise the real merge/abandon
+        // paths.
+        let consumer_lifecycle = lifecycle.clone();
+        let consumer_registry = std::sync::Arc::downgrade(&registry);
+        tokio::spawn(async move {
+            while let Some(msg) = close_rx.recv().await {
+                let Some(reg) = consumer_registry.upgrade() else {
+                    break;
+                };
+                consumer_lifecycle
+                    .handle_close_request(msg.id, msg.intent, &reg)
+                    .await;
+            }
+        });
         let app = router(AppState {
             registry: registry.clone(),
             lifecycle,
@@ -551,7 +566,6 @@ mod tests {
             std::sync::Arc::new(agent_host::fake::NoopFirstTurnSink),
         );
         let lifecycle = test_lifecycle();
-        lifecycle.set_registry(std::sync::Arc::downgrade(&registry));
         let app = router(AppState {
             registry,
             lifecycle,

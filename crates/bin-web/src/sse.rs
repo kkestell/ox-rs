@@ -135,7 +135,6 @@ mod tests {
             std::sync::Arc::new(agent_host::fake::NoopFirstTurnSink),
         );
         let lifecycle = test_lifecycle();
-        lifecycle.set_registry(std::sync::Arc::downgrade(&registry));
         let app = router(AppState {
             registry: registry.clone(),
             lifecycle,

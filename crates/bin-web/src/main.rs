@@ -45,7 +45,9 @@ use clap::Parser;
 use domain::SessionId;
 use tokio::net::TcpListener;
 
-use crate::lifecycle::SessionLifecycle;
+use crate::lifecycle::{
+    ChannelCloseSink, ChannelFirstTurnSink, CloseRequestMsg, FirstTurnMsg, SessionLifecycle,
+};
 use crate::registry::SessionRegistry;
 use crate::routes::router;
 use crate::startup::assert_workspace_ready;
@@ -176,13 +178,12 @@ async fn run(cli: Cli) -> Result<()> {
 
     let spawner = Arc::new(ProcessSpawner);
 
-    // Two-phase init to break the registry↔lifecycle cycle:
-    //
-    //   1. Build the lifecycle with its `Weak<SessionRegistry>` empty.
-    //   2. Build the registry, handing it `lifecycle` as its close sink.
-    //   3. Call `lifecycle.set_registry(..)` so the coordinator can
-    //      reach the registry through a weak-ref.
-    //
+    // Single-phase init: the registry holds channel-backed sinks, the
+    // lifecycle holds no back-reference to the registry, and two
+    // consumer tasks drain the channels and call lifecycle methods
+    // with a weak registry handle. The registry drops naturally on
+    // shutdown; the consumer tasks exit when their `Weak` upgrade
+    // fails or when every sender (one per session) has been dropped.
     let slug_generator: Arc<dyn SlugGenerator> =
         Arc::new(OpenRouterSlugGenerator::new(slug_api_key, slug_model));
     let session_store = Arc::new(
@@ -192,8 +193,12 @@ async fn run(cli: Cli) -> Result<()> {
     let session_store_dyn: Arc<dyn SessionStore> = session_store.clone();
     let lifecycle =
         SessionLifecycle::new(git, slug_generator, session_store_dyn.clone(), workspace_ctx);
-    let close_sink: Arc<dyn CloseRequestSink> = lifecycle.clone();
-    let first_turn_sink: Arc<dyn FirstTurnSink> = lifecycle.clone();
+
+    let (close_tx, close_rx) = tokio::sync::mpsc::unbounded_channel::<CloseRequestMsg>();
+    let (first_turn_tx, first_turn_rx) = tokio::sync::mpsc::unbounded_channel::<FirstTurnMsg>();
+    let close_sink: Arc<dyn CloseRequestSink> = Arc::new(ChannelCloseSink::new(close_tx));
+    let first_turn_sink: Arc<dyn FirstTurnSink> =
+        Arc::new(ChannelFirstTurnSink::new(first_turn_tx));
 
     let registry = if let Some(id) = cli.resume {
         // `--resume <id>` bypasses the saved layout and opens exactly
@@ -222,9 +227,8 @@ async fn run(cli: Cli) -> Result<()> {
         .await?
     };
 
-    // Phase 3: close the init cycle. After this, any lifecycle method
-    // that upgrades the weak-ref can reach the registry.
-    lifecycle.set_registry(Arc::downgrade(&registry));
+    spawn_close_consumer(close_rx, lifecycle.clone(), Arc::downgrade(&registry));
+    spawn_first_turn_consumer(first_turn_rx, lifecycle.clone(), Arc::downgrade(&registry));
 
     let state = AppState {
         registry: registry.clone(),
@@ -266,6 +270,46 @@ async fn run(cli: Cli) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Drain close-request messages and dispatch them to the lifecycle
+/// against a live registry. The task exits when the registry is
+/// dropped (weak-upgrade fails) or when every session-held sender has
+/// been dropped and the channel is closed.
+fn spawn_close_consumer(
+    mut rx: tokio::sync::mpsc::UnboundedReceiver<CloseRequestMsg>,
+    lifecycle: Arc<SessionLifecycle>,
+    registry: std::sync::Weak<SessionRegistry>,
+) {
+    tokio::spawn(async move {
+        while let Some(msg) = rx.recv().await {
+            let Some(reg) = registry.upgrade() else {
+                break;
+            };
+            lifecycle
+                .handle_close_request(msg.id, msg.intent, &reg)
+                .await;
+        }
+    });
+}
+
+/// Drain first-turn messages and dispatch them to the lifecycle's
+/// slug-rename hook. Exit conditions mirror the close consumer.
+fn spawn_first_turn_consumer(
+    mut rx: tokio::sync::mpsc::UnboundedReceiver<FirstTurnMsg>,
+    lifecycle: Arc<SessionLifecycle>,
+    registry: std::sync::Weak<SessionRegistry>,
+) {
+    tokio::spawn(async move {
+        while let Some(msg) = rx.recv().await {
+            let Some(reg) = registry.upgrade() else {
+                break;
+            };
+            lifecycle
+                .handle_first_turn(msg.id, msg.first_message, &reg)
+                .await;
+        }
+    });
 }
 
 /// Resolve the `ox-agent` binary by looking next to the current
