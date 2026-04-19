@@ -14,11 +14,12 @@ use anyhow::{Context, Result};
 use regex::Regex;
 use serde::Deserialize;
 
+use domain::ToolDef;
+
 use super::spill::{self, PREVIEW_LINES};
 use super::{Tool, display_path, require_non_empty, resolve_path};
 use crate::approval::{ApprovalRequirement, MissingPathPolicy, path_approval_requirement};
 use crate::ports::FileSystem;
-use crate::stream::ToolDef;
 
 /// Byte cap for walk_glob — generous because the file list is rarely the
 /// memory problem; the match accumulation is.

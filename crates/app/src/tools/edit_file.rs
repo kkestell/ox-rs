@@ -34,11 +34,12 @@ use std::sync::Arc;
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 
+use domain::ToolDef;
+
 use super::hashlines::{Anchor, parse_anchor, split_lines, verify_anchor};
 use super::{Tool, display_path, require_non_empty, resolve_path};
 use crate::approval::{ApprovalRequirement, MissingPathPolicy, path_approval_requirement};
 use crate::ports::FileSystem;
-use crate::stream::ToolDef;
 
 pub struct EditFileTool<F> {
     fs: Arc<F>,

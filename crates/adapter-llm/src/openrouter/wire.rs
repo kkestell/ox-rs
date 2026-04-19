@@ -1,6 +1,5 @@
 use anyhow::Result;
-use app::ToolDef;
-use domain::{ContentBlock, Message, Role};
+use domain::{ContentBlock, Message, Role, ToolDef};
 use serde::{Deserialize, Serialize};
 
 // ---------------------------------------------------------------------------

@@ -11,8 +11,7 @@
 //! code (GTK previously, axum today) forwards events through
 //! `apply_event` and makes its own rendering decisions from the snapshot.
 
-use app::StreamAccumulator;
-use domain::{Message, SessionId};
+use domain::{Message, SessionId, StreamAccumulator};
 use protocol::AgentEvent;
 
 #[derive(Default)]

@@ -29,7 +29,8 @@ use anyhow::{Context, Result};
 use domain::CloseIntent;
 use serde::Deserialize;
 
-use crate::stream::ToolDef;
+use domain::ToolDef;
+
 use crate::tools::Tool;
 
 /// A one-shot slot for the next close intent. Tools call `set`; the driver

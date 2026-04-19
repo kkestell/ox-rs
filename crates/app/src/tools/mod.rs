@@ -24,8 +24,9 @@ use std::sync::Arc;
 
 use anyhow::{Result, bail};
 
+use domain::ToolDef;
+
 use crate::approval::ApprovalRequirement;
-use crate::stream::ToolDef;
 
 pub mod bash;
 pub mod edit_file;

@@ -12,11 +12,12 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use serde::Deserialize;
 
+use domain::ToolDef;
+
 use super::spill::{self, PREVIEW_LINES};
 use super::{Tool, display_path, require_non_empty, resolve_path};
 use crate::approval::{ApprovalRequirement, MissingPathPolicy, path_approval_requirement};
 use crate::ports::FileSystem;
-use crate::stream::ToolDef;
 
 /// Byte cap for walk_glob to prevent unbounded memory consumption.
 const WALK_MAX_BYTES: usize = 10 * 1024 * 1024; // 10 MB

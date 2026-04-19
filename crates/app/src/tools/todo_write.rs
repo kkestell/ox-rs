@@ -16,9 +16,10 @@ use std::pin::Pin;
 use anyhow::{Context, Result};
 use serde::Deserialize;
 
+use domain::ToolDef;
+
 use super::Tool;
 use crate::approval::ApprovalRequirement;
-use crate::stream::ToolDef;
 
 /// Serde validator for the status enum. `rename_all = "snake_case"` matches
 /// the C# reference's wire format (`pending`, `in_progress`, `completed`);

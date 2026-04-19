@@ -14,10 +14,11 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use serde::Deserialize;
 
+use domain::ToolDef;
+
 use super::spill::{self, PREVIEW_LINES};
 use super::{Tool, require_non_empty};
 use crate::ports::{FileSystem, Shell};
-use crate::stream::ToolDef;
 
 const DEFAULT_TIMEOUT_MS: u64 = 120_000;
 

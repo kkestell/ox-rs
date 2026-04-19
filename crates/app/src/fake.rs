@@ -5,12 +5,11 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
-use domain::{Message, Session, SessionId, SessionSummary, StreamEvent, Usage};
+use domain::{Message, Session, SessionId, SessionSummary, StreamEvent, ToolDef, Usage};
 use futures::stream::{self, Stream};
 
 use crate::LlmProvider;
 use crate::ports::{CommandOutput, FileSystem, SessionStore};
-use crate::stream::ToolDef;
 use crate::tools::Tool;
 
 /// A queued response: a sequence of stream events (success), a connection-time
@@ -557,11 +556,10 @@ pub fn tool_registry_with(tools: Vec<Arc<dyn Tool>>) -> crate::tools::ToolRegist
 
 #[cfg(test)]
 mod tests {
-    use domain::{ContentBlock, Role};
+    use domain::{ContentBlock, Role, StreamAccumulator};
     use futures::StreamExt;
 
     use super::*;
-    use crate::stream::StreamAccumulator;
 
     #[tokio::test]
     async fn fake_emits_text_response() {

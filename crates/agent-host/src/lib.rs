@@ -6,10 +6,6 @@
 //! [`AgentSpawner`] trait that lets tests substitute an in-memory
 //! subprocess. The crate is framework-agnostic: nothing here knows
 //! about GTK, axum, or HTTP.
-//!
-//! `StreamAccumulator` is re-exported from `app` so consumers do not
-//! need to depend on the application layer just to assemble streamed
-//! deltas into a renderable message snapshot.
 
 mod client;
 mod close_request_sink;
@@ -24,7 +20,6 @@ mod slug_generator;
 mod spawner;
 mod workspace_context;
 
-pub use app::StreamAccumulator;
 pub use client::{AgentClient, AgentEventStream, AgentSpawnConfig};
 pub use close_request_sink::CloseRequestSink;
 pub use first_turn_sink::FirstTurnSink;

@@ -5,7 +5,7 @@ use anyhow::Result;
 use domain::{Message, Session, SessionId, SessionSummary, StreamEvent};
 use futures::stream::Stream;
 
-use crate::stream::ToolDef;
+use domain::ToolDef;
 
 // Driven (outbound) ports
 

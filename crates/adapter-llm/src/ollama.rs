@@ -1,8 +1,7 @@
 use std::pin::Pin;
 
 use anyhow::Result;
-use app::ToolDef;
-use domain::{Message, StreamEvent};
+use domain::{Message, StreamEvent, ToolDef};
 use futures::stream::Stream;
 
 pub struct OllamaProvider {

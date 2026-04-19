@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use std::collections::HashMap;
 
 use anyhow::{Result, bail};
-use domain::{Message, Session, SessionId, StreamEvent};
+use domain::{Message, Session, SessionId, StreamAccumulator, StreamEvent};
 use futures::StreamExt;
 
 use crate::approval::{
@@ -12,7 +12,6 @@ use crate::approval::{
 };
 use crate::cancel::CancelToken;
 use crate::ports::{LlmProvider, SessionStore};
-use crate::stream::StreamAccumulator;
 use crate::tools::{ToolRegistry, extract_tool_calls};
 
 /// Result of a completed turn — either it ran to natural completion or was
@@ -1325,8 +1324,8 @@ mod tests {
 
         struct PickyTool;
         impl Tool for PickyTool {
-            fn def(&self) -> crate::stream::ToolDef {
-                crate::stream::ToolDef {
+            fn def(&self) -> domain::ToolDef {
+                domain::ToolDef {
                     name: "picky".into(),
                     description: "always errors".into(),
                     parameters: serde_json::json!({"type": "object"}),
