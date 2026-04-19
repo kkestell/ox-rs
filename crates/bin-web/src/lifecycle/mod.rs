@@ -32,22 +32,24 @@
 //! response to lifecycle events.
 
 use std::collections::HashMap;
-use std::future::Future;
 use std::path::{Path, PathBuf};
-use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
 use agent_host::{
-    CloseRequestSink, FirstTurnSink, Git, MergeOutcome, SlugGenerator, WorkspaceContext,
-    WorktreeStatus, workspace_slug,
+    Git, MergeOutcome, SlugGenerator, WorkspaceContext, WorktreeStatus, workspace_slug,
 };
 use anyhow::{Context, Result};
 use app::SessionStore;
 use domain::{CloseIntent, Session, SessionId};
-use tokio::sync::mpsc;
 
 use crate::registry::SessionRegistry;
 use crate::session::CloseStart;
+
+mod close_guard;
+mod sinks;
+
+use close_guard::CloseGuard;
+pub use sinks::{ChannelCloseSink, ChannelFirstTurnSink, CloseRequestMsg, FirstTurnMsg};
 
 /// Per-session close-in-flight flag. The coordinator takes the lock
 /// for the whole merge / abandon / close-request flow; concurrent
@@ -612,43 +614,6 @@ impl SessionLifecycle {
     }
 }
 
-/// RAII release of the close lock entry. Removes the session's
-/// `CloseState::Closing` record when dropped so the next
-/// merge/abandon call on the same id isn't rejected.
-///
-/// The guard removes the entry on *any* drop — success or failure.
-/// That's correct: on success the session is also removed from the
-/// registry so the map entry has nothing to guard; on failure we want
-/// the lock released so the caller can retry.
-struct CloseGuard<'a> {
-    closing: &'a Mutex<HashMap<SessionId, CloseState>>,
-    id: SessionId,
-    session: Option<Arc<crate::session::ActiveSession>>,
-    clear_session_on_drop: bool,
-}
-
-impl CloseGuard<'_> {
-    fn protect_session(&mut self, session: Arc<crate::session::ActiveSession>) {
-        self.session = Some(session);
-    }
-
-    fn keep_session_closing(&mut self) {
-        self.clear_session_on_drop = false;
-    }
-}
-
-impl Drop for CloseGuard<'_> {
-    fn drop(&mut self) {
-        if self.clear_session_on_drop
-            && let Some(session) = &self.session
-        {
-            session.clear_closing();
-        }
-        let mut map = self.closing.lock().expect("close map poisoned");
-        map.remove(&self.id);
-    }
-}
-
 /// The first 8 hex characters of a UUID — used verbatim as the short id
 /// that names the worktree directory and the `ox/<short>` branch. 8 hex
 /// chars gives 4.3B possibilities, comfortable for a per-user tool where
@@ -674,91 +639,8 @@ fn rejection_message(rej: &MergeRejection) -> String {
     }
 }
 
-/// Agent-initiated close request message. Pushed onto the close
-/// channel by a [`ChannelCloseSink`]; drained by the consumer task
-/// that calls [`SessionLifecycle::handle_close_request`].
-#[derive(Debug)]
-pub struct CloseRequestMsg {
-    pub id: SessionId,
-    pub intent: CloseIntent,
-}
-
-/// First-turn completion message. Pushed by a
-/// [`ChannelFirstTurnSink`]; drained by the consumer task that calls
-/// [`SessionLifecycle::handle_first_turn`].
-#[derive(Debug)]
-pub struct FirstTurnMsg {
-    pub id: SessionId,
-    pub first_message: String,
-}
-
-/// [`CloseRequestSink`] that pushes requests onto an unbounded channel.
-/// Sessions hold one of these behind `Arc<dyn CloseRequestSink>`; the
-/// composition root owns a consumer task that drains the receiver and
-/// dispatches to [`SessionLifecycle::handle_close_request`].
-///
-/// Send is sync (unbounded channels never block); the returned future
-/// only exists to satisfy the trait's `dyn`-friendly signature.
-pub struct ChannelCloseSink {
-    tx: mpsc::UnboundedSender<CloseRequestMsg>,
-}
-
-impl ChannelCloseSink {
-    pub fn new(tx: mpsc::UnboundedSender<CloseRequestMsg>) -> Self {
-        Self { tx }
-    }
-}
-
-impl CloseRequestSink for ChannelCloseSink {
-    fn request_close(
-        &self,
-        id: SessionId,
-        intent: CloseIntent,
-    ) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
-        let result = self.tx.send(CloseRequestMsg { id, intent });
-        Box::pin(async move {
-            if result.is_err() {
-                eprintln!(
-                    "ox: close request for session {id} dropped: consumer channel closed"
-                );
-            }
-        })
-    }
-}
-
-/// [`FirstTurnSink`] that pushes notifications onto an unbounded
-/// channel. Mirror of [`ChannelCloseSink`] for the slug-rename path.
-pub struct ChannelFirstTurnSink {
-    tx: mpsc::UnboundedSender<FirstTurnMsg>,
-}
-
-impl ChannelFirstTurnSink {
-    pub fn new(tx: mpsc::UnboundedSender<FirstTurnMsg>) -> Self {
-        Self { tx }
-    }
-}
-
-impl FirstTurnSink for ChannelFirstTurnSink {
-    fn on_first_turn_complete(
-        &self,
-        id: SessionId,
-        first_message: String,
-    ) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
-        let result = self.tx.send(FirstTurnMsg { id, first_message });
-        Box::pin(async move {
-            if result.is_err() {
-                eprintln!(
-                    "ox: first-turn notification for session {id} dropped: consumer channel closed"
-                );
-            }
-        })
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use domain::SessionId;
-
     use super::*;
 
     #[test]
@@ -791,27 +673,4 @@ mod tests {
             "boom"
         );
     }
-
-    #[tokio::test]
-    async fn channel_close_sink_surfaces_send_error_when_receiver_gone() {
-        // Drop the receiver before sending. The sink must not panic —
-        // it should return a future that logs and completes. This is
-        // the degenerate case where the consumer task has already
-        // exited (shutdown in flight).
-        let (tx, rx) = mpsc::unbounded_channel::<CloseRequestMsg>();
-        drop(rx);
-        let sink: Arc<dyn CloseRequestSink> = Arc::new(ChannelCloseSink::new(tx));
-        sink.request_close(SessionId::new_v4(), CloseIntent::Merge)
-            .await;
-    }
-
-    #[tokio::test]
-    async fn channel_first_turn_sink_surfaces_send_error_when_receiver_gone() {
-        let (tx, rx) = mpsc::unbounded_channel::<FirstTurnMsg>();
-        drop(rx);
-        let sink: Arc<dyn FirstTurnSink> = Arc::new(ChannelFirstTurnSink::new(tx));
-        sink.on_first_turn_complete(SessionId::new_v4(), "hello".into())
-            .await;
-    }
-
 }

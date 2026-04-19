@@ -31,39 +31,17 @@ use agent_host::{
     AgentSpawnConfig, AgentSpawner, CloseRequestSink, FirstTurnSink, Layout, LayoutRepository,
 };
 use anyhow::{Context, Result, anyhow};
-use app::SessionStore;
 use domain::SessionId;
-use protocol::AgentCommand;
-use serde::Serialize;
 
-use crate::session::{ActiveSession, SendOutcome};
+use crate::session::ActiveSession;
 
-/// JSON payload for `GET /api/sessions` — everything the frontend
-/// needs on first paint. Snapshotted under the registry's read lock,
-/// so any concurrent `create`/`remove` appears as "not yet" or "gone,"
-/// never as half-applied state.
-#[derive(Debug, Serialize)]
-pub struct SnapshotJson {
-    pub workspace_root: PathBuf,
-    pub sessions: Vec<SessionSummary>,
-    pub layout: Layout,
-}
+mod dispatch;
+mod restore;
+mod snapshot;
 
-#[derive(Debug, Serialize)]
-pub struct SessionSummary {
-    pub session_id: SessionId,
-    pub model: String,
-}
-
-/// Errors [`SessionRegistry::send_command`] maps to HTTP status codes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CommandDispatch {
-    Ok,
-    NotFound,
-    Dead,
-    AlreadyTurning,
-    Closing,
-}
+pub use dispatch::CommandDispatch;
+#[allow(unused_imports)]
+pub use snapshot::{SessionSummary, SnapshotJson};
 
 pub struct SessionRegistry {
     sessions: RwLock<HashMap<SessionId, Arc<ActiveSession>>>,
@@ -106,107 +84,6 @@ impl SessionRegistry {
         })
     }
 
-    /// Attempt to resume every saved session for this workspace root.
-    ///
-    /// For each layout-row session id:
-    /// - Look up its `{id}.json` via `session_store.try_load`. If no
-    ///   file exists, the row is stale (session was never persisted or
-    ///   was hand-deleted); skip it.
-    /// - Read `worktree_path` from the loaded session and spawn an
-    ///   agent pointed at that path with `resume: Some(id)`.
-    /// - Any per-session failure (worktree missing, agent binary out of
-    ///   date, etc.) is logged and the loop continues so one broken row
-    ///   does not block the rest of the layout from restoring.
-    ///
-    /// If no session resumes, the registry is returned empty. The
-    /// frontend will show the workspace with no panes until the user
-    /// creates a session via `POST /api/sessions`.
-    pub async fn restore(
-        spawner: Arc<dyn AgentSpawner>,
-        spawn_config: AgentSpawnConfig,
-        layout: Arc<dyn LayoutRepository>,
-        workspace_root: PathBuf,
-        close_sink: Arc<dyn CloseRequestSink>,
-        first_turn_sink: Arc<dyn FirstTurnSink>,
-        session_store: Arc<dyn SessionStore>,
-    ) -> Result<Arc<Self>> {
-        let registry = Self::new(
-            spawner,
-            spawn_config,
-            layout,
-            workspace_root.clone(),
-            close_sink,
-            first_turn_sink,
-        );
-
-        let saved_order: Vec<SessionId> = match registry.layout.get(&workspace_root).await {
-            Ok(Some(layout)) => layout.order,
-            Ok(None) => Vec::new(),
-            Err(err) => {
-                eprintln!("ox: failed to load saved layout for restore: {err:#}");
-                Vec::new()
-            }
-        };
-
-        for id in saved_order {
-            let session = match session_store.try_load(id).await {
-                Ok(Some(s)) => s,
-                Ok(None) => {
-                    // Session file never written — the previous run died
-                    // before the first `TurnComplete`. The layout row is
-                    // stale; skip it and move on.
-                    eprintln!("ox: skipping session {id}: no on-disk session file");
-                    continue;
-                }
-                Err(err) => {
-                    eprintln!("ox: failed to load session {id}: {err:#}");
-                    continue;
-                }
-            };
-
-            if !session.worktree_path.exists() {
-                eprintln!(
-                    "ox: skipping session {id}: worktree {} is missing",
-                    session.worktree_path.display()
-                );
-                continue;
-            }
-
-            if let Err(err) = registry
-                .spawn_for_worktree(session.worktree_path.clone(), id, Some(id))
-                .await
-            {
-                eprintln!("ox: failed to resume session {id}: {err:#}");
-            }
-        }
-
-        Ok(registry)
-    }
-
-    /// Spawn an agent that resumes a specific session id. Used by the
-    /// `--resume <id>` CLI path. The session's saved `worktree_path` is
-    /// loaded from the store so the agent comes back on the same branch
-    /// it was last working on.
-    pub async fn create_resumed(
-        &self,
-        id: SessionId,
-        session_store: &dyn SessionStore,
-    ) -> Result<SessionId> {
-        let session = session_store
-            .try_load(id)
-            .await
-            .with_context(|| format!("loading session {id} for --resume"))?
-            .ok_or_else(|| anyhow!("no saved session with id {id}"))?;
-        if !session.worktree_path.exists() {
-            return Err(anyhow!(
-                "session {id} worktree {} is missing",
-                session.worktree_path.display()
-            ));
-        }
-        self.spawn_for_worktree(session.worktree_path, id, Some(id))
-            .await
-    }
-
     /// Drop the session from the registry. The `Arc<ActiveSession>`
     /// held by the map is released; its `AgentClient` drops; the child
     /// dies via `kill_on_drop`. Returns true if the session existed.
@@ -237,50 +114,6 @@ impl SessionRegistry {
     pub fn is_empty(&self) -> bool {
         let sessions = self.sessions.read().expect("sessions lock poisoned");
         sessions.is_empty()
-    }
-
-    /// Snapshot for `GET /api/sessions`.
-    pub async fn snapshot(&self) -> SnapshotJson {
-        let layout = match self.layout.get(&self.workspace_root).await {
-            Ok(Some(layout)) => layout,
-            Ok(None) => Layout::default(),
-            Err(err) => {
-                eprintln!("ox: failed to read workspace layout: {err:#}");
-                Layout::default()
-            }
-        };
-        let sessions = self.sessions.read().expect("sessions lock poisoned");
-
-        // Present sessions in layout order first, then append any
-        // live sessions that aren't referenced by the layout (e.g.,
-        // a freshly created session before the client has PUT the
-        // new layout).
-        let mut ordered: Vec<SessionSummary> = Vec::with_capacity(sessions.len());
-        let mut seen = std::collections::HashSet::new();
-        for id in &layout.order {
-            if let Some(session) = sessions.get(id) {
-                let _ = session; // Summary doesn't need session-level state today.
-                ordered.push(SessionSummary {
-                    session_id: *id,
-                    model: self.spawn_config.model.clone(),
-                });
-                seen.insert(*id);
-            }
-        }
-        for id in sessions.keys() {
-            if !seen.contains(id) {
-                ordered.push(SessionSummary {
-                    session_id: *id,
-                    model: self.spawn_config.model.clone(),
-                });
-            }
-        }
-
-        SnapshotJson {
-            workspace_root: self.workspace_root.clone(),
-            sessions: ordered,
-            layout,
-        }
     }
 
     /// Persist a client-authored layout. Unknown session ids are
@@ -323,51 +156,6 @@ impl SessionRegistry {
         let n = ids.len();
         let layout = Layout::new(ids, vec![1.0 / n as f32; n]);
         self.layout.put(&self.workspace_root, layout).await
-    }
-
-    /// Dispatch a command to a session by id. Maps `SendOutcome`
-    /// onto the richer `CommandDispatch` so the handler has all four
-    /// HTTP paths (204/404/410/409) in one match.
-    pub async fn send_command(&self, id: SessionId, cmd: AgentCommand) -> CommandDispatch {
-        let session = match self.get(id) {
-            Some(s) => s,
-            None => return CommandDispatch::NotFound,
-        };
-        match cmd {
-            AgentCommand::SendMessage { input } => match session.send_message(input) {
-                SendOutcome::Ok => CommandDispatch::Ok,
-                SendOutcome::Dead => CommandDispatch::Dead,
-                SendOutcome::AlreadyTurning => CommandDispatch::AlreadyTurning,
-                SendOutcome::Closing => CommandDispatch::Closing,
-            },
-            AgentCommand::Cancel => {
-                session.cancel();
-                CommandDispatch::Ok
-            }
-            // `AgentCommand` is `#[non_exhaustive]`; accept unknown
-            // variants as 204 on the theory that the handler shouldn't
-            // have routed them here. Callers use the narrow, typed
-            // `send_message` / `cancel` methods instead.
-            _ => CommandDispatch::Ok,
-        }
-    }
-
-    pub async fn resolve_tool_approval(
-        &self,
-        id: SessionId,
-        request_id: String,
-        approved: bool,
-    ) -> CommandDispatch {
-        let session = match self.get(id) {
-            Some(s) => s,
-            None => return CommandDispatch::NotFound,
-        };
-        match session.resolve_tool_approval(request_id, approved) {
-            SendOutcome::Ok => CommandDispatch::Ok,
-            SendOutcome::Dead => CommandDispatch::Dead,
-            SendOutcome::AlreadyTurning => CommandDispatch::Ok,
-            SendOutcome::Closing => CommandDispatch::Closing,
-        }
     }
 
     /// Shared entry point for spawning a session against a specific
