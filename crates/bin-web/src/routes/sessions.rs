@@ -15,8 +15,6 @@ pub(super) async fn list_sessions(State(state): State<AppState>) -> Response {
 }
 
 pub(super) async fn create_session(State(state): State<AppState>) -> Response {
-    // Route through the lifecycle coordinator so every fresh session
-    // gets its own git worktree + branch.
     match state.lifecycle.create_and_spawn(&state.registry).await {
         Ok(session_id) => Json(CreatedSession { session_id }).into_response(),
         Err(err) => {

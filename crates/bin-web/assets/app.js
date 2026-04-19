@@ -25,6 +25,7 @@ const state = {
   // exists (first page load of an empty workspace), this stays 0 —
   // `mountSession` tolerates that and simply hides the chip.
   contextWindow: 0,
+  model: null,
 };
 
 // Window title — `<spinner> Ox - <slug>`. The spinner animates at 1Hz
@@ -181,6 +182,7 @@ async function main() {
   // `SessionSummary` duplicates this today but would be the natural
   // place to grow per-session models later.
   state.contextWindow = snapshot.context_window || 0;
+  state.model = snapshot.model;
   const byId = new Map(snapshot.sessions.map((s) => [s.session_id, s]));
   const order = [];
   for (const id of snapshot.layout.order) {
@@ -244,6 +246,7 @@ function mountSession(id, model, contextWindow, size) {
     abandonButton: node.querySelector(".abandon"),
     slugEl: node.querySelector(".session-slug"),
     usageChipEl: node.querySelector(".usage-chip"),
+    modelChipEl: node.querySelector(".model-chip"),
     eventSource: null,
     accumulator: null,
     streamingEl: null,
@@ -283,6 +286,7 @@ function mountSession(id, model, contextWindow, size) {
   // catalog wasn't available (contextWindow=0), `renderUsage` hides
   // the chip rather than rendering nonsense.
   renderUsage(sess, { prompt_tokens: 0 });
+  renderModel(sess);
 
   openStream(sess);
   return sess;
@@ -396,6 +400,12 @@ function renderUsage(sess, usage) {
   const pct = Math.round((used / total) * 100);
   chip.textContent = `${USAGE_FORMATTER.format(used)} / ${USAGE_FORMATTER.format(total)} (${pct}%)`;
   chip.hidden = false;
+}
+
+function renderModel(sess) {
+  const chip = sess.modelChipEl;
+  if (!chip) return;
+  chip.textContent = sess.model || "";
 }
 
 function renderInlineApproval(sess, request) {
@@ -941,7 +951,7 @@ async function onNewSession() {
   // The new pane joins the row with an equal share so it's visible. The
   // user can drag gutters afterwards; drag-end will overwrite the layout.
   distributeEvenly();
-  mountSession(body.session_id, "", state.contextWindow, 1);
+  mountSession(body.session_id, state.model, state.contextWindow, 1);
   renderGutters();
   putLayout();
 }

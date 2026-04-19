@@ -260,8 +260,24 @@ button:disabled {
   display: flex;
   gap: var(--gap);
   padding: var(--pad);
+  padding-bottom: 0;
   border-top: 1px solid var(--border);
   background: var(--bg-pane);
+}
+
+.composer-footer {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: var(--pad);
+  background: var(--bg-pane);
+}
+
+.model-chip {
+  color: var(--fg-muted);
+  font-family: var(--font-mono);
+  white-space: nowrap;
 }
 
 .composer textarea {

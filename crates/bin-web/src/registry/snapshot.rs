@@ -24,6 +24,10 @@ pub struct SnapshotJson {
     /// (shouldn't happen — main.rs validates at startup — but treated
     /// as "unknown" here rather than panicking at snapshot time).
     pub context_window: u32,
+    /// Registry-wide model slug. All sessions share the same model today;
+    /// surfaced at the top level so the frontend can display it without
+    /// waiting for the first session to be created.
+    pub model: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -93,6 +97,7 @@ impl SessionRegistry {
             sessions: ordered,
             layout,
             context_window,
+            model: default_model.to_owned(),
         }
     }
 }
