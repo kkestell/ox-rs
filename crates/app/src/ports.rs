@@ -20,14 +20,26 @@ pub trait LlmProvider {
     ) -> impl Future<Output = Result<Pin<Box<dyn Stream<Item = Result<StreamEvent>> + Send>>>> + Send;
 }
 
-pub trait SessionStore {
-    fn load(&self, id: SessionId) -> impl Future<Output = Result<Session>> + Send;
-    fn save(&self, session: &Session) -> impl Future<Output = Result<()>> + Send;
-    fn list(&self) -> impl Future<Output = Result<Vec<SessionSummary>>> + Send;
+pub trait SessionStore: Send + Sync + 'static {
+    /// Load a session by id, returning `None` when the record does not
+    /// exist on disk. Boxed futures keep the trait `dyn`-compatible so
+    /// lifecycle code can hold `Arc<dyn SessionStore>`.
+    fn try_load(
+        &self,
+        id: SessionId,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<Session>>> + Send + '_>>;
+    fn save<'a>(
+        &'a self,
+        session: &'a Session,
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>>;
+    fn list(&self) -> Pin<Box<dyn Future<Output = Result<Vec<SessionSummary>>> + Send + '_>>;
     /// Remove a session's on-disk record. Missing sessions are treated as
     /// success so callers can invoke `delete` idempotently during merge /
     /// abandon flows without having to race a concurrent removal.
-    fn delete(&self, id: SessionId) -> impl Future<Output = Result<()>> + Send;
+    fn delete(
+        &self,
+        id: SessionId,
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>>;
 }
 
 pub trait SecretStore {

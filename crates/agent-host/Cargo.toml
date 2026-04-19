@@ -5,7 +5,6 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1.0.102"
-async-trait = "0.1.89"
 domain = { version = "0.1.0", path = "../domain" }
 protocol = { version = "0.1.0", path = "../protocol" }
 serde = { version = "1.0.228", features = ["derive"] }

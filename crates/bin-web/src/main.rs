@@ -36,10 +36,11 @@ use adapter_llm::OpenRouterSlugGenerator;
 use adapter_process::ProcessSpawner;
 use adapter_storage::{DiskLayoutRepository, DiskSessionStore};
 use agent_host::{
-    AgentSpawnConfig, CloseRequestSink, FirstTurnSink, Git, LayoutRepository, SessionRecords,
-    SlugGenerator, workspace_slug,
+    AgentSpawnConfig, CloseRequestSink, FirstTurnSink, Git, LayoutRepository, SlugGenerator,
+    workspace_slug,
 };
 use anyhow::{Context, Result};
+use app::SessionStore;
 use clap::Parser;
 use domain::SessionId;
 use tokio::net::TcpListener;
@@ -187,9 +188,9 @@ async fn run(cli: Cli) -> Result<()> {
         DiskSessionStore::new(&spawn_config.sessions_dir)
             .context("creating the session store directory")?,
     );
-    let session_records: Arc<dyn SessionRecords> = session_store.clone();
+    let session_store_dyn: Arc<dyn SessionStore> = session_store.clone();
     let lifecycle =
-        SessionLifecycle::new(git, slug_generator, session_records.clone(), workspace_ctx);
+        SessionLifecycle::new(git, slug_generator, session_store_dyn.clone(), workspace_ctx);
     let close_sink: Arc<dyn CloseRequestSink> = lifecycle.clone();
     let first_turn_sink: Arc<dyn FirstTurnSink> = lifecycle.clone();
 
@@ -205,7 +206,7 @@ async fn run(cli: Cli) -> Result<()> {
             close_sink.clone(),
             first_turn_sink.clone(),
         );
-        resume_single(&reg, id, session_records.as_ref()).await?;
+        resume_single(&reg, id, session_store_dyn.as_ref()).await?;
         reg
     } else {
         SessionRegistry::restore(
@@ -215,7 +216,7 @@ async fn run(cli: Cli) -> Result<()> {
             workspace_root.clone(),
             close_sink.clone(),
             first_turn_sink.clone(),
-            session_records.clone(),
+            session_store_dyn.clone(),
         )
         .await?
     };
@@ -292,7 +293,7 @@ fn resolve_agent_binary() -> Result<PathBuf> {
 async fn resume_single(
     registry: &SessionRegistry,
     id: SessionId,
-    session_store: &dyn SessionRecords,
+    session_store: &dyn SessionStore,
 ) -> Result<()> {
     // `restore`'s fallback path produces a one-pane registry already;
     // we replicate that shape here by creating the resumed session and

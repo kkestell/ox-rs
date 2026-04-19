@@ -14,7 +14,6 @@ mod first_turn_sink;
 mod git;
 mod layout;
 mod paths;
-mod session_records;
 mod session_runtime;
 mod slug_generator;
 mod spawner;
@@ -26,7 +25,6 @@ pub use first_turn_sink::FirstTurnSink;
 pub use git::{Git, MergeOutcome, WorktreeStatus};
 pub use layout::{Layout, LayoutRepository, normalize_sizes};
 pub use paths::workspace_slug;
-pub use session_records::SessionRecords;
 pub use session_runtime::{
     BeginClose, SessionRuntime, ShouldSend, apply_event, begin_close, begin_send, clear_closing,
 };

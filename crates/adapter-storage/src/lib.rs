@@ -1,10 +1,11 @@
 use std::collections::BTreeMap;
+use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::Mutex;
 
 use agent_host::{Layout, LayoutRepository, normalize_sizes};
 use anyhow::{Context, Result};
-use async_trait::async_trait;
 use domain::{Session, SessionId, SessionSummary};
 use serde::{Deserialize, Serialize};
 
@@ -144,83 +145,77 @@ impl DiskSessionStore {
     }
 }
 
-#[async_trait]
-impl agent_host::SessionRecords for DiskSessionStore {
-    async fn try_load(&self, id: SessionId) -> Result<Option<Session>> {
-        DiskSessionStore::try_load(self, id).await
-    }
-
-    async fn save(&self, session: &Session) -> Result<()> {
-        app::SessionStore::save(self, session).await
-    }
-
-    async fn delete(&self, id: SessionId) -> Result<()> {
-        app::SessionStore::delete(self, id).await
-    }
-}
-
 impl app::SessionStore for DiskSessionStore {
-    async fn load(&self, id: SessionId) -> Result<Session> {
-        let path = self.session_path(id);
-        let data = tokio::fs::read_to_string(&path)
-            .await
-            .with_context(|| format!("failed to read session file {}", path.display()))?;
-        let session: Session = serde_json::from_str(&data)
-            .with_context(|| format!("failed to deserialize session {id}"))?;
-        Ok(session)
+    fn try_load(
+        &self,
+        id: SessionId,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<Session>>> + Send + '_>> {
+        Box::pin(async move { DiskSessionStore::try_load(self, id).await })
     }
 
-    async fn save(&self, session: &Session) -> Result<()> {
-        let path = self.session_path(session.id);
-        let data = serde_json::to_string_pretty(session)
-            .with_context(|| format!("failed to serialize session {}", session.id))?;
-        tokio::fs::write(&path, data)
-            .await
-            .with_context(|| format!("failed to write session file {}", path.display()))?;
-        Ok(())
+    fn save<'a>(
+        &'a self,
+        session: &'a Session,
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
+        Box::pin(async move {
+            let path = self.session_path(session.id);
+            let data = serde_json::to_string_pretty(session)
+                .with_context(|| format!("failed to serialize session {}", session.id))?;
+            tokio::fs::write(&path, data)
+                .await
+                .with_context(|| format!("failed to write session file {}", path.display()))?;
+            Ok(())
+        })
     }
 
-    async fn list(&self) -> Result<Vec<SessionSummary>> {
-        let mut summaries = Vec::new();
+    fn list(&self) -> Pin<Box<dyn Future<Output = Result<Vec<SessionSummary>>> + Send + '_>> {
+        Box::pin(async move {
+            let mut summaries = Vec::new();
 
-        let mut entries = tokio::fs::read_dir(&self.dir)
-            .await
-            .with_context(|| format!("failed to read session directory {}", self.dir.display()))?;
+            let mut entries = tokio::fs::read_dir(&self.dir).await.with_context(|| {
+                format!("failed to read session directory {}", self.dir.display())
+            })?;
 
-        while let Some(entry) = entries.next_entry().await? {
-            let path = entry.path();
+            while let Some(entry) = entries.next_entry().await? {
+                let path = entry.path();
 
-            // Only consider .json files whose stem is a valid UUID.
-            // No file reads — the filename alone is authoritative.
-            let is_json = path.extension().is_some_and(|ext| ext == "json");
-            if !is_json {
-                continue;
+                // Only consider .json files whose stem is a valid UUID.
+                // No file reads — the filename alone is authoritative.
+                let is_json = path.extension().is_some_and(|ext| ext == "json");
+                if !is_json {
+                    continue;
+                }
+                let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+                    continue;
+                };
+                let Ok(id) = stem.parse::<SessionId>() else {
+                    continue;
+                };
+
+                summaries.push(SessionSummary { id });
             }
-            let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
-                continue;
-            };
-            let Ok(id) = stem.parse::<SessionId>() else {
-                continue;
-            };
 
-            summaries.push(SessionSummary { id });
-        }
-
-        Ok(summaries)
+            Ok(summaries)
+        })
     }
 
-    async fn delete(&self, id: SessionId) -> Result<()> {
-        let path = self.session_path(id);
-        // `NotFound` is treated as success so the merge / abandon flows
-        // can call `delete` unconditionally without probing the filesystem
-        // first. Any other I/O error surfaces — a permission or disk
-        // problem should not be silently swallowed.
-        match tokio::fs::remove_file(&path).await {
-            Ok(()) => Ok(()),
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(err) => Err(err)
-                .with_context(|| format!("failed to delete session file {}", path.display())),
-        }
+    fn delete(
+        &self,
+        id: SessionId,
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>> {
+        Box::pin(async move {
+            let path = self.session_path(id);
+            // `NotFound` is treated as success so the merge / abandon flows
+            // can call `delete` unconditionally without probing the filesystem
+            // first. Any other I/O error surfaces — a permission or disk
+            // problem should not be silently swallowed.
+            match tokio::fs::remove_file(&path).await {
+                Ok(()) => Ok(()),
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(err) => Err(err)
+                    .with_context(|| format!("failed to delete session file {}", path.display())),
+            }
+        })
     }
 }
 
@@ -270,7 +265,7 @@ mod tests {
         let session = multi_role_session(id);
 
         store.save(&session).await.unwrap();
-        let loaded = store.load(id).await.unwrap();
+        let loaded = store.try_load(id).await.unwrap().expect("session exists");
 
         assert_eq!(loaded.id, id);
         assert_eq!(loaded.workspace_root, session.workspace_root);
@@ -286,10 +281,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn load_nonexistent_returns_error() {
+    async fn try_load_nonexistent_returns_none() {
         let (store, _tmp) = temp_store();
-        let result = store.load(SessionId::new_v4()).await;
-        assert!(result.is_err());
+        let result = store.try_load(SessionId::new_v4()).await.unwrap();
+        assert!(result.is_none());
     }
 
     #[tokio::test]
@@ -338,7 +333,7 @@ mod tests {
         session.push_message(Message::user("second"));
         store.save(&session).await.unwrap();
 
-        let loaded = store.load(id).await.unwrap();
+        let loaded = store.try_load(id).await.unwrap().expect("session exists");
         assert_eq!(loaded.messages.len(), 2);
         assert_eq!(loaded.messages[1].text(), "second");
     }
@@ -381,8 +376,8 @@ mod tests {
         assert_eq!(summaries.len(), 1);
         assert_eq!(summaries[0].id, id);
 
-        // load() on the same ID should fail with a deserialization error.
-        let err = store.load(id).await.unwrap_err();
+        // try_load() on the same ID should fail with a deserialization error.
+        let err = store.try_load(id).await.unwrap_err();
         assert!(
             err.to_string().contains("deserialize"),
             "unexpected error: {err}"
@@ -396,7 +391,7 @@ mod tests {
         let session = Session::new(id, "/empty".into(), "/empty/wt".into());
 
         store.save(&session).await.unwrap();
-        let loaded = store.load(id).await.unwrap();
+        let loaded = store.try_load(id).await.unwrap().expect("session exists");
 
         assert_eq!(loaded.id, id);
         assert!(loaded.messages.is_empty());
@@ -415,8 +410,8 @@ mod tests {
         let summaries = store.list().await.unwrap();
         assert!(summaries.iter().all(|s| s.id != id));
 
-        // Loading the same id now errors with a read-file error.
-        assert!(store.load(id).await.is_err());
+        // Loading the same id now returns None (file is gone).
+        assert!(store.try_load(id).await.unwrap().is_none());
     }
 
     #[tokio::test]

@@ -209,38 +209,48 @@ impl FakeSessionStore {
 }
 
 impl SessionStore for FakeSessionStore {
-    async fn load(&self, id: SessionId) -> Result<Session> {
-        self.sessions
-            .lock()
-            .unwrap()
-            .get(&id)
-            .cloned()
-            .ok_or_else(|| anyhow::anyhow!("FakeSessionStore: no session with id {id}"))
+    fn try_load(
+        &self,
+        id: SessionId,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<Session>>> + Send + '_>> {
+        Box::pin(async move { Ok(self.sessions.lock().unwrap().get(&id).cloned()) })
     }
 
-    async fn save(&self, session: &Session) -> Result<()> {
-        self.sessions
-            .lock()
-            .unwrap()
-            .insert(session.id, session.clone());
-        Ok(())
+    fn save<'a>(
+        &'a self,
+        session: &'a Session,
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
+        Box::pin(async move {
+            self.sessions
+                .lock()
+                .unwrap()
+                .insert(session.id, session.clone());
+            Ok(())
+        })
     }
 
-    async fn list(&self) -> Result<Vec<SessionSummary>> {
-        let guard = self.sessions.lock().unwrap();
-        let summaries = guard
-            .values()
-            .map(|s| SessionSummary { id: s.id })
-            .collect();
-        Ok(summaries)
+    fn list(&self) -> Pin<Box<dyn Future<Output = Result<Vec<SessionSummary>>> + Send + '_>> {
+        Box::pin(async move {
+            let guard = self.sessions.lock().unwrap();
+            let summaries = guard
+                .values()
+                .map(|s| SessionSummary { id: s.id })
+                .collect();
+            Ok(summaries)
+        })
     }
 
-    async fn delete(&self, id: SessionId) -> Result<()> {
-        // Mirrors `DiskSessionStore::delete`: removing a missing id is a
-        // success so tests can exercise idempotent delete paths without
-        // having to probe for existence first.
-        self.sessions.lock().unwrap().remove(&id);
-        Ok(())
+    fn delete(
+        &self,
+        id: SessionId,
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>> {
+        Box::pin(async move {
+            // Mirrors `DiskSessionStore::delete`: removing a missing id is a
+            // success so tests can exercise idempotent delete paths without
+            // having to probe for existence first.
+            self.sessions.lock().unwrap().remove(&id);
+            Ok(())
+        })
     }
 }
 
@@ -643,7 +653,7 @@ mod tests {
         session.push_message(Message::user("hello"));
 
         store.save(&session).await.unwrap();
-        let loaded = store.load(id).await.unwrap();
+        let loaded = store.try_load(id).await.unwrap().expect("session exists");
 
         assert_eq!(loaded.id, id);
         assert_eq!(loaded.workspace_root.to_str().unwrap(), "/tmp/project");
@@ -653,10 +663,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn store_load_nonexistent_returns_error() {
+    async fn store_try_load_nonexistent_returns_none() {
         let store = FakeSessionStore::new();
-        let result = store.load(SessionId::new_v4()).await;
-        assert!(result.is_err());
+        let result = store.try_load(SessionId::new_v4()).await.unwrap();
+        assert!(result.is_none());
     }
 
     #[tokio::test]
@@ -685,7 +695,10 @@ mod tests {
         store.save(&session).await.unwrap();
 
         store.delete(id).await.unwrap();
-        assert!(store.load(id).await.is_err(), "loaded a deleted session");
+        assert!(
+            store.try_load(id).await.unwrap().is_none(),
+            "loaded a deleted session"
+        );
 
         // Second delete of the same id succeeds — matches the port contract.
         store.delete(id).await.unwrap();

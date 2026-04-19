@@ -51,10 +51,11 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use agent_host::{
-    CloseRequestSink, FirstTurnSink, Git, MergeOutcome, SessionRecords, SlugGenerator,
-    WorkspaceContext, WorktreeStatus, workspace_slug,
+    CloseRequestSink, FirstTurnSink, Git, MergeOutcome, SlugGenerator, WorkspaceContext,
+    WorktreeStatus, workspace_slug,
 };
 use anyhow::{Context, Result, anyhow};
+use app::SessionStore;
 use domain::{CloseIntent, Session, SessionId};
 
 use crate::registry::SessionRegistry;
@@ -116,10 +117,10 @@ pub struct SessionLifecycle {
     /// Slug generator — an `OpenRouterProvider`-backed call in
     /// production, `FakeSlugGenerator` in tests.
     slug_generator: Arc<dyn SlugGenerator>,
-    /// Host-facing session records. The agent subprocess owns normal turn
-    /// persistence; lifecycle policy uses this narrow port for close
-    /// preflight, teardown deletion, and slug-rename path updates.
-    session_store: Arc<dyn SessionRecords>,
+    /// Host-facing session store. The agent subprocess owns normal turn
+    /// persistence; lifecycle policy uses the port for close preflight,
+    /// teardown deletion, and slug-rename path updates.
+    session_store: Arc<dyn SessionStore>,
     /// Main workspace root + base branch, snapshotted at startup. Every
     /// worktree-add and merge runs against these values; they do not
     /// change over the server's lifetime.
@@ -143,7 +144,7 @@ impl SessionLifecycle {
     pub fn new(
         git: Arc<dyn Git>,
         slug_generator: Arc<dyn SlugGenerator>,
-        session_store: Arc<dyn SessionRecords>,
+        session_store: Arc<dyn SessionStore>,
         workspace: WorkspaceContext,
     ) -> Arc<Self> {
         Arc::new(Self {

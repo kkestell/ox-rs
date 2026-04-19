@@ -80,7 +80,10 @@ impl<L: LlmProvider, S: SessionStore> SessionRunner<L, S> {
     /// Load a session's messages by id. Used by the agent driver to replay
     /// history on `--resume` without holding a second `SessionStore` handle.
     pub async fn load_history(&self, id: SessionId) -> Result<Vec<Message>> {
-        Ok(self.store.load(id).await?.messages)
+        match self.store.try_load(id).await? {
+            Some(session) => Ok(session.messages),
+            None => bail!("session {id} not found"),
+        }
     }
 
     /// Create a new session and run the first turn. The caller is responsible
@@ -127,7 +130,9 @@ impl<L: LlmProvider, S: SessionStore> SessionRunner<L, S> {
         cancel: CancelToken,
         on_event: impl FnMut(TurnEvent<'_>) + Send,
     ) -> Result<TurnOutcome> {
-        let mut session = self.store.load(id).await?;
+        let Some(mut session) = self.store.try_load(id).await? else {
+            bail!("session {id} not found");
+        };
         self.run_turn(&mut session, input, cancel, on_event).await
     }
 
@@ -139,7 +144,9 @@ impl<L: LlmProvider, S: SessionStore> SessionRunner<L, S> {
         approver: &dyn ToolApprover,
         on_event: impl FnMut(TurnEvent<'_>) + Send,
     ) -> Result<TurnOutcome> {
-        let mut session = self.store.load(id).await?;
+        let Some(mut session) = self.store.try_load(id).await? else {
+            bail!("session {id} not found");
+        };
         self.run_turn_with_approver(&mut session, input, cancel, approver, on_event)
             .await
     }

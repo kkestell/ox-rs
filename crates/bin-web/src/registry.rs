@@ -29,9 +29,9 @@ use std::sync::{Arc, RwLock};
 
 use agent_host::{
     AgentSpawnConfig, AgentSpawner, CloseRequestSink, FirstTurnSink, Layout, LayoutRepository,
-    SessionRecords,
 };
 use anyhow::{Context, Result, anyhow};
+use app::SessionStore;
 use domain::SessionId;
 use protocol::AgentCommand;
 use serde::Serialize;
@@ -128,7 +128,7 @@ impl SessionRegistry {
         workspace_root: PathBuf,
         close_sink: Arc<dyn CloseRequestSink>,
         first_turn_sink: Arc<dyn FirstTurnSink>,
-        session_store: Arc<dyn SessionRecords>,
+        session_store: Arc<dyn SessionStore>,
     ) -> Result<Arc<Self>> {
         let registry = Self::new(
             spawner,
@@ -192,7 +192,7 @@ impl SessionRegistry {
     pub async fn create_resumed(
         &self,
         id: SessionId,
-        session_store: &dyn SessionRecords,
+        session_store: &dyn SessionStore,
     ) -> Result<SessionId> {
         let session = session_store
             .try_load(id)
